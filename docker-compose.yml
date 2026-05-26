@@ -1,0 +1,306 @@
+name: execrelay
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16@sha256:87f39af0a38cb42e4add367d9dfad2087a53fe5c9b24b5bc0dc66bd204b0665f
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-execrelay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-execrelay_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-execrelay}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2.11-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
+    command: ["-c", "/etc/nats/nats.conf"]
+    environment:
+      NATS_USER: ${NATS_USER:-execrelay}
+      NATS_PASS: ${NATS_PASS:-execrelay_nats_dev}
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - ./infra/docker/nats/nats.conf:/etc/nats/nats.conf:ro
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-execrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-execrelay_dev_password}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  tempo:
+    image: grafana/tempo:latest@sha256:2513658c41faa9197dc7373599bb6119eb27bcb4232cc83779e2bc87cbc34299
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    ports:
+      - "3200:3200"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./infra/docker/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3200/ready >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:latest@sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/ready >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:latest@sha256:2d1f9ae67c1778d33e291d4c3c759cd8b650e67491f02533499eb950e075eeb5
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest@sha256:364cdfa503f1a54a000e7f86f3910f9a838ea939d225b6394710010e4444f8a2
+    command:
+      - "mlflow"
+      - "server"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "5000"
+      - "--backend-store-uri"
+      - "${MLFLOW_BACKEND_STORE_URI:-sqlite:////mlflow/mlflow.db}"
+      - "--default-artifact-root"
+      - "${MLFLOW_ARTIFACT_ROOT:-/mlflow/artifacts}"
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=2)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  ingress:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/ingress/Dockerfile
+    environment:
+      HTTP_ADDR: :8080
+      NATS_URL: nats://${NATS_USER:-execrelay}:${NATS_PASS:-execrelay_nats_dev}@nats:4222
+      INGRESS_REGION: ${INGRESS_REGION:-local}
+      EXECRELAY_LICENSES: ${EXECRELAY_LICENSES:-}
+      WEBHOOK_TIMESTAMP_WINDOW_SECS: ${WEBHOOK_TIMESTAMP_WINDOW_SECS:-30}
+      WEBHOOK_RATE_LIMIT: ${WEBHOOK_RATE_LIMIT:-60}
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+
+  bridge:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/bridge/Dockerfile
+    environment:
+      HTTP_ADDR: :8080
+      NATS_URL: nats://${NATS_USER:-execrelay}:${NATS_PASS:-execrelay_nats_dev}@nats:4222
+      BRIDGE_REGION: ${BRIDGE_REGION:-local}
+      BRIDGE_AUTH_TOKEN: ${BRIDGE_AUTH_TOKEN:-}
+      SIGNALS_STREAM: SIGNALS
+      SIGNALS_CONSUMER: bridge
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+
+  dxtrade:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/dxtrade/Dockerfile
+    environment:
+      HTTP_ADDR: :8080
+      NATS_URL: nats://${NATS_USER:-execrelay}:${NATS_PASS:-execrelay_nats_dev}@nats:4222
+      SIGNALS_STREAM: SIGNALS
+      SIGNALS_CONSUMER: dxtrade
+      DXTRADE_INSTANCES: ${DXTRADE_INSTANCES:-}
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+
+  persist:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/persist/Dockerfile
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      NATS_URL: nats://${NATS_USER:-execrelay}:${NATS_PASS:-execrelay_nats_dev}@nats:4222
+      DATABASE_URL: postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}
+    depends_on:
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8084:8080"
+
+  portal-api:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/portal-api/Dockerfile
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}
+      JWT_SECRET: ${JWT_SECRET:-changeme-in-production}
+      PORTAL_ALLOWED_ORIGINS: ${PORTAL_ALLOWED_ORIGINS:-*}
+      NATS_URL: nats://${NATS_USER:-execrelay}:${NATS_PASS:-execrelay_nats_dev}@nats:4222
+      INGRESS_URL: http://ingress:8080
+      SIGNALS_STREAM: SIGNALS
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+
+  tasks:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/tasks/Dockerfile
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}
+      RETENTION_DAYS: ${RETENTION_DAYS:-90}
+      FILL_TIMEOUT_SECS: ${FILL_TIMEOUT_SECS:-30}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8086:8080"
+
+  analytics:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/analytics/Dockerfile
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8087:8080"
+
+  reports:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/reports/Dockerfile
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8088:8080"
+
+  portal-web:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: apps/portal-web/Dockerfile
+    environment:
+      PORTAL_API_URL: http://portal-api:8080
+      PORTAL_ALLOWED_ORIGINS: ${PORTAL_ALLOWED_ORIGINS:-http://localhost:3001}
+    depends_on:
+      portal-api:
+        condition: service_started
+    ports:
+      - "3001:3000"
+
+volumes:
+  postgres-data:
+  nats-data:
+  redis-data:
+  minio-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:
+  mlflow-data:

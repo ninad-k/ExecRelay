@@ -1,0 +1,9 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+asyncpg==0.30.0
+bcrypt==4.2.1
+PyJWT==2.10.1
+pydantic[email]==2.10.3
+slowapi==0.1.9
+nats-py==2.9.0
+httpx==0.28.1

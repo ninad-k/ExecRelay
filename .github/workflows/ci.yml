@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go tests
+        run: go test ./...
+
+      - name: Go benchmarks
+        run: go test -bench=. -benchmem ./...
+
+      - name: Compose config
+        run: docker compose config >/dev/null
+
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: ingress
+            dockerfile: apps/ingress/Dockerfile
+          - service: bridge
+            dockerfile: apps/bridge/Dockerfile
+          - service: dxtrade
+            dockerfile: apps/dxtrade/Dockerfile
+          - service: persist
+            dockerfile: apps/persist/Dockerfile
+          - service: portal-api
+            dockerfile: apps/portal-api/Dockerfile
+          - service: portal-web
+            dockerfile: apps/portal-web/Dockerfile
+          - service: tasks
+            dockerfile: apps/tasks/Dockerfile
+          - service: analytics
+            dockerfile: apps/analytics/Dockerfile
+          - service: reports
+            dockerfile: apps/reports/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: docker build -f "${{ matrix.dockerfile }}" -t "execrelay/${{ matrix.service }}:ci" .
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "execrelay/${{ matrix.service }}:ci"
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+
+      - name: Syft SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: "execrelay/${{ matrix.service }}:ci"
+          format: spdx-json
+          output-file: "sbom-${{ matrix.service }}.spdx.json"
+
+      - name: Grype image scan
+        uses: anchore/scan-action@v6
+        with:
+          image: "execrelay/${{ matrix.service }}:ci"
+          fail-build: true
+          severity-cutoff: high

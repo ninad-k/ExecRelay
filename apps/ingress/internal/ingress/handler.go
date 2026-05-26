@@ -1,0 +1,447 @@
+package ingress
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"math"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	oldproto "github.com/golang/protobuf/proto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	parser "github.com/ninadk/execrelay/packages/parser-go"
+	execrelaypb "github.com/ninadk/execrelay/packages/proto"
+)
+
+type Handler struct {
+	store            LicenseStore
+	publisher        Publisher
+	eventPublisher   Publisher
+	region           string
+	maxBodyBytes     int64
+	now              func() time.Time
+	timestampWindow  time.Duration
+	rateLimiter      *ipRateLimiter
+	allowedCIDRs     []*net.IPNet
+	dailyCounter     *dailyCounter
+}
+
+type Options struct {
+	Store           LicenseStore
+	Publisher       Publisher
+	EventPublisher  Publisher
+	Region          string
+	MaxBodyBytes    int64
+	Now             func() time.Time
+	TimestampWindow time.Duration
+	RateLimit       int // max requests per minute per IP; 0 = disabled
+	AllowedCIDRs    []*net.IPNet
+}
+
+func NewHandler(opts Options) *Handler {
+	if opts.Publisher == nil {
+		opts.Publisher = NoopPublisher{}
+	}
+	if opts.Store == nil {
+		opts.Store = NewStaticLicenseStore(nil)
+	}
+	if opts.Region == "" {
+		opts.Region = defaultRegion
+	}
+	if opts.MaxBodyBytes <= 0 {
+		opts.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	var rl *ipRateLimiter
+	if opts.RateLimit > 0 {
+		rl = newIPRateLimiter(float64(opts.RateLimit)/60.0, opts.RateLimit)
+	}
+	return &Handler{
+		store:           opts.Store,
+		publisher:       opts.Publisher,
+		eventPublisher:  opts.EventPublisher,
+		region:          opts.Region,
+		maxBodyBytes:    opts.MaxBodyBytes,
+		now:             opts.Now,
+		timestampWindow: opts.TimestampWindow,
+		rateLimiter:     rl,
+		allowedCIDRs:    opts.AllowedCIDRs,
+		dailyCounter:    newDailyCounter(),
+	}
+}
+
+func (h *Handler) Routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", h.health)
+	mux.HandleFunc("/webhook", h.webhook)
+	mux.Handle("/metrics", promhttp.Handler())
+	return metricsMiddleware(mux)
+}
+
+func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"service": "ingress", "status": "ok"})
+}
+
+func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+
+	if h.rateLimiter != nil && !h.rateLimiter.allow(clientIP(r)) {
+		recordRejection("rate_limit_exceeded")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+
+	if len(h.allowedCIDRs) > 0 {
+		ip := net.ParseIP(clientIP(r))
+		allowed := false
+		if ip != nil {
+			for _, cidr := range h.allowedCIDRs {
+				if cidr.Contains(ip) {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			recordRejection("ip_not_allowed")
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "ip_not_allowed"})
+			return
+		}
+	}
+
+	if h.timestampWindow > 0 {
+		if err := checkTimestamp(r.Header, h.now(), h.timestampWindow); err != nil {
+			recordRejection("timestamp_rejected")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "timestamp_rejected", "reason": err.Error()})
+			return
+		}
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
+		return
+	}
+	raw := string(body)
+
+	parsed, err := parser.Parse(raw)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, reject("parse_error", err))
+		return
+	}
+
+	record, err := h.store.Lookup(r.Context(), parsed.LicenseID)
+	if err != nil {
+		status := http.StatusUnauthorized
+		if errors.Is(err, ErrLicenseInactive) {
+			status = http.StatusForbidden
+		}
+		h.publishRejection(parsed.LicenseID, "license_rejected", body)
+		writeJSON(w, status, map[string]string{"error": "license_rejected"})
+		return
+	}
+
+	if !validSubjectToken(parsed.LicenseID) || !validSubjectToken(record.InstanceID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_route_token"})
+		return
+	}
+	if record.Secret != "" && !validSecret(parsed, record.Secret) {
+		h.publishRejection(parsed.LicenseID, "secret_rejected", body)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "secret_rejected"})
+		return
+	}
+	if record.HMACSecret != "" {
+		primaryOK := validSignature(body, record.HMACSecret, r.Header)
+		pendingOK := record.PendingHMACSecret != "" && validSignature(body, record.PendingHMACSecret, r.Header)
+		if !primaryOK && !pendingOK {
+			h.publishRejection(parsed.LicenseID, "signature_rejected", body)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature_rejected"})
+			return
+		}
+	}
+
+	if record.MaxSignalsPerDay > 0 {
+		count := h.dailyCounter.Increment(parsed.LicenseID, h.now())
+		if count > record.MaxSignalsPerDay {
+			recordRejection("plan_limit_exceeded")
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "plan_limit_exceeded"})
+			return
+		}
+	}
+
+	traceID := traceIDFromRequest(r.Header)
+	if traceID == "" {
+		traceID = newTraceID()
+	}
+
+	wire := signalProto(parsed, record, h.region, traceID, body, h.now())
+	payload, err := oldproto.Marshal(wire)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "encode_failed"})
+		return
+	}
+
+	subject := signalSubject(parsed.LicenseID, record.InstanceID, record.Platform)
+	if err := h.publisher.Publish(r.Context(), subject, payload); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "publish_failed"})
+		return
+	}
+
+	w.Header().Set("X-ExecRelay-Trace-ID", traceID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID})
+}
+
+func (h *Handler) publishRejection(licenseID, reason string, body []byte) {
+	if h.eventPublisher == nil {
+		return
+	}
+	hash := sha256.Sum256(body)
+	data, _ := json.Marshal(map[string]string{
+		"license_id":   licenseID,
+		"reason_code":  reason,
+		"payload_hash": hex.EncodeToString(hash[:]),
+		"region":       h.region,
+	})
+	if err := h.eventPublisher.Publish(context.Background(), "events.ingress.rejection", data); err != nil {
+		slog.Warn("publish rejection event", "err", err)
+	}
+}
+
+func checkTimestamp(header http.Header, now time.Time, window time.Duration) error {
+	raw := header.Get("X-ExecRelay-Timestamp")
+	if raw == "" {
+		return nil // header absent → skip (backward-compatible)
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return errors.New("invalid timestamp format")
+	}
+	diff := now.Sub(time.Unix(ts, 0))
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > window {
+		return errors.New("timestamp outside acceptable window")
+	}
+	return nil
+}
+
+func signalProto(signal parser.Signal, record LicenseRecord, region, traceID string, body []byte, received time.Time) *execrelaypb.Signal {
+	hash := sha256.Sum256(body)
+	wire := &execrelaypb.Signal{
+		TraceId:          traceID,
+		LicenseId:        signal.LicenseID,
+		InstanceId:       record.InstanceID,
+		Command:          signal.Command.String(),
+		RawCommand:       signal.RawCommand,
+		Symbol:           signal.Symbol,
+		IngressRegion:    region,
+		ReceivedUnixNano: received.UnixNano(),
+		BodySha256:       hex.EncodeToString(hash[:]),
+		Params:           make([]*execrelaypb.SignalParam, 0, signal.ParamCount),
+	}
+	for i := 0; i < signal.ParamCount; i++ {
+		param := signal.Params[i]
+		if param.Kind == parser.ParamSecret {
+			continue
+		}
+		wire.Params = append(wire.Params, &execrelaypb.SignalParam{Key: param.Key, Value: param.Value})
+	}
+	return wire
+}
+
+func validSecret(signal parser.Signal, want string) bool {
+	param, ok := signal.Param(parser.ParamSecret)
+	return ok && constantStringEqual(param.Value, want)
+}
+
+func validSignature(body []byte, secret string, header http.Header) bool {
+	signature := header.Get("X-ExecRelay-Signature")
+	if signature == "" {
+		signature = header.Get("X-Signature")
+	}
+	if signature == "" {
+		signature = header.Get("X-Hub-Signature-256")
+	}
+	if strings.HasPrefix(signature, "sha256=") {
+		signature = signature[len("sha256="):]
+	}
+	if len(signature) != sha256.Size*2 {
+		return false
+	}
+
+	got, err := hex.DecodeString(signature)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	want := mac.Sum(nil)
+	return hmac.Equal(got, want)
+}
+
+func signalSubject(licenseID, instanceID, platform string) string {
+	if platform == "" {
+		platform = "mt5"
+	}
+	return "signals." + platform + "." + licenseID + "." + instanceID
+}
+
+func validSubjectToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func traceIDFromRequest(header http.Header) string {
+	if traceID := strings.TrimSpace(header.Get("X-ExecRelay-Trace-ID")); traceID != "" {
+		return traceID
+	}
+	traceparent := header.Get("Traceparent")
+	if len(traceparent) >= 55 && traceparent[2] == '-' && traceparent[35] == '-' {
+		return traceparent[3:35]
+	}
+	return ""
+}
+
+func newTraceID() string {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(bytes[:])
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i > 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return strings.TrimSpace(ip)
+	}
+	addr := r.RemoteAddr
+	if i := strings.LastIndexByte(addr, ':'); i > 0 {
+		return addr[:i]
+	}
+	return addr
+}
+
+func reject(code string, err error) map[string]string {
+	response := map[string]string{"error": code}
+	if parseErr, ok := err.(parser.ParseError); ok {
+		response["reason"] = parseErr.Error()
+		response["field"] = parseErr.Field
+		return response
+	}
+	response["reason"] = err.Error()
+	return response
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload map[string]string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func Shutdown(ctx context.Context, publisher Publisher) error {
+	done := make(chan struct{})
+	go func() {
+		publisher.Close()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
+
+// ipRateLimiter is a simple per-IP token bucket (no external deps).
+type ipRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*tokenBucket
+	rate    float64 // tokens per second
+	burst   int
+}
+
+type tokenBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+const bucketIdleExpiry = 10 * time.Minute
+
+func newIPRateLimiter(ratePerSec float64, burst int) *ipRateLimiter {
+	l := &ipRateLimiter{
+		buckets: make(map[string]*tokenBucket),
+		rate:    ratePerSec,
+		burst:   burst,
+	}
+	go l.cleanupLoop()
+	return l
+}
+
+func (l *ipRateLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[ip]
+	if !ok {
+		b = &tokenBucket{tokens: float64(l.burst), last: time.Now()}
+		l.buckets[ip] = b
+	}
+	now := time.Now()
+	elapsed := now.Sub(b.last).Seconds()
+	b.tokens = math.Min(float64(l.burst), b.tokens+elapsed*l.rate)
+	b.last = now
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+// cleanupLoop removes buckets that haven't been seen for bucketIdleExpiry.
+func (l *ipRateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(bucketIdleExpiry / 2)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-bucketIdleExpiry)
+		l.mu.Lock()
+		for ip, b := range l.buckets {
+			if b.last.Before(cutoff) {
+				delete(l.buckets, ip)
+			}
+		}
+		l.mu.Unlock()
+	}
+}

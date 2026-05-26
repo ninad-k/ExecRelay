@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d AS build
+WORKDIR /build
+COPY apps/portal-api/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir --target /deps -r requirements.txt
+COPY apps/portal-api/app.py ./app.py
+RUN PYTHONPATH=/deps python -m py_compile app.py
+
+FROM python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d AS runtime
+LABEL org.opencontainers.image.title="ExecRelay Portal API" \
+      org.opencontainers.image.description="ExecRelay REST API for license, instance, and signal management" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/ninadk/execrelay"
+RUN groupadd --system execrelay && useradd --system --gid execrelay --home-dir /app --shell /usr/sbin/nologin execrelay
+WORKDIR /app
+COPY --from=build /deps /app/deps
+COPY --from=build /build/app.py /app/app.py
+RUN chown -R execrelay:execrelay /app
+USER execrelay
+EXPOSE 8080
+ENV HTTP_ADDR=0.0.0.0:8080 PYTHONPATH=/app/deps
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 CMD ["python", "/app/app.py", "--healthcheck"]
+CMD ["python", "/app/app.py"]
