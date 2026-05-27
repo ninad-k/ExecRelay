@@ -1,0 +1,3 @@
+asyncpg
+nats-py
+prometheus-client
