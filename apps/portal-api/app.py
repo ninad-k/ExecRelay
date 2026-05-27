@@ -1260,6 +1260,179 @@ async def _own_license(pool: asyncpg.Pool, license_id: str, user_id: Any) -> Any
 
 
 # ---------------------------------------------------------------------------
+# Trade journal export
+# ---------------------------------------------------------------------------
+#
+# Exports fills (executed trades) for the authenticated user as CSV or JSON
+# over a date range. Streams the rows so a large export doesn't materialize the
+# whole result set in memory. Always scoped to the requesting user's licenses
+# via the JOIN on licenses.user_id — never returns another user's data.
+#
+# GET /journal/export?from=2025-01-01&to=2025-12-31&format=csv
+# GET /journal/export?from=2025-01-01&to=2025-12-31&format=json
+#
+# from/to are ISO dates (date-only); the range is inclusive on `from` and
+# exclusive on `to`. Default `to` is today; default `from` is 30 days ago.
+
+from fastapi.responses import StreamingResponse  # noqa: E402
+
+JOURNAL_MAX_ROWS = 200_000
+
+
+@app.get("/journal/export")
+async def journal_export(
+    from_: str | None = None,
+    to: str | None = None,
+    format: str = "csv",
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> StreamingResponse:
+    # FastAPI query alias to accept ?from= (Python keyword)
+    from_value = from_
+
+    fmt = format.lower().strip()
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+
+    now = _time.time()
+    try:
+        end_ts = (
+            _datetime.fromisoformat(to).replace(tzinfo=_timezone.utc)
+            if to
+            else _datetime.fromtimestamp(now, _timezone.utc)
+        )
+        start_ts = (
+            _datetime.fromisoformat(from_value).replace(tzinfo=_timezone.utc)
+            if from_value
+            else end_ts - _timedelta(days=30)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid date: {exc}") from exc
+
+    if start_ts >= end_ts:
+        raise HTTPException(status_code=400, detail="from must be before to")
+
+    # Bound the result set so a runaway export can't OOM the server.
+    sql = (
+        "SELECT f.id::text AS fill_id, f.trace_id, f.broker_order_id, "
+        "       f.status, f.error_code, f.error_message, f.payload, "
+        "       f.created_at, l.license_key, i.instance_key "
+        "  FROM fills f "
+        "  JOIN licenses l ON l.id = f.license_id "
+        "  LEFT JOIN instances i ON i.id = f.instance_id "
+        " WHERE l.user_id = $1 AND f.created_at >= $2 AND f.created_at < $3 "
+        " ORDER BY f.created_at ASC "
+        " LIMIT $4"
+    )
+
+    if fmt == "csv":
+        return StreamingResponse(
+            _stream_csv(pool, sql, user["id"], start_ts, end_ts),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="execrelay-journal-'
+                    f'{start_ts.date()}-{end_ts.date()}.csv"'
+                ),
+            },
+        )
+
+    return StreamingResponse(
+        _stream_json(pool, sql, user["id"], start_ts, end_ts),
+        media_type="application/json",
+    )
+
+
+async def _stream_csv(
+    pool: asyncpg.Pool,
+    sql: str,
+    user_id: str,
+    start_ts: "_datetime",
+    end_ts: "_datetime",
+) -> "_AsyncIterator[str]":
+    yield (
+        "fill_id,trace_id,broker_order_id,status,error_code,"
+        "error_message,license_key,instance_key,created_at,payload_json\n"
+    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            async for row in conn.cursor(
+                sql, user_id, start_ts, end_ts, JOURNAL_MAX_ROWS
+            ):
+                yield _csv_row(row)
+
+
+async def _stream_json(
+    pool: asyncpg.Pool,
+    sql: str,
+    user_id: str,
+    start_ts: "_datetime",
+    end_ts: "_datetime",
+) -> "_AsyncIterator[str]":
+    yield '{"fills":['
+    first = True
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            async for row in conn.cursor(
+                sql, user_id, start_ts, end_ts, JOURNAL_MAX_ROWS
+            ):
+                if not first:
+                    yield ","
+                first = False
+                yield _json_row(row)
+    yield "]}"
+
+
+def _csv_row(row: "asyncpg.Record") -> str:
+    fields = [
+        row["fill_id"],
+        row["trace_id"] or "",
+        row["broker_order_id"] or "",
+        row["status"],
+        row["error_code"] or "",
+        row["error_message"] or "",
+        row["license_key"],
+        row["instance_key"] or "",
+        row["created_at"].isoformat(),
+        _json.dumps(row["payload"]) if row["payload"] is not None else "",
+    ]
+    return ",".join(_csv_escape(str(f)) for f in fields) + "\n"
+
+
+def _json_row(row: "asyncpg.Record") -> str:
+    return _json.dumps(
+        {
+            "fill_id": row["fill_id"],
+            "trace_id": row["trace_id"],
+            "broker_order_id": row["broker_order_id"],
+            "status": row["status"],
+            "error_code": row["error_code"],
+            "error_message": row["error_message"],
+            "license_key": row["license_key"],
+            "instance_key": row["instance_key"],
+            "created_at": row["created_at"].isoformat(),
+            "payload": row["payload"],
+        }
+    )
+
+
+def _csv_escape(s: str) -> str:
+    if any(c in s for c in (",", '"', "\n", "\r")):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+# Local imports to avoid disturbing the top of the file. Aliased with leading
+# underscores so they're not part of the module's public surface.
+import json as _json  # noqa: E402
+import time as _time  # noqa: E402
+from datetime import datetime as _datetime  # noqa: E402
+from datetime import timedelta as _timedelta  # noqa: E402
+from datetime import timezone as _timezone  # noqa: E402
+from typing import AsyncIterator as _AsyncIterator  # noqa: E402, F401
+
+
+# ---------------------------------------------------------------------------
 # Entry point (uvicorn)
 # ---------------------------------------------------------------------------
 
