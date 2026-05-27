@@ -1,0 +1,27 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="02. Bridge" type="GoApplicationRunConfiguration" factoryName="Go Application">
+    <option name="CGO_ENABLED" value="false" />
+    <method v="2" is_startup_fragment="false">
+      <option name="RunConfigurationTask" runConfigurationName="02. Bridge" />
+    </method>
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="EXECUTABLE_NAME" value="" />
+    <option name="PROGRAM_PARAMETERS" value="" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <element name="module" value="execrelay" />
+    <element name="envs">
+      <env name="DEBUG" value="true" />
+      <env name="HTTP_ADDR" value=":8081" />
+      <env name="NATS_URL" value="nats://localhost:4222" />
+      <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+      <env name="EA_CONNECTION_TIMEOUT_SECS" value="10" />
+      <env name="CIRCUIT_BREAKER_FAILURE_THRESHOLD" value="5" />
+      <env name="CIRCUIT_BREAKER_SUCCESS_THRESHOLD" value="2" />
+    </element>
+    <kind value="DIRECTORY" />
+    <filePath value="$PROJECT_DIR$/apps/bridge/cmd/bridge/main.go" />
+  </configuration>
+</component>

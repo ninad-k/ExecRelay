@@ -1,0 +1,17 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="00. All Services (Compound)" type="CompoundRunConfigurationType">
+    <toRun name="01. Ingress" type="GoApplicationRunConfiguration" />
+    <toRun name="02. Bridge" type="GoApplicationRunConfiguration" />
+    <toRun name="03. DXTrade" type="GoApplicationRunConfiguration" />
+    <toRun name="04. Persist" type="PythonConfigurationType" />
+    <toRun name="05. Portal API" type="PythonConfigurationType" />
+    <toRun name="06. Risk" type="PythonConfigurationType" />
+    <toRun name="07. Tasks" type="PythonConfigurationType" />
+    <toRun name="08. Analytics" type="PythonConfigurationType" />
+    <toRun name="09. Reports" type="PythonConfigurationType" />
+    <toRun name="10. Backtester" type="PythonConfigurationType" />
+    <toRun name="11. ML Feature Extractor" type="PythonConfigurationType" />
+    <toRun name="12. ML Predictor" type="PythonConfigurationType" />
+    <method v="2" />
+  </configuration>
+</component>
