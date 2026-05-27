@@ -1,0 +1,14 @@
+-- Intentionally empty.
+--
+-- Reversing 000001_foundation would drop 22 tables and the timescaledb
+-- extension, which would destroy all user, license, fills, and audit data.
+-- Doing that automatically with `migrate down` is too dangerous.
+--
+-- If you genuinely need to roll back this migration:
+--   1. Take a backup.
+--   2. Drop tables manually in reverse dependency order.
+--   3. Use `migrate force 0` to reset the version pointer.
+--
+-- For schema changes after 000001, prefer adding a new forward migration
+-- (000004, 000005, ...) that ALTERs or DROPs specific objects.
+SELECT 1;

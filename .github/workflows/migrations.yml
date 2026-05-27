@@ -1,0 +1,54 @@
+name: migrations
+
+on:
+  pull_request:
+    paths:
+      - 'infra/migrations/**'
+      - '.github/workflows/migrations.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/migrations/**'
+      - '.github/workflows/migrations.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apply-migrations:
+    name: Apply migrations against a fresh Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: execrelay
+          POSTGRES_PASSWORD: execrelay_dev_password
+          POSTGRES_DB: execrelay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U execrelay"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install migrate CLI
+        run: |
+          curl -fsSL https://github.com/golang-migrate/migrate/releases/download/v4.18.1/migrate.linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin migrate
+          migrate -version
+
+      - name: migrate up
+        env:
+          DATABASE_URL: postgres://execrelay:execrelay_dev_password@localhost:5432/execrelay?sslmode=disable
+        run: migrate -path infra/migrations -database "$DATABASE_URL" up
+
+      - name: Verify schema_migrations table populated
+        env:
+          PGPASSWORD: execrelay_dev_password
+        run: |
+          sudo apt-get -qq install -y postgresql-client
+          psql -h localhost -U execrelay -d execrelay -c "SELECT version, dirty FROM schema_migrations;"

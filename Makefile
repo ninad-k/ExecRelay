@@ -17,6 +17,27 @@ install-hooks:
 lint:
 	pre-commit run --all-files
 
+# ---- Database migrations (golang-migrate) ----
+# Install CLI:  brew install golang-migrate
+MIGRATE_PATH := infra/migrations
+MIGRATE_DB   ?= postgres://$(or $(POSTGRES_USER),execrelay):$(or $(POSTGRES_PASSWORD),execrelay_dev_password)@localhost:5432/$(or $(POSTGRES_DB),execrelay)?sslmode=disable
+N            ?= 1
+
+.PHONY: migrate-up migrate-down migrate-status migrate-new
+
+migrate-up:
+	migrate -path $(MIGRATE_PATH) -database "$(MIGRATE_DB)" up
+
+migrate-down:
+	migrate -path $(MIGRATE_PATH) -database "$(MIGRATE_DB)" down $(N)
+
+migrate-status:
+	migrate -path $(MIGRATE_PATH) -database "$(MIGRATE_DB)" version
+
+migrate-new:
+	@if [ -z "$(NAME)" ]; then echo "Usage: make migrate-new NAME=<short_description>"; exit 1; fi
+	migrate create -ext sql -dir $(MIGRATE_PATH) -seq $(NAME)
+
 
 check: compose-config test bench docker-build
 
