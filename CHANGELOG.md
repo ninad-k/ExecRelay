@@ -1,4 +1,13 @@
-# Changes
+# Changelog
+
+All notable changes to this project. The format loosely follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); historical
+entries use the project's earlier phase-based naming and are kept
+verbatim for the audit trail.
+
+For unreleased changes, see [`git log main`](https://github.com/ninad-k/ExecRelay/commits/main).
+
+---
 
 ## Phase 13 -- MT4 EA + WebSocket DLL + Supplementary
 

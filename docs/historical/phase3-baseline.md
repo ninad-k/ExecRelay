@@ -1,5 +1,11 @@
 # Phase 3: Load Testing - Baseline Results
 
+> **Historical snapshot.** This file captures the state of the system
+> at a specific point in time (Phase 3 release). Numbers here are NOT
+> current — see [`loadtest-results.txt`](../../loadtest-results.txt)
+> for the most recent run and re-run `make loadtest-suite` for fresh
+> data. Kept here for the audit trail.
+
 ## Summary
 Load test suite executed against docker-compose services with single-instance deployments (ingress, bridge, persist, postgres, nats, redis). Tests ran for 1 minute per rate setting.
 
