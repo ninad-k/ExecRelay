@@ -28,3 +28,9 @@ PASS: 0.0% success rate, p99=0.00ms
 WARNING: Success rate below 99%
 
 --- Webhook Throughput Test: 500 req/s ---
+Total: 29951 | Success: 0 (0.0%) | Failed: 29951
+Error codes: 429: 29891 401: 60
+
+PASS: 0.0% success rate, p99=0.00ms
+
+WARNING: Success rate below 99%

@@ -41,7 +41,7 @@ echo ""
 echo "[2/6] Building Docker images in minikube..."
 eval $(minikube docker-env)
 
-SERVICES=("ingress" "bridge" "dxtrade" "persist" "portal-api" "tasks" "analytics" "reports" "portal-web")
+SERVICES=("ingress" "bridge" "dxtrade" "persist" "risk" "portal-api" "tasks" "analytics" "reports" "ml-feature-extractor" "ml-predictor" "backtester" "portal-web")
 for service in "${SERVICES[@]}"; do
   echo "   Building execrelay-$service..."
   docker build \
@@ -60,8 +60,17 @@ echo "✓ Namespace '$NAMESPACE' ready"
 # 4. Get host IP for database connections
 echo ""
 echo "[4/6] Configuring database access..."
-HOST_IP=$(minikube ssh "route -n | grep ^ | awk '{ print \$3; exit }'")
-echo "   Host IP (from minikube): $HOST_IP"
+HOST_IP=$(minikube ssh "cat /etc/hosts | grep host.minikube.internal | awk '{print \$1}'")
+# Trim whitespace using Bash parameter expansion
+HOST_IP="${HOST_IP#"${HOST_IP%%[![:space:]]*}"}"   # Remove leading whitespace
+HOST_IP="${HOST_IP%"${HOST_IP##*[![:space:]]}"}"   # Remove trailing whitespace
+if [ -z "$HOST_IP" ]; then
+  # Fallback: get default gateway
+  HOST_IP=$(minikube ssh "ip route | grep default | awk '{print \$3}'")
+  HOST_IP="${HOST_IP#"${HOST_IP%%[![:space:]]*}"}"
+  HOST_IP="${HOST_IP%"${HOST_IP##*[![:space:]]}"}"
+fi
+echo "   Host IP (from minikube): [$HOST_IP]"
 
 # Update values file with host IP
 TEMP_VALUES=$(mktemp)

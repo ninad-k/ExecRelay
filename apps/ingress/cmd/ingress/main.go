@@ -13,17 +13,24 @@ import (
 	"github.com/ninadk/execrelay/apps/ingress/internal/ingress"
 )
 
+var logger *slog.Logger
+
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "run a local health probe")
 	flag.Parse()
-
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	cfg, err := ingress.ConfigFromEnv()
 	if err != nil {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
+
+	logLevel := slog.LevelInfo
+	if cfg.Debug {
+		logLevel = slog.LevelDebug
+	}
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	slog.SetDefault(logger)
 
 	if *healthcheck {
 		addr := cfg.HTTPAddr
@@ -61,7 +68,12 @@ func main() {
 		TimestampWindow: cfg.TimestampWindow,
 		RateLimit:       cfg.RateLimit,
 		AllowedCIDRs:    cfg.AllowedCIDRs,
+		Debug:           cfg.Debug,
 	})
+
+	if cfg.Debug {
+		slog.Info("debug logging enabled")
+	}
 
 	server := ingress.NewServer(cfg, handler.Routes())
 

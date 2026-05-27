@@ -119,4 +119,61 @@ export const api = {
       { method: 'POST' },
     )
   },
+
+  correlateSignals(licenseId: string, signalIds: string[]) {
+    return apiFetch<{
+      signals: Signal[]
+      correlation_matrix: Record<string, number>
+      symbol_groups: Record<string, number>
+      conflicts: string[]
+    }>(`/licenses/${licenseId}/signals/correlate`, {
+      method: 'POST',
+      body: JSON.stringify({ signal_ids: signalIds }),
+    })
+  },
+
+  getPortfolioExposure(licenseId: string) {
+    return apiFetch<{
+      license_id: string
+      accounts: Array<{
+        account_id: string
+        notional_usd: number
+        limit_usd: number
+        utilization_pct: number
+        positions: Array<{
+          symbol: string
+          size: number
+        }>
+      }>
+    }>(`/licenses/${licenseId}/portfolio-exposure`)
+  },
+
+  getRiskMetrics(licenseId: string) {
+    return apiFetch<{
+      license_id: string
+      accounts: Array<{
+        account_id: string
+        notional_exposure: number
+        exposure_limit: number
+        exposure_ratio: number
+        peak_equity: number
+        current_equity: number
+        drawdown_pct: number
+        largest_position: {
+          symbol: string
+          size: number
+          value: number
+        } | null
+      }>
+      total_exposure: number
+      total_limit: number
+      breaches: Array<{
+        account_id: string
+        breach_type: string
+        current_value: number
+        limit_value: number
+        created_at: string
+      }>
+    }>(`/licenses/${licenseId}/risk-metrics`)
+  },
 }

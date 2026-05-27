@@ -19,6 +19,7 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
 )
+DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 FILL_TIMEOUT_SECS = int(os.environ.get("FILL_TIMEOUT_SECS", "30"))
 FILL_CHECK_INTERVAL = int(os.environ.get("FILL_CHECK_INTERVAL", "60"))
@@ -26,11 +27,15 @@ RETENTION_INTERVAL = int(os.environ.get("RETENTION_INTERVAL", "86400"))
 TASK_POLL_INTERVAL = int(os.environ.get("TASK_POLL_INTERVAL", "10"))
 
 logger = logging.getLogger(SERVICE)
+log_level = logging.DEBUG if DEBUG else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     stream=sys.stdout,
 )
+
+if DEBUG:
+    logger.info("Debug logging enabled")
 
 
 # ---------------------------------------------------------------------------

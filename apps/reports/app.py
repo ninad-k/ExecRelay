@@ -21,15 +21,20 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
 )
+DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 
 REPORT_TYPES = {"daily_signal_summary", "weekly_performance"}
 
 logger = logging.getLogger(SERVICE)
+log_level = logging.DEBUG if DEBUG else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     stream=sys.stdout,
 )
+
+if DEBUG:
+    logger.info("Debug logging enabled")
 
 _pool: asyncpg.Pool | None = None
 

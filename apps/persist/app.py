@@ -22,11 +22,16 @@ HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
 NATS_URL  = os.environ.get("NATS_URL",  "nats://nats:4222")
 DB_DSN    = os.environ.get("DATABASE_URL",
                             "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
+DEBUG     = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 
 logger = logging.getLogger(SERVICE)
-logging.basicConfig(level=logging.INFO,
+log_level = logging.DEBUG if DEBUG else logging.INFO
+logging.basicConfig(level=log_level,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s",
                     stream=sys.stdout)
+
+if DEBUG:
+    logger.info("Debug logging enabled")
 
 # Prometheus metrics
 signals_processed = Counter("persist_signals_processed_total", "Total signals processed")

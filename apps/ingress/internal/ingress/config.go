@@ -28,6 +28,7 @@ type Config struct {
 	TimestampWindow time.Duration
 	RateLimit       int
 	AllowedCIDRs    []*net.IPNet
+	Debug           bool
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -38,6 +39,7 @@ func ConfigFromEnv() (Config, error) {
 		MaxBodyBytes: defaultMaxBodyBytes,
 		ReadTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
+		Debug:        getenvBool("DEBUG", true),
 	}
 
 	if raw := os.Getenv("MAX_BODY_BYTES"); raw != "" {
@@ -108,6 +110,21 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func getenvBool(key string, defaultValue bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return defaultValue
+	}
 }
 
 func NewServer(cfg Config, handler http.Handler) *http.Server {

@@ -1,3 +1,6 @@
+nameOverride: ""
+fullnameOverride: ""
+
 image:
   registry: docker.io
   pullPolicy: IfNotPresent
@@ -122,3 +125,7 @@ jwtSecret: "changeme-in-minikube"
 licenses: ""
 pagerdutyKey: ""
 slackWebhookUrl: ""
+
+prometheus:
+  enabled: false
+  interval: 30s

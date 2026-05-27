@@ -8,7 +8,7 @@ metadata:
     {{- include "execrelay.labels" . | nindent 4 }}
     app.kubernetes.io/component: {{ $serviceName }}
 spec:
-  type: {{ $service.service.type | default "ClusterIP" }}
+  type: {{ if $service.service }}{{ $service.service.type }}{{ else }}ClusterIP{{ end }}
   ports:
   {{- if eq $serviceName "portal-web" }}
   - port: 80

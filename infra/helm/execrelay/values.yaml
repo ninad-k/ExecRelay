@@ -89,6 +89,23 @@ services:
       HTTP_ADDR: "0.0.0.0:8080"
     envFrom: []
 
+  risk:
+    image:
+      repository: execrelay-risk
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_PORT: "8080"
+    envFrom: []
+
   "portal-api":
     image:
       repository: execrelay-portal-api
@@ -158,6 +175,57 @@ services:
         memory: 512Mi
     env:
       HTTP_ADDR: "0.0.0.0:8080"
+    envFrom: []
+
+  "ml-feature-extractor":
+    image:
+      repository: execrelay-ml-feature-extractor
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_PORT: "8080"
+    envFrom: []
+
+  "ml-predictor":
+    image:
+      repository: execrelay-ml-predictor
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    env:
+      HTTP_PORT: "8080"
+    envFrom: []
+
+  backtester:
+    image:
+      repository: execrelay-backtester
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_PORT: "8080"
     envFrom: []
 
   "portal-web":

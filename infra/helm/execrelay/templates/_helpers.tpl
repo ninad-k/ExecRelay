@@ -2,59 +2,44 @@
 Expand the name of the chart.
 */}}
 {{- define "execrelay.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+execrelay
 {{- end }}
 
 {{/*
 Create a default fully qualified app name.
 */}}
 {{- define "execrelay.fullname" -}}
-{{- if .Values.fullnameOverride }}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
-{{- else }}
-{{- $name := default .Chart.Name .Values.nameOverride }}
-{{- if contains $name .Release.Name }}
-{{- .Release.Name | trunc 63 | trimSuffix "-" }}
-{{- else }}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
-{{- end }}
-{{- end }}
+execrelay
 {{- end }}
 
 {{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "execrelay.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+execrelay-0.1.0
 {{- end }}
 
 {{/*
 Common labels
 */}}
 {{- define "execrelay.labels" -}}
-helm.sh/chart: {{ include "execrelay.chart" . }}
-{{ include "execrelay.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-{{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: execrelay-0.1.0
+app.kubernetes.io/name: execrelay
+app.kubernetes.io/instance: execrelay
+app.kubernetes.io/managed-by: Helm
 {{- end }}
 
 {{/*
 Selector labels
 */}}
 {{- define "execrelay.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "execrelay.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/name: execrelay
+app.kubernetes.io/instance: execrelay
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
 {{- define "execrelay.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "execrelay.fullname" .) .Values.serviceAccount.name }}
-{{- else }}
-{{- default "default" .Values.serviceAccount.name }}
-{{- end }}
+execrelay
 {{- end }}

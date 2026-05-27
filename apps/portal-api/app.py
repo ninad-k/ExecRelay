@@ -39,9 +39,14 @@ INGRESS_URL = os.environ.get("INGRESS_URL", "http://ingress:8080")
 SIGNALS_STREAM = os.environ.get("SIGNALS_STREAM", "SIGNALS")
 
 logger = logging.getLogger(SERVICE)
-logging.basicConfig(level=logging.INFO,
+DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
+log_level = logging.DEBUG if DEBUG else logging.INFO
+logging.basicConfig(level=log_level,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s",
                     stream=sys.stdout)
+
+if DEBUG:
+    logger.info("Debug logging enabled")
 
 if JWT_SECRET == "changeme-in-production":
     logger.warning("JWT_SECRET is using the default value — set it before any non-local deployment")
@@ -721,6 +726,258 @@ async def replay_signal(
                  reason=f"original_trace_id={row['trace_id']} new_trace_id={new_trace_id}")
 
     return {"trace_id": new_trace_id, "subject": subject}
+
+
+@app.post("/licenses/{license_id}/signals/correlate")
+async def correlate_signals(
+    license_id: str,
+    body: dict[str, Any],
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    lic = await _own_license(pool, license_id, user["id"])
+    signal_ids = body.get("signal_ids", [])
+
+    if not signal_ids or len(signal_ids) < 2:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least 2 signals required")
+
+    signals = await pool.fetch(
+        "SELECT id, symbol, command, entry_price FROM accepted_signals "
+        "WHERE id = ANY($1) AND license_id = $2",
+        signal_ids, lic["id"],
+    )
+
+    if not signals:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "signals not found")
+
+    symbol_groups = {}
+    for sig in signals:
+        sym = sig["symbol"]
+        if sym not in symbol_groups:
+            symbol_groups[sym] = []
+        symbol_groups[sym].append(sig)
+
+    correlations = {}
+    for sym_a, sym_b in [(list(symbol_groups.keys())[i], list(symbol_groups.keys())[j])
+                          for i in range(len(symbol_groups))
+                          for j in range(i+1, len(symbol_groups))]:
+        corr = await pool.fetchval(
+            "SELECT correlation_coefficient FROM symbol_correlations "
+            "WHERE license_id = $1 AND symbol_a = $2 AND symbol_b = $3",
+            lic["id"], sym_a, sym_b,
+        )
+        if corr is not None:
+            correlations[f"{sym_a}-{sym_b}"] = corr
+
+    conflicts = []
+    for sym, sigs in symbol_groups.items():
+        commands = [s["command"] for s in sigs]
+        if "buy" in commands and "sell" in commands:
+            conflicts.append(f"{sym}: conflicting buy/sell signals")
+
+    return {
+        "signals": [{"id": s["id"], "symbol": s["symbol"], "command": s["command"]} for s in signals],
+        "correlation_matrix": correlations,
+        "symbol_groups": {k: len(v) for k, v in symbol_groups.items()},
+        "conflicts": conflicts,
+    }
+
+
+@app.post("/licenses/{license_id}/signal-groups", status_code=status.HTTP_201_CREATED)
+async def create_signal_group(
+    license_id: str,
+    body: dict[str, Any],
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    lic = await _own_license(pool, license_id, user["id"])
+    signal_ids = body.get("signal_ids", [])
+    group_name = body.get("group_name", "")
+
+    if not signal_ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "signal_ids required")
+
+    group_id = await pool.fetchval(
+        "INSERT INTO signal_groups (license_id, group_name, metadata) "
+        "VALUES ($1, $2, $3) RETURNING id",
+        lic["id"], group_name, body.get("metadata", {}),
+    )
+
+    for sig_id in signal_ids:
+        await pool.execute(
+            "INSERT INTO signal_group_members (group_id, signal_id, membership_reason) "
+            "VALUES ($1, $2, $3)",
+            group_id, sig_id, body.get("reason", "user_grouped"),
+        )
+
+    return {"group_id": group_id, "signal_count": len(signal_ids)}
+
+
+@app.get("/licenses/{license_id}/portfolio-exposure")
+async def portfolio_exposure(
+    license_id: str,
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    lic = await _own_license(pool, license_id, user["id"])
+
+    accounts = await pool.fetch(
+        "SELECT DISTINCT account_id FROM account_positions WHERE license_id = $1",
+        lic["id"],
+    )
+
+    result = {"license_id": str(lic["id"]), "accounts": []}
+
+    for account_row in accounts:
+        account_id = account_row["account_id"]
+
+        positions = await pool.fetch(
+            "SELECT symbol, position_size, entry_price, current_price FROM account_positions "
+            "WHERE license_id = $1 AND account_id = $2",
+            lic["id"], account_id,
+        )
+
+        limit = await pool.fetchrow(
+            "SELECT max_notional_usd, max_position_size_pct, max_loss_pct FROM portfolio_exposure_limits "
+            "WHERE license_id = $1 AND account_id = $2",
+            lic["id"], account_id,
+        )
+
+        notional = sum(float(p["position_size"]) * float(p["current_price"] or p["entry_price"] or 1.0)
+                      for p in positions)
+        limit_usd = float(limit["max_notional_usd"] or 200000) if limit else 200000
+
+        result["accounts"].append({
+            "account_id": account_id,
+            "notional_usd": notional,
+            "limit_usd": limit_usd,
+            "utilization_pct": round(notional / limit_usd * 100, 2),
+            "positions": [{"symbol": p["symbol"], "size": float(p["position_size"])} for p in positions],
+        })
+
+    return result
+
+
+@app.get("/licenses/{license_id}/risk-metrics")
+async def risk_metrics(
+    license_id: str,
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    lic = await _own_license(pool, license_id, user["id"])
+
+    accounts = await pool.fetch(
+        "SELECT DISTINCT account_id FROM account_drawdowns WHERE license_id = $1",
+        lic["id"],
+    )
+
+    result = {
+        "license_id": str(lic["id"]),
+        "accounts": [],
+        "total_exposure": 0,
+        "total_limit": 0,
+        "breaches": [],
+    }
+
+    for account_row in accounts:
+        account_id = account_row["account_id"]
+
+        drawdown = await pool.fetchrow(
+            "SELECT peak_equity, current_equity, drawdown_pct FROM account_drawdowns "
+            "WHERE license_id = $1 AND account_id = $2",
+            lic["id"], account_id,
+        )
+
+        positions = await pool.fetch(
+            "SELECT symbol, position_size, current_price FROM account_positions "
+            "WHERE license_id = $1 AND account_id = $2 AND position_size != 0",
+            lic["id"], account_id,
+        )
+
+        notional = sum(float(p["position_size"]) * float(p["current_price"] or 0)
+                      for p in positions)
+
+        limit = await pool.fetchrow(
+            "SELECT max_notional_usd FROM portfolio_exposure_limits "
+            "WHERE license_id = $1 AND account_id = $2",
+            lic["id"], account_id,
+        )
+
+        limit_usd = float(limit["max_notional_usd"]) if limit else 0
+        result["total_exposure"] += notional
+        result["total_limit"] += limit_usd
+
+        largest_position = max(
+            [(p["symbol"], p["position_size"], float(p["position_size"]) * float(p["current_price"] or 0))
+             for p in positions],
+            key=lambda x: abs(x[2]),
+            default=None,
+        )
+
+        result["accounts"].append({
+            "account_id": account_id,
+            "notional_exposure": notional,
+            "exposure_limit": limit_usd,
+            "exposure_ratio": round(notional / limit_usd * 100, 2) if limit_usd else 0,
+            "peak_equity": float(drawdown["peak_equity"]) if drawdown else 0,
+            "current_equity": float(drawdown["current_equity"]) if drawdown else 0,
+            "drawdown_pct": float(drawdown["drawdown_pct"]) if drawdown else 0,
+            "largest_position": {
+                "symbol": largest_position[0],
+                "size": float(largest_position[1]),
+                "value": float(largest_position[2]),
+            } if largest_position else None,
+        })
+
+    breaches = await pool.fetch(
+        "SELECT account_id, breach_type, current_value, limit_value, created_at "
+        "FROM risk_breach_log WHERE license_id = $1 ORDER BY created_at DESC LIMIT 20",
+        lic["id"],
+    )
+
+    result["breaches"] = [
+        {
+            "account_id": b["account_id"],
+            "breach_type": b["breach_type"],
+            "current_value": float(b["current_value"]),
+            "limit_value": float(b["limit_value"]),
+            "created_at": b["created_at"].isoformat(),
+        }
+        for b in breaches
+    ]
+
+    return result
+
+
+@app.post("/api/backtest", status_code=status.HTTP_200_OK)
+async def backtest(
+    body: dict[str, Any],
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    license_id = body.get("license_id")
+    date_start = body.get("date_start")
+    date_end = body.get("date_end")
+
+    if not license_id or not date_start or not date_end:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "license_id, date_start, date_end required")
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        try:
+            resp = await client.post(
+                "http://backtester:8080/backtest",
+                json={
+                    "license_id": license_id,
+                    "date_start": date_start,
+                    "date_end": date_end,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"backtester service error: {str(exc)[:200]}",
+            )
 
 
 @app.post("/licenses/{license_id}/test-signal", status_code=status.HTTP_202_ACCEPTED)

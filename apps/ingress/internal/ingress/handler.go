@@ -5,9 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -35,6 +37,8 @@ type Handler struct {
 	rateLimiter      *ipRateLimiter
 	allowedCIDRs     []*net.IPNet
 	dailyCounter     *dailyCounter
+	db               *sql.DB
+	debug            bool
 }
 
 type Options struct {
@@ -47,6 +51,8 @@ type Options struct {
 	TimestampWindow time.Duration
 	RateLimit       int // max requests per minute per IP; 0 = disabled
 	AllowedCIDRs    []*net.IPNet
+	DB              *sql.DB
+	Debug           bool
 }
 
 func NewHandler(opts Options) *Handler {
@@ -80,6 +86,8 @@ func NewHandler(opts Options) *Handler {
 		rateLimiter:     rl,
 		allowedCIDRs:    opts.AllowedCIDRs,
 		dailyCounter:    newDailyCounter(),
+		db:              opts.DB,
+		debug:           opts.Debug,
 	}
 }
 
@@ -96,20 +104,31 @@ func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
+	clientAddr := clientIP(r)
+	if h.debug {
+		slog.Debug("webhook request received", "client", clientAddr, "method", r.Method)
+	}
+
 	if r.Method != http.MethodPost {
+		if h.debug {
+			slog.Debug("rejecting non-POST request", "client", clientAddr, "method", r.Method)
+		}
 		w.Header().Set("Allow", http.MethodPost)
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
 		return
 	}
 
-	if h.rateLimiter != nil && !h.rateLimiter.allow(clientIP(r)) {
+	if h.rateLimiter != nil && !h.rateLimiter.allow(clientAddr) {
+		if h.debug {
+			slog.Debug("rate limit exceeded", "client", clientAddr)
+		}
 		recordRejection("rate_limit_exceeded")
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limit_exceeded"})
 		return
 	}
 
 	if len(h.allowedCIDRs) > 0 {
-		ip := net.ParseIP(clientIP(r))
+		ip := net.ParseIP(clientAddr)
 		allowed := false
 		if ip != nil {
 			for _, cidr := range h.allowedCIDRs {
@@ -120,35 +139,62 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !allowed {
+			if h.debug {
+				slog.Debug("IP not in allowed CIDRs", "client", clientAddr)
+			}
 			recordRejection("ip_not_allowed")
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "ip_not_allowed"})
 			return
+		}
+		if h.debug {
+			slog.Debug("IP allowed by CIDR", "client", clientAddr)
 		}
 	}
 
 	if h.timestampWindow > 0 {
 		if err := checkTimestamp(r.Header, h.now(), h.timestampWindow); err != nil {
+			if h.debug {
+				slog.Debug("timestamp validation failed", "client", clientAddr, "err", err)
+			}
 			recordRejection("timestamp_rejected")
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "timestamp_rejected", "reason": err.Error()})
 			return
+		}
+		if h.debug {
+			slog.Debug("timestamp valid", "client", clientAddr)
 		}
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
 	if err != nil {
+		if h.debug {
+			slog.Debug("failed to read body", "client", clientAddr, "err", err)
+		}
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
 		return
 	}
 	raw := string(body)
+	if h.debug {
+		slog.Debug("body received", "client", clientAddr, "size", len(body))
+	}
 
 	parsed, err := parser.Parse(raw)
 	if err != nil {
+		if h.debug {
+			slog.Debug("parse error", "client", clientAddr, "err", err)
+		}
 		writeJSON(w, http.StatusBadRequest, reject("parse_error", err))
 		return
+	}
+	if h.debug {
+		slog.Debug("signal parsed", "client", clientAddr, "license", parsed.LicenseID, "symbol", parsed.Symbol, "command", parsed.RawCommand)
 	}
 
 	record, err := h.store.Lookup(r.Context(), parsed.LicenseID)
 	if err != nil {
+		if h.debug {
+			slog.Debug("license lookup failed", "client", clientAddr, "license", parsed.LicenseID, "err", err)
+		}
 		status := http.StatusUnauthorized
 		if errors.Is(err, ErrLicenseInactive) {
 			status = http.StatusForbidden
@@ -157,31 +203,73 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": "license_rejected"})
 		return
 	}
+	if h.debug {
+		slog.Debug("license found", "client", clientAddr, "license", parsed.LicenseID, "instance", record.InstanceID)
+	}
 
 	if !validSubjectToken(parsed.LicenseID) || !validSubjectToken(record.InstanceID) {
+		if h.debug {
+			slog.Debug("invalid subject tokens", "client", clientAddr, "license", parsed.LicenseID)
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_route_token"})
 		return
 	}
 	if record.Secret != "" && !validSecret(parsed, record.Secret) {
+		if h.debug {
+			slog.Debug("secret validation failed", "client", clientAddr, "license", parsed.LicenseID)
+		}
 		h.publishRejection(parsed.LicenseID, "secret_rejected", body)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "secret_rejected"})
 		return
 	}
+	if h.debug && record.Secret != "" {
+		slog.Debug("secret validated", "client", clientAddr, "license", parsed.LicenseID)
+	}
+
 	if record.HMACSecret != "" {
 		primaryOK := validSignature(body, record.HMACSecret, r.Header)
 		pendingOK := record.PendingHMACSecret != "" && validSignature(body, record.PendingHMACSecret, r.Header)
 		if !primaryOK && !pendingOK {
+			if h.debug {
+				slog.Debug("signature validation failed", "client", clientAddr, "license", parsed.LicenseID)
+			}
 			h.publishRejection(parsed.LicenseID, "signature_rejected", body)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature_rejected"})
 			return
+		}
+		if h.debug {
+			slog.Debug("signature validated", "client", clientAddr, "license", parsed.LicenseID, "primary", primaryOK)
 		}
 	}
 
 	if record.MaxSignalsPerDay > 0 {
 		count := h.dailyCounter.Increment(parsed.LicenseID, h.now())
+		if h.debug {
+			slog.Debug("daily signal count", "license", parsed.LicenseID, "count", count, "limit", record.MaxSignalsPerDay)
+		}
 		if count > record.MaxSignalsPerDay {
+			if h.debug {
+				slog.Debug("daily plan limit exceeded", "client", clientAddr, "license", parsed.LicenseID)
+			}
 			recordRejection("plan_limit_exceeded")
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "plan_limit_exceeded"})
+			return
+		}
+	}
+
+	// Check exposure limits (Phase 7)
+	if h.db != nil && record.InstanceID != "" {
+		exposure := h.checkExposureLimits(r.Context(), parsed.LicenseID, record.InstanceID, h.db)
+		if h.debug {
+			slog.Debug("exposure check", "license", parsed.LicenseID, "account", record.InstanceID, "current", exposure.CurrentExposure, "limit", exposure.ExposureLimit)
+		}
+		if !exposure.AllowedToProceed {
+			if h.debug {
+				slog.Debug("exposure limit exceeded", "client", clientAddr, "license", parsed.LicenseID, "reason", exposure.Reason)
+			}
+			recordRejection("exposure_limit_exceeded")
+			h.publishRejection(parsed.LicenseID, "exposure_limit_exceeded", body)
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "exposure_limit_exceeded", "reason": exposure.Reason})
 			return
 		}
 	}
@@ -190,22 +278,46 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 	if traceID == "" {
 		traceID = newTraceID()
 	}
+	if h.debug {
+		slog.Debug("trace ID assigned", "trace_id", traceID, "license", parsed.LicenseID)
+	}
+
+	// Score signal with ML model (Phase 8)
+	mlConfidence, _ := h.scoreSignalWithML(r.Context(), parsed.Symbol, h.now().Unix())
+	if h.debug {
+		slog.Debug("ML scoring completed", "trace_id", traceID, "symbol", parsed.Symbol, "confidence", mlConfidence)
+	}
 
 	wire := signalProto(parsed, record, h.region, traceID, body, h.now())
 	payload, err := oldproto.Marshal(wire)
 	if err != nil {
+		if h.debug {
+			slog.Debug("protobuf encoding failed", "trace_id", traceID, "err", err)
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "encode_failed"})
 		return
 	}
+	if h.debug {
+		slog.Debug("signal encoded", "trace_id", traceID, "payload_size", len(payload))
+	}
 
 	subject := signalSubject(parsed.LicenseID, record.InstanceID, record.Platform)
+	if h.debug {
+		slog.Debug("publishing signal", "trace_id", traceID, "subject", subject)
+	}
 	if err := h.publisher.Publish(r.Context(), subject, payload); err != nil {
+		if h.debug {
+			slog.Debug("publish failed", "trace_id", traceID, "subject", subject, "err", err)
+		}
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "publish_failed"})
 		return
 	}
+	if h.debug {
+		slog.Debug("signal published successfully", "trace_id", traceID, "license", parsed.LicenseID, "symbol", parsed.Symbol)
+	}
 
 	w.Header().Set("X-ExecRelay-Trace-ID", traceID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID, "ml_confidence": fmt.Sprintf("%.3f", mlConfidence)})
 }
 
 func (h *Handler) publishRejection(licenseID, reason string, body []byte) {
