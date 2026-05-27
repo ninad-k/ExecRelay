@@ -119,9 +119,9 @@ func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 
 // killSwitch reports or toggles the trading-halt flag.
 //
-//   GET  /admin/kill-switch?token=<perimeter>           — returns {"halted": "true|false"}
-//   POST /admin/kill-switch?token=<perimeter>&state=on  — halts trading
-//   POST /admin/kill-switch?token=<perimeter>&state=off — resumes trading
+//	GET  /admin/kill-switch?token=<perimeter>           — returns {"halted": "true|false"}
+//	POST /admin/kill-switch?token=<perimeter>&state=on  — halts trading
+//	POST /admin/kill-switch?token=<perimeter>&state=off — resumes trading
 //
 // Always requires the perimeter token (separate from per-license auth) so a
 // misconfigured license cannot accidentally lift a halt. Toggle changes are
