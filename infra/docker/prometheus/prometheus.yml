@@ -7,10 +7,53 @@ scrape_configs:
     static_configs:
       - targets: ["prometheus:9090"]
 
+  # Go Services
+  - job_name: ingress
+    static_configs:
+      - targets: ["ingress:8080"]
+
+  - job_name: bridge
+    static_configs:
+      - targets: ["bridge:8080"]
+
+  - job_name: dxtrade
+    static_configs:
+      - targets: ["dxtrade:8080"]
+
+  # Python Services
+  - job_name: persist
+    static_configs:
+      - targets: ["persist:8080"]
+
+  - job_name: portal-api
+    static_configs:
+      - targets: ["portal-api:8080"]
+
+  - job_name: tasks
+    static_configs:
+      - targets: ["tasks:8080"]
+
+  - job_name: analytics
+    static_configs:
+      - targets: ["analytics:8080"]
+
+  - job_name: reports
+    static_configs:
+      - targets: ["reports:8080"]
+
+  # Infrastructure
   - job_name: nats
     metrics_path: /varz
     static_configs:
       - targets: ["nats:8222"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
 
   - job_name: tempo
     static_configs:

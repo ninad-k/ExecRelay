@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"time"
 
 	oldproto "github.com/golang/protobuf/proto"
 	"github.com/nats-io/nats.go"
@@ -84,7 +85,11 @@ func (s *Subscriber) dispatch(msg *nats.Msg) {
 		return
 	}
 
+	RecordCommandProcessed(cmd.Action)
+	start := time.Now()
 	result, err := client.Execute(context.Background(), cmd)
+	RecordExecutionLatency(time.Since(start).Seconds())
+
 	if err != nil {
 		log.Printf("dxtrade: execute %s for %s: %v", cmd.Action, signal.InstanceId, err)
 		_ = s.publishFill(signal.InstanceId, signal.TraceId, &Result{

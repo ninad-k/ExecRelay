@@ -15,6 +15,7 @@ from typing import Any
 import asyncpg
 import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 SERVICE   = "persist"
 HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
@@ -26,6 +27,12 @@ logger = logging.getLogger(SERVICE)
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s",
                     stream=sys.stdout)
+
+# Prometheus metrics
+signals_processed = Counter("persist_signals_processed_total", "Total signals processed")
+fills_processed = Counter("persist_fills_processed_total", "Total fills processed")
+events_processed = Counter("persist_events_processed_total", "Total events processed", ["event_type"])
+persist_lag = Histogram("persist_processing_duration_seconds", "Duration of persist operations")
 
 # ---------------------------------------------------------------------------
 # Protobuf wire-format parser for Signal (field layout matches signal.pb.go)
@@ -169,6 +176,7 @@ async def persist_fill(pool: asyncpg.Pool, fill: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 async def on_signal(pool: asyncpg.Pool | None, msg: Any) -> None:
+    signals_processed.inc()
     try:
         sig = parse_signal(msg.data)
     except Exception as exc:
@@ -176,13 +184,15 @@ async def on_signal(pool: asyncpg.Pool | None, msg: Any) -> None:
         await msg.ack(); return
     if pool:
         try:
-            await persist_signal(pool, sig, msg.data)
+            with persist_lag.time():
+                await persist_signal(pool, sig, msg.data)
         except Exception as exc:
             logger.error("persist signal trace_id=%s: %s", sig.get("trace_id"), exc)
     await msg.ack()
 
 
 async def on_fill(pool: asyncpg.Pool | None, msg: Any) -> None:
+    fills_processed.inc()
     parts = msg.subject.split(".")
     instance_id = parts[1] if len(parts) > 1 else ""
     try:
@@ -193,7 +203,8 @@ async def on_fill(pool: asyncpg.Pool | None, msg: Any) -> None:
         await msg.ack(); return
     if pool:
         try:
-            await persist_fill(pool, fill)
+            with persist_lag.time():
+                await persist_fill(pool, fill)
         except Exception as exc:
             logger.error("persist fill trace_id=%s: %s", fill.get("trace_id"), exc)
     await msg.ack()
@@ -207,14 +218,18 @@ async def on_event(pool: asyncpg.Pool | None, msg: Any) -> None:
         await msg.ack(); return
 
     subject = msg.subject
+    event_type = subject.split(".")[-1] if "." in subject else "unknown"
+    events_processed.labels(event_type=event_type).inc()
+
     if pool:
         try:
-            if subject == "events.ea.connected":
-                await _persist_ea_connected(pool, evt)
-            elif subject == "events.ea.disconnected":
-                await _persist_ea_disconnected(pool, evt)
-            elif subject == "events.ingress.rejection":
-                await _persist_rejection(pool, evt)
+            with persist_lag.time():
+                if subject == "events.ea.connected":
+                    await _persist_ea_connected(pool, evt)
+                elif subject == "events.ea.disconnected":
+                    await _persist_ea_disconnected(pool, evt)
+                elif subject == "events.ingress.rejection":
+                    await _persist_rejection(pool, evt)
         except Exception as exc:
             logger.error("persist event subject=%s: %s", subject, exc)
     await msg.ack()
@@ -345,14 +360,22 @@ async def run(stop_event: asyncio.Event) -> None:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path != "/health":
-            self.send_response(404); self.end_headers(); return
-        body = json.dumps({"service": SERVICE, "status": "ok"}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        if self.path == "/health":
+            body = json.dumps({"service": SERVICE, "status": "ok"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/metrics":
+            body = generate_latest()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404); self.end_headers()
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass

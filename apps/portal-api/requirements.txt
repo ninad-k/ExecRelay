@@ -7,3 +7,4 @@ pydantic[email]==2.10.3
 slowapi==0.1.9
 nats-py==2.9.0
 httpx==0.28.1
+prometheus-client==0.21.0

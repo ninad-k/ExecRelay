@@ -146,6 +146,36 @@ services:
       timeout: 3s
       retries: 10
 
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest@sha256:4b85c9cfb66667911c77154eb1d02a88b8d8e848f7ab9d45b5c927fa2a5d4c9b
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9187/metrics >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest@sha256:701a4ca0fdbea5a51bab2526d9ae568e89f11d9fd4a7882e8387b19ac67dd9f8
+    environment:
+      REDIS_ADDR: redis:6379
+    ports:
+      - "9121:9121"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9121/metrics >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
   ingress:
     profiles: ["apps"]
     build:
