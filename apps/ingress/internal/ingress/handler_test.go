@@ -272,6 +272,133 @@ func TestWebhookPerimeterGateDisabledWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestKillSwitchHaltedRejectsWebhook(t *testing.T) {
+	h := perimeterHandler(&capturePublisher{}, "gate-secret")
+	h.tradingHalted.Store(true)
+	handler := h.Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?token=gate-secret", bytes.NewBufferString(body))
+	req.Header.Set("X-ExecRelay-Signature", signature(body, "hmac-secret"))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte("trading_halted")) {
+		t.Fatalf("expected trading_halted, got %s", rr.Body.String())
+	}
+}
+
+func TestKillSwitchEndpointGetReturnsCurrentState(t *testing.T) {
+	h := perimeterHandler(&capturePublisher{}, "gate-secret")
+	handler := h.Routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/kill-switch?token=gate-secret", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"halted":"false"`)) {
+		t.Fatalf("expected halted=false, got %s", rr.Body.String())
+	}
+}
+
+func TestKillSwitchEndpointTogglesOnAndOff(t *testing.T) {
+	h := perimeterHandler(&capturePublisher{}, "gate-secret")
+	handler := h.Routes()
+
+	// Turn it ON
+	req := httptest.NewRequest(http.MethodPost, "/admin/kill-switch?token=gate-secret&state=on", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("on: status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !h.tradingHalted.Load() {
+		t.Fatal("expected tradingHalted=true after state=on")
+	}
+
+	// Turn it OFF
+	req = httptest.NewRequest(http.MethodPost, "/admin/kill-switch?token=gate-secret&state=off", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("off: status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if h.tradingHalted.Load() {
+		t.Fatal("expected tradingHalted=false after state=off")
+	}
+}
+
+func TestKillSwitchEndpointRejectsBadToken(t *testing.T) {
+	h := perimeterHandler(&capturePublisher{}, "gate-secret")
+	handler := h.Routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/kill-switch?token=wrong&state=on", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if h.tradingHalted.Load() {
+		t.Fatal("kill switch toggled despite bad token")
+	}
+}
+
+func TestKillSwitchEndpointRejectsBadState(t *testing.T) {
+	h := perimeterHandler(&capturePublisher{}, "gate-secret")
+	handler := h.Routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/kill-switch?token=gate-secret&state=maybe", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestKillSwitchEndpointDisabledWhenNoPerimeterToken(t *testing.T) {
+	// Without INGRESS_PERIMETER_TOKEN configured, the endpoint refuses to act
+	// so a wide-open ingress can't be toggled by anyone on the network.
+	handler := testHandler(&capturePublisher{}).Routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/kill-switch?state=on", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte("kill_switch_disabled")) {
+		t.Fatalf("expected kill_switch_disabled, got %s", rr.Body.String())
+	}
+}
+
+func TestKillSwitchEnvVarStartsHalted(t *testing.T) {
+	// Verifies TradingHalted option initialises the in-memory flag.
+	h := NewHandler(Options{
+		Store: NewStaticLicenseStore([]LicenseRecord{{
+			LicenseID:  "60123456789",
+			Secret:     "alert-secret",
+			HMACSecret: "hmac-secret",
+			InstanceID: "mt5-a",
+			Active:     true,
+		}}),
+		Publisher:     &capturePublisher{},
+		Region:        "iad",
+		MaxBodyBytes:  1024,
+		TradingHalted: true,
+		Now: func() time.Time {
+			return time.Unix(1700000000, 123)
+		},
+	})
+	if !h.tradingHalted.Load() {
+		t.Fatal("Options.TradingHalted=true did not initialise handler state")
+	}
+}
+
 func perimeterHandler(publisher Publisher, token string) *Handler {
 	return NewHandler(Options{
 		Store: NewStaticLicenseStore([]LicenseRecord{{

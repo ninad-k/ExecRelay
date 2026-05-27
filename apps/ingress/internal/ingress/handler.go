@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	oldproto "github.com/golang/protobuf/proto"
@@ -39,6 +40,7 @@ type Handler struct {
 	dailyCounter    *dailyCounter
 	db              *sql.DB
 	perimeterToken  []byte // empty = gate disabled
+	tradingHalted   atomic.Bool
 	debug           bool
 }
 
@@ -54,6 +56,7 @@ type Options struct {
 	AllowedCIDRs    []*net.IPNet
 	DB              *sql.DB
 	PerimeterToken  string // optional shared secret required as ?token=<value>; empty = disabled
+	TradingHalted   bool   // initial state of the kill switch; can be toggled later via /admin/halt
 	Debug           bool
 }
 
@@ -81,7 +84,7 @@ func NewHandler(opts Options) *Handler {
 	if opts.PerimeterToken != "" {
 		perimeter = []byte(opts.PerimeterToken)
 	}
-	return &Handler{
+	h := &Handler{
 		store:           opts.Store,
 		publisher:       opts.Publisher,
 		eventPublisher:  opts.EventPublisher,
@@ -96,18 +99,78 @@ func NewHandler(opts Options) *Handler {
 		perimeterToken:  perimeter,
 		debug:           opts.Debug,
 	}
+	h.tradingHalted.Store(opts.TradingHalted)
+	reportTradingHalted(opts.TradingHalted)
+	return h
 }
 
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.health)
 	mux.HandleFunc("/webhook", h.webhook)
+	mux.HandleFunc("/admin/kill-switch", h.killSwitch)
 	mux.Handle("/metrics", promhttp.Handler())
 	return metricsMiddleware(mux)
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"service": "ingress", "status": "ok"})
+}
+
+// killSwitch reports or toggles the trading-halt flag.
+//
+//   GET  /admin/kill-switch?token=<perimeter>           — returns {"halted": "true|false"}
+//   POST /admin/kill-switch?token=<perimeter>&state=on  — halts trading
+//   POST /admin/kill-switch?token=<perimeter>&state=off — resumes trading
+//
+// Always requires the perimeter token (separate from per-license auth) so a
+// misconfigured license cannot accidentally lift a halt. Toggle changes are
+// logged with the client IP for audit; the token value itself is never logged.
+func (h *Handler) killSwitch(w http.ResponseWriter, r *http.Request) {
+	clientAddr := clientIP(r)
+	if len(h.perimeterToken) == 0 {
+		// Without a perimeter token the kill switch is unreachable to prevent
+		// a wide-open endpoint from being toggled by anyone on the network.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "kill_switch_disabled", "reason": "INGRESS_PERIMETER_TOKEN must be set to use this endpoint"})
+		return
+	}
+	got := r.URL.Query().Get("token")
+	if !hmac.Equal([]byte(got), h.perimeterToken) {
+		recordRejection("perimeter_rejected")
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "perimeter_rejected"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]string{
+			"halted": strconv.FormatBool(h.tradingHalted.Load()),
+		})
+	case http.MethodPost:
+		state := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("state")))
+		var halted bool
+		switch state {
+		case "on", "halt", "halted", "true", "1":
+			halted = true
+		case "off", "resume", "false", "0":
+			halted = false
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_state", "reason": "state must be on|off"})
+			return
+		}
+		previous := h.tradingHalted.Swap(halted)
+		reportTradingHalted(halted)
+		if previous != halted {
+			slog.Warn("kill switch toggled", "client", clientAddr, "halted", halted, "previous", previous)
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"halted":   strconv.FormatBool(halted),
+			"previous": strconv.FormatBool(previous),
+		})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+	}
 }
 
 func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +199,12 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "perimeter_rejected"})
 			return
 		}
+	}
+
+	if h.tradingHalted.Load() {
+		recordRejection("trading_halted")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "trading_halted"})
+		return
 	}
 
 	if h.rateLimiter != nil && !h.rateLimiter.allow(clientAddr) {

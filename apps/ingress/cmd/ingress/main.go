@@ -70,8 +70,12 @@ func main() {
 		RateLimit:       cfg.RateLimit,
 		AllowedCIDRs:    cfg.AllowedCIDRs,
 		PerimeterToken:  cfg.PerimeterToken,
+		TradingHalted:   cfg.TradingHalted,
 		Debug:           cfg.Debug,
 	})
+	if cfg.TradingHalted {
+		slog.Warn("kill switch ACTIVE at startup: all webhooks will be rejected with trading_halted until /admin/kill-switch?state=off is called")
+	}
 	if cfg.PerimeterToken == "" {
 		slog.Warn("INGRESS_PERIMETER_TOKEN unset; perimeter gate disabled (per-license auth still applies)")
 	} else {

@@ -29,6 +29,7 @@ type Config struct {
 	RateLimit       int
 	AllowedCIDRs    []*net.IPNet
 	PerimeterToken  string
+	TradingHalted   bool
 	Debug           bool
 }
 
@@ -85,6 +86,7 @@ func ConfigFromEnv() (Config, error) {
 	}
 
 	cfg.PerimeterToken = strings.TrimSpace(os.Getenv("INGRESS_PERIMETER_TOKEN"))
+	cfg.TradingHalted = getenvBool("INGRESS_TRADING_HALTED", false)
 
 	licenses, err := LoadLicenses()
 	if err != nil {

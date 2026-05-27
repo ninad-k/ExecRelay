@@ -30,7 +30,20 @@ var (
 		Name: "ingress_license_config_warnings",
 		Help: "Per-license configuration warnings (1 = warning active, 0 = cleared).",
 	}, []string{"license_id", "issue"})
+
+	tradingHaltedGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ingress_trading_halted",
+		Help: "Kill-switch state. 1 = all webhooks are rejected with trading_halted; 0 = normal operation.",
+	})
 )
+
+func reportTradingHalted(halted bool) {
+	if halted {
+		tradingHaltedGauge.Set(1)
+	} else {
+		tradingHaltedGauge.Set(0)
+	}
+}
 
 // ReportLicenseWarnings sets the gauge for each current warning and clears
 // any gauges from a previous audit that are no longer active. Call at startup
