@@ -1,0 +1,163 @@
+image:
+  registry: "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ecr-credentials
+
+services:
+  ingress:
+    replicaCount: 3
+    service:
+      type: LoadBalancer
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  bridge:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  dxtrade:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  persist:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  "portal-api":
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  tasks:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  analytics:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  reports:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  "portal-web":
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+nodeSelector:
+  node-type: app
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - execrelay
+        topologyKey: kubernetes.io/hostname
+
+ingress:
+  enabled: true
+  className: aws-load-balancer
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS-1-2-2017-01
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: api.execrelay.com
+      paths:
+        - path: /
+          pathType: Prefix
+    - host: webhooks.execrelay.com
+      paths:
+        - path: /
+          pathType: Prefix
+    - host: portal.execrelay.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: execrelay-tls
+      hosts:
+        - api.execrelay.com
+        - webhooks.execrelay.com
+        - portal.execrelay.com
+
+prometheus:
+  enabled: true
+  interval: 30s
+
+natsUrl: "nats://execrelay:execrelay_nats_dev@execrelay-nats.execrelay.svc.cluster.local:4222"
+databaseUrl: "postgresql://execrelay:execrelay_dev_password@execrelay-rds.us-east-1.rds.amazonaws.com:5432/execrelay"
+jwtSecret: "changeme-in-production"
+licenses: ""
+pagerdutyKey: ""
+slackWebhookUrl: ""

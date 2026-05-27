@@ -1,0 +1,34 @@
+{{- if .Values.autoscaling.enabled }}
+{{- range $serviceName, $service := .Values.services }}
+{{- if or (eq $serviceName "ingress") (eq $serviceName "bridge") (eq $serviceName "persist") (eq $serviceName "portal-api") }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "execrelay.fullname" . }}-{{ $serviceName }}
+  labels:
+    {{- include "execrelay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $serviceName }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "execrelay.fullname" . }}-{{ $serviceName }}
+  minReplicas: {{ $.Values.autoscaling.minReplicas | default 2 }}
+  maxReplicas: {{ $.Values.autoscaling.maxReplicas | default 10 }}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: {{ $.Values.autoscaling.targetCPUUtilizationPercentage | default 70 }}
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+{{- end }}
+{{- end }}
+{{- end }}

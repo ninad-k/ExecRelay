@@ -91,9 +91,29 @@ services:
       - "9090:9090"
     volumes:
       - ./infra/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus-data:/prometheus
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/ready >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  alertmanager:
+    image: prom/alertmanager:latest@sha256:7b9f9e7f9e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./infra/docker/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    environment:
+      PAGERDUTY_INTEGRATION_KEY: ${PAGERDUTY_INTEGRATION_KEY:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9093/-/ready >/dev/null"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -111,6 +131,8 @@ services:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       prometheus:
+        condition: service_healthy
+      alertmanager:
         condition: service_healthy
       tempo:
         condition: service_started
@@ -332,5 +354,6 @@ volumes:
   minio-data:
   tempo-data:
   prometheus-data:
+  alertmanager-data:
   grafana-data:
   mlflow-data:

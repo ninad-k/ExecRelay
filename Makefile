@@ -5,7 +5,7 @@ GO_SERVICES := ingress bridge dxtrade
 PY_SERVICES := persist portal-api tasks analytics reports
 WEB_SERVICES := portal-web
 
-.PHONY: check test bench compose-config docker-build loadtest up down ps
+.PHONY: check test bench compose-config docker-build loadtest loadtest-suite up down ps
 
 check: compose-config test bench docker-build
 
@@ -21,6 +21,15 @@ loadtest:
 		-rate $(LOADTEST_RATE) \
 		-duration $(LOADTEST_DUR) \
 		-workers $(LOADTEST_WORKERS)
+
+# Run comprehensive load test suite at multiple rates
+LOADTEST_SUITE_TARGET ?= http://localhost:8081/webhook
+LOADTEST_SUITE_OUT    ?= loadtest-results.txt
+loadtest-suite:
+	go run ./loadtest/cmd/loadtest-suite \
+		-target $(LOADTEST_SUITE_TARGET) \
+		-output $(LOADTEST_SUITE_OUT)
+	@cat $(LOADTEST_SUITE_OUT)
 
 test:
 	go test ./...

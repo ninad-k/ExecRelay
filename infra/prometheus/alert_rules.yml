@@ -1,0 +1,103 @@
+groups:
+  - name: exec_relay_slo_violations
+    interval: 30s
+    rules:
+      - alert: IngressP99LatencyHigh
+        expr: histogram_quantile(0.99, rate(ingress_webhook_duration_seconds_bucket[5m])) > 0.095
+        for: 5m
+        labels:
+          severity: critical
+          service: ingress
+        annotations:
+          summary: "Ingress p99 latency exceeds 95ms"
+          description: "Ingress p99 latency is {{ $value | humanizeDuration }} (threshold: 95ms)"
+
+      - alert: BridgeP99LatencyHigh
+        expr: histogram_quantile(0.99, rate(dxtrade_execution_latency_seconds_bucket[5m])) > 0.15
+        for: 5m
+        labels:
+          severity: warning
+          service: bridge
+        annotations:
+          summary: "Bridge p99 latency exceeds 150ms"
+          description: "Bridge p99 latency is {{ $value | humanizeDuration }} (threshold: 150ms)"
+
+      - alert: FillSuccessRateLow
+        expr: (rate(persist_fills_processed_total[1h]) / rate(persist_signals_processed_total[1h])) < 0.95
+        for: 1h
+        labels:
+          severity: warning
+          service: bridge
+        annotations:
+          summary: "Fill success rate below 95%"
+          description: "Fill success rate is {{ $value | humanizePercentage }} (threshold: 95%)"
+
+  - name: exec_relay_service_health
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: "Service {{ $labels.job }} has been down for 2 minutes"
+
+      - alert: NATSConsumerLagHigh
+        expr: bridge_consumer_lag_pending > 1000
+        for: 5m
+        labels:
+          severity: critical
+          service: nats
+        annotations:
+          summary: "NATS consumer lag exceeds 1000 events"
+          description: "Consumer {{ $labels.consumer }} lag is {{ $value }} events (threshold: 1000)"
+
+      - alert: PostgreSQLConnectionUtilizationHigh
+        expr: (pg_stat_activity_count / pg_settings_max_connections) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: postgres
+        annotations:
+          summary: "PostgreSQL connection utilization exceeds 80%"
+          description: "PostgreSQL connection usage is {{ $value | humanizePercentage }} (threshold: 80%)"
+
+  - name: exec_relay_data_quality
+    interval: 30s
+    rules:
+      - alert: DuplicateSignalRateHigh
+        expr: |
+          (increase(persist_signals_processed_total[1h]) - increase(persist_fills_processed_total[1h]))
+          / increase(persist_signals_processed_total[1h]) > 0.05
+        for: 1h
+        labels:
+          severity: info
+          service: persist
+        annotations:
+          summary: "Duplicate signal rate exceeds 5%"
+          description: "Duplicate signals detected: {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      - alert: SignalToFillLatencyHigh
+        expr: |
+          histogram_quantile(0.99, rate(persist_processing_duration_seconds_bucket[5m]))
+          + histogram_quantile(0.99, rate(dxtrade_execution_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: persist
+        annotations:
+          summary: "Signal-to-fill latency p99 exceeds 1 second"
+          description: "End-to-end latency is {{ $value | humanizeDuration }} (threshold: 1s)"
+
+      - alert: TaskTimeoutRateHigh
+        expr: |
+          (increase(persist_fills_processed_total{status="timeout"}[24h]) / increase(persist_fills_processed_total[24h])) > 0.02
+        for: 1h
+        labels:
+          severity: warning
+          service: tasks
+        annotations:
+          summary: "Task timeout rate exceeds 2%"
+          description: "Timeout rate is {{ $value | humanizePercentage }} (threshold: 2%)"

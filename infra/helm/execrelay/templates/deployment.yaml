@@ -1,0 +1,115 @@
+{{- range $serviceName, $service := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "execrelay.fullname" $ }}-{{ $serviceName }}
+  labels:
+    {{- include "execrelay.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $serviceName }}
+spec:
+  {{- if not $.Values.autoscaling.enabled }}
+  replicas: {{ $service.replicaCount | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "execrelay.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $serviceName }}
+  template:
+    metadata:
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "execrelay.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $serviceName }}
+    spec:
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "execrelay.serviceAccountName" $ }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: {{ $serviceName }}
+        securityContext:
+          {{- toYaml $.Values.securityContext | nindent 12 }}
+        image: "{{ $.Values.image.registry }}/{{ $service.image.repository }}:{{ $service.image.tag | default $.Chart.AppVersion }}"
+        imagePullPolicy: {{ $.Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ $service.port }}
+          protocol: TCP
+        {{- if eq $serviceName "portal-web" }}
+        - name: web
+          containerPort: 3000
+          protocol: TCP
+        {{- end }}
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2
+        resources:
+          {{- toYaml $service.resources | nindent 12 }}
+        env:
+        {{- range $key, $value := $service.env }}
+        - name: {{ $key }}
+          value: {{ $value | quote }}
+        {{- end }}
+        - name: NATS_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "execrelay.fullname" $ }}-secrets
+              key: nats-url
+        {{- if ne $serviceName "portal-web" }}
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "execrelay.fullname" $ }}-secrets
+              key: database-url
+        {{- end }}
+        {{- if eq $serviceName "ingress" }}
+        - name: EXECRELAY_LICENSES
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "execrelay.fullname" $ }}-secrets
+              key: licenses
+        {{- end }}
+        {{- if eq $serviceName "portal-api" }}
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "execrelay.fullname" $ }}-secrets
+              key: jwt-secret
+        {{- end }}
+        {{- with $service.envFrom }}
+        envFrom:
+          {{- toYaml . | nindent 12 }}
+        {{- end }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

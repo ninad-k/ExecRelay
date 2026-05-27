@@ -1,0 +1,27 @@
+{{- range $serviceName, $service := .Values.services }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "execrelay.fullname" . }}-{{ $serviceName }}
+  labels:
+    {{- include "execrelay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $serviceName }}
+spec:
+  type: {{ $service.service.type | default "ClusterIP" }}
+  ports:
+  {{- if eq $serviceName "portal-web" }}
+  - port: 80
+    targetPort: web
+    protocol: TCP
+    name: http
+  {{- else }}
+  - port: 8080
+    targetPort: http
+    protocol: TCP
+    name: http
+  {{- end }}
+  selector:
+    {{- include "execrelay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $serviceName }}
+{{- end }}

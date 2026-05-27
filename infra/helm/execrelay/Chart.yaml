@@ -1,0 +1,15 @@
+apiVersion: v2
+name: execrelay
+description: ExecRelay - TradingView Signal Router for MetaTrader
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - trading
+  - signals
+  - webhook
+  - metatrader
+  - dxtrade
+maintainers:
+  - name: Ninad K
+    email: info@reycapitalsfo.com

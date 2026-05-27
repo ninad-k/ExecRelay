@@ -1,0 +1,257 @@
+global:
+  environment: production
+
+image:
+  registry: ""  # Set to AWS account ECR URL: 123456789.dkr.ecr.us-east-1.amazonaws.com
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+services:
+  ingress:
+    image:
+      repository: execrelay-ingress
+      tag: latest
+    replicaCount: 3
+    port: 8080
+    service:
+      type: LoadBalancer
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: ":8080"
+      INGRESS_REGION: us-east-1
+      WEBHOOK_TIMESTAMP_WINDOW_SECS: "30"
+      WEBHOOK_RATE_LIMIT: "60"
+    envFrom: []
+
+  bridge:
+    image:
+      repository: execrelay-bridge
+      tag: latest
+    replicaCount: 2
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: ":8080"
+      BRIDGE_REGION: us-east-1
+      SIGNALS_STREAM: SIGNALS
+      SIGNALS_CONSUMER: bridge
+    envFrom: []
+
+  dxtrade:
+    image:
+      repository: execrelay-dxtrade
+      tag: latest
+    replicaCount: 2
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: ":8080"
+      SIGNALS_STREAM: SIGNALS
+      SIGNALS_CONSUMER: dxtrade
+    envFrom: []
+
+  persist:
+    image:
+      repository: execrelay-persist
+      tag: latest
+    replicaCount: 2
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: "0.0.0.0:8080"
+    envFrom: []
+
+  "portal-api":
+    image:
+      repository: execrelay-portal-api
+      tag: latest
+    replicaCount: 2
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: "0.0.0.0:8080"
+      PORTAL_ALLOWED_ORIGINS: "https://*.execrelay.com"
+    envFrom: []
+
+  tasks:
+    image:
+      repository: execrelay-tasks
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: "0.0.0.0:8080"
+      RETENTION_DAYS: "90"
+      FILL_TIMEOUT_SECS: "30"
+    envFrom: []
+
+  analytics:
+    image:
+      repository: execrelay-analytics
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: "0.0.0.0:8080"
+    envFrom: []
+
+  reports:
+    image:
+      repository: execrelay-reports
+      tag: latest
+    replicaCount: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    env:
+      HTTP_ADDR: "0.0.0.0:8080"
+    envFrom: []
+
+  "portal-web":
+    image:
+      repository: execrelay-portal-web
+      tag: latest
+    replicaCount: 1
+    port: 3000
+    service:
+      type: ClusterIP
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    env:
+      PORTAL_ALLOWED_ORIGINS: "https://portal.execrelay.com"
+    envFrom: []
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+postgresql:
+  enabled: false  # Use AWS RDS instead
+  persistence:
+    size: 50Gi
+    storageClass: gp3
+
+nats:
+  enabled: false  # Use AWS MQ instead
+
+redis:
+  enabled: false  # Deploy separately or use ElastiCache
+
+prometheus:
+  enabled: true
+  interval: 30s
+
+ingress:
+  enabled: true
+  className: ""
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: api.execrelay.com
+      paths:
+        - path: /
+          pathType: Prefix
+    - host: webhooks.execrelay.com
+      paths:
+        - path: /
+          pathType: Prefix
+    - host: portal.execrelay.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: execrelay-tls
+      hosts:
+        - api.execrelay.com
+        - webhooks.execrelay.com
+        - portal.execrelay.com
+
+externalSecrets:
+  enabled: false
+  backendType: aws-secrets-manager
+  region: us-east-1
