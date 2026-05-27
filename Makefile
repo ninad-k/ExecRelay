@@ -5,7 +5,18 @@ GO_SERVICES := ingress bridge dxtrade
 PY_SERVICES := persist portal-api tasks analytics reports
 WEB_SERVICES := portal-web
 
-.PHONY: check test bench compose-config docker-build loadtest loadtest-suite up down ps
+.PHONY: check test bench compose-config docker-build loadtest loadtest-suite up down ps install-hooks lint
+
+# Install pre-commit hooks (one-time per clone). Requires:
+#   pipx install pre-commit  (or: pip install --user pre-commit)
+install-hooks:
+	pre-commit install
+	@echo "pre-commit hooks installed; run 'make lint' to check the whole tree"
+
+# Run all pre-commit hooks against every tracked file
+lint:
+	pre-commit run --all-files
+
 
 check: compose-config test bench docker-build
 

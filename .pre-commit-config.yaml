@@ -1,0 +1,50 @@
+# Run locally:  pre-commit install   # one-time per clone
+# Run on all:   pre-commit run --all-files
+# Skip a hook:  SKIP=gitleaks git commit ...
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.md$|^apps/portal-web/package-lock\.json$'
+      - id: end-of-file-fixer
+        exclude: '^apps/portal-web/package-lock\.json$'
+      - id: check-yaml
+        args: [--unsafe]   # allow GitHub Actions tags
+        exclude: '^infra/helm/.*/templates/.*\.yaml$'   # Helm templates use {{- }} which isn't valid YAML
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      # ruff-format runs on every commit. The lint hook (`ruff`) is intentionally
+      # disabled until the existing E702/F841/E722/E402 findings are triaged
+      # and fixed — see `ruff check apps/` for the list. To enable: add an
+      # `- id: ruff` hook above ruff-format with `args: [--fix]`.
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+        pass_filenames: true
+      - id: go-vet
+        name: go vet
+        entry: bash -c 'cd "$(git rev-parse --show-toplevel)" && go vet ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
