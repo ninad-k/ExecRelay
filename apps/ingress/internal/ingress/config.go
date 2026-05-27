@@ -28,6 +28,7 @@ type Config struct {
 	TimestampWindow time.Duration
 	RateLimit       int
 	AllowedCIDRs    []*net.IPNet
+	PerimeterToken  string
 	Debug           bool
 }
 
@@ -82,6 +83,8 @@ func ConfigFromEnv() (Config, error) {
 		}
 		cfg.AllowedCIDRs = nets
 	}
+
+	cfg.PerimeterToken = strings.TrimSpace(os.Getenv("INGRESS_PERIMETER_TOKEN"))
 
 	licenses, err := LoadLicenses()
 	if err != nil {

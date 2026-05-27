@@ -212,6 +212,85 @@ func testHandler(publisher Publisher) *Handler {
 	})
 }
 
+func TestWebhookPerimeterGateAcceptsValidToken(t *testing.T) {
+	publisher := &capturePublisher{}
+	handler := perimeterHandler(publisher, "gate-secret").Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,sl_pips=20,tp_pips=40,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?token=gate-secret", bytes.NewBufferString(body))
+	req.Header.Set("X-ExecRelay-Signature", signature(body, "hmac-secret"))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookPerimeterGateRejectsMissingToken(t *testing.T) {
+	handler := perimeterHandler(&capturePublisher{}, "gate-secret").Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte("perimeter_rejected")) {
+		t.Fatalf("expected perimeter_rejected error, got %s", rr.Body.String())
+	}
+}
+
+func TestWebhookPerimeterGateRejectsWrongToken(t *testing.T) {
+	handler := perimeterHandler(&capturePublisher{}, "gate-secret").Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?token=wrong", bytes.NewBufferString(body))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookPerimeterGateDisabledWhenEmpty(t *testing.T) {
+	// When PerimeterToken is empty, the gate is off and requests without
+	// ?token= must still succeed if the per-license auth passes.
+	handler := testHandler(&capturePublisher{}).Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
+	req.Header.Set("X-ExecRelay-Signature", signature(body, "hmac-secret"))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func perimeterHandler(publisher Publisher, token string) *Handler {
+	return NewHandler(Options{
+		Store: NewStaticLicenseStore([]LicenseRecord{{
+			LicenseID:  "60123456789",
+			Secret:     "alert-secret",
+			HMACSecret: "hmac-secret",
+			InstanceID: "mt5-a",
+			Active:     true,
+		}}),
+		Publisher:      publisher,
+		Region:         "iad",
+		MaxBodyBytes:   1024,
+		PerimeterToken: token,
+		Now: func() time.Time {
+			return time.Unix(1700000000, 123)
+		},
+	})
+}
+
 func signature(body, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(body))

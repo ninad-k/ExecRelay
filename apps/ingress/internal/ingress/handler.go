@@ -38,6 +38,7 @@ type Handler struct {
 	allowedCIDRs     []*net.IPNet
 	dailyCounter     *dailyCounter
 	db               *sql.DB
+	perimeterToken   []byte // empty = gate disabled
 	debug            bool
 }
 
@@ -52,6 +53,7 @@ type Options struct {
 	RateLimit       int // max requests per minute per IP; 0 = disabled
 	AllowedCIDRs    []*net.IPNet
 	DB              *sql.DB
+	PerimeterToken  string // optional shared secret required as ?token=<value>; empty = disabled
 	Debug           bool
 }
 
@@ -75,6 +77,10 @@ func NewHandler(opts Options) *Handler {
 	if opts.RateLimit > 0 {
 		rl = newIPRateLimiter(float64(opts.RateLimit)/60.0, opts.RateLimit)
 	}
+	var perimeter []byte
+	if opts.PerimeterToken != "" {
+		perimeter = []byte(opts.PerimeterToken)
+	}
 	return &Handler{
 		store:           opts.Store,
 		publisher:       opts.Publisher,
@@ -87,6 +93,7 @@ func NewHandler(opts Options) *Handler {
 		allowedCIDRs:    opts.AllowedCIDRs,
 		dailyCounter:    newDailyCounter(),
 		db:              opts.DB,
+		perimeterToken:  perimeter,
 		debug:           opts.Debug,
 	}
 }
@@ -116,6 +123,19 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", http.MethodPost)
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
 		return
+	}
+
+	if len(h.perimeterToken) > 0 {
+		// Constant-time check; never log the supplied token value.
+		got := r.URL.Query().Get("token")
+		if !hmac.Equal([]byte(got), h.perimeterToken) {
+			if h.debug {
+				slog.Debug("perimeter token rejected", "client", clientAddr)
+			}
+			recordRejection("perimeter_rejected")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "perimeter_rejected"})
+			return
+		}
 	}
 
 	if h.rateLimiter != nil && !h.rateLimiter.allow(clientAddr) {

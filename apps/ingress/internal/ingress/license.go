@@ -89,3 +89,50 @@ func (s *HotReloadLicenseStore) Lookup(_ context.Context, licenseID string) (Lic
 func constantStringEqual(got, want string) bool {
 	return hmac.Equal([]byte(got), []byte(want))
 }
+
+// LicenseWarning describes a per-license configuration issue surfaced at
+// startup and on hot-reload. Severity is informational unless Issue is
+// "no_auth", in which case the license accepts unauthenticated webhooks.
+type LicenseWarning struct {
+	LicenseID string
+	Issue     string // "no_auth" | "no_hmac" | "no_secret" | "rotation_active"
+	Detail    string
+}
+
+// AuditLicenses returns warnings for licenses that are missing recommended
+// authentication. The hardest check is "no_auth": neither Secret nor
+// HMACSecret is set, which means anyone with the license_id can submit
+// signals. Less severe warnings flag missing-but-not-fatal config.
+func AuditLicenses(records []LicenseRecord) []LicenseWarning {
+	warnings := make([]LicenseWarning, 0)
+	for _, r := range records {
+		switch {
+		case r.Secret == "" && r.HMACSecret == "":
+			warnings = append(warnings, LicenseWarning{
+				LicenseID: r.LicenseID,
+				Issue:     "no_auth",
+				Detail:    "license accepts unauthenticated webhooks (no Secret and no HMACSecret configured)",
+			})
+		case r.HMACSecret == "":
+			warnings = append(warnings, LicenseWarning{
+				LicenseID: r.LicenseID,
+				Issue:     "no_hmac",
+				Detail:    "license relies only on body-embedded secret; HMAC header signature recommended",
+			})
+		case r.Secret == "":
+			warnings = append(warnings, LicenseWarning{
+				LicenseID: r.LicenseID,
+				Issue:     "no_secret",
+				Detail:    "license relies only on HMAC; body-embedded secret recommended as defense in depth",
+			})
+		}
+		if r.PendingHMACSecret != "" {
+			warnings = append(warnings, LicenseWarning{
+				LicenseID: r.LicenseID,
+				Issue:     "rotation_active",
+				Detail:    "PendingHMACSecret is set; complete the rotation by promoting and clearing it",
+			})
+		}
+	}
+	return warnings
+}

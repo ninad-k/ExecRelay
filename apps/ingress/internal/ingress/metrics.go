@@ -25,7 +25,22 @@ var (
 		Name: "ingress_rejections_total",
 		Help: "Total webhook rejections by reason code.",
 	}, []string{"reason"})
+
+	licenseConfigWarnings = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ingress_license_config_warnings",
+		Help: "Per-license configuration warnings (1 = warning active, 0 = cleared).",
+	}, []string{"license_id", "issue"})
 )
+
+// ReportLicenseWarnings sets the gauge for each current warning and clears
+// any gauges from a previous audit that are no longer active. Call at startup
+// and after each license hot-reload.
+func ReportLicenseWarnings(current []LicenseWarning) {
+	licenseConfigWarnings.Reset()
+	for _, w := range current {
+		licenseConfigWarnings.WithLabelValues(w.LicenseID, w.Issue).Set(1)
+	}
+}
 
 type statusRecorder struct {
 	http.ResponseWriter

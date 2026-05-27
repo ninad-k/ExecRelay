@@ -58,6 +58,7 @@ func main() {
 	}
 
 	licenseStore := ingress.NewHotReloadLicenseStore(cfg.Licenses)
+	logLicenseAudit(cfg.Licenses)
 
 	handler := ingress.NewHandler(ingress.Options{
 		Store:           licenseStore,
@@ -68,8 +69,14 @@ func main() {
 		TimestampWindow: cfg.TimestampWindow,
 		RateLimit:       cfg.RateLimit,
 		AllowedCIDRs:    cfg.AllowedCIDRs,
+		PerimeterToken:  cfg.PerimeterToken,
 		Debug:           cfg.Debug,
 	})
+	if cfg.PerimeterToken == "" {
+		slog.Warn("INGRESS_PERIMETER_TOKEN unset; perimeter gate disabled (per-license auth still applies)")
+	} else {
+		slog.Info("perimeter token gate enabled")
+	}
 
 	if cfg.Debug {
 		slog.Info("debug logging enabled")
@@ -97,6 +104,7 @@ func main() {
 				continue
 			}
 			licenseStore.Reload(updated)
+			logLicenseAudit(updated)
 			slog.Info("licenses reloaded", "count", len(updated))
 
 		case sig := <-stop:
@@ -119,5 +127,21 @@ func main() {
 			}
 			return
 		}
+	}
+}
+
+// logLicenseAudit emits a slog warning per license configuration issue and
+// publishes the same warnings as Prometheus gauges. Called at startup and on
+// SIGHUP-triggered license reload.
+func logLicenseAudit(records []ingress.LicenseRecord) {
+	warnings := ingress.AuditLicenses(records)
+	ingress.ReportLicenseWarnings(warnings)
+	for _, w := range warnings {
+		slog.Warn("license config warning", "license", w.LicenseID, "issue", w.Issue, "detail", w.Detail)
+	}
+	if len(warnings) == 0 {
+		slog.Info("license audit clean", "count", len(records))
+	} else {
+		slog.Info("license audit complete", "count", len(records), "warnings", len(warnings))
 	}
 }
