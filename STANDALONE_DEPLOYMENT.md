@@ -1,301 +1,154 @@
-# ExecRelay Standalone Deployment Guide
+# Single-server deployment
 
-This guide shows how to deploy ExecRelay without Docker or Kubernetes, perfect for development, testing, or single-node production deployments.
+Run the entire ExecRelay stack — 9 application services plus Postgres, NATS,
+Redis, MinIO, Prometheus, Grafana, Alertmanager, Tempo, MLflow — on **one
+Ubuntu 22.04/24.04 box** via the installer scripts.
 
-## Prerequisites
+For dev (anywhere with Docker): see the [Local development](#local-development)
+section at the bottom.
 
-- Go 1.21+
-- Python 3.10+
-- PostgreSQL 14+
-- NATS server
-- curl, bash, jq (optional but useful)
+---
 
-## Quick Start (5 minutes)
-
-### 1. Setup Environment
+## Production install (fresh VM)
 
 ```bash
-cp .env.example .env
-# Edit .env if needed - defaults work for local development
+# 1. As root, clone the repo and run the bootstrap installer.
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/ninad-k/ExecRelay.git
+cd ExecRelay
+
+# 2. Bootstrap: installs Docker, generates .env with random secrets,
+#    builds images, runs migrations, brings up the stack.
+sudo bash scripts/install.sh
+
+# 3. Harden for the internet: Caddy + Let's Encrypt TLS, UFW, systemd unit.
+#    Requires DNS A records for your DOMAIN, api.DOMAIN, hook.DOMAIN,
+#    admin.DOMAIN pointing at this server's public IP.
+sudo DOMAIN=execrelay.example.com EMAIL=you@example.com \
+  bash scripts/configure-prod.sh
+
+# 4. Nightly Postgres backups (7 daily + 4 weekly rotation, 03:15 UTC).
+sudo bash scripts/install-backups.sh
 ```
 
-### 2. Start Infrastructure Services
+After step 4, the box is running ExecRelay in production. Caddy terminates
+TLS, UFW blocks everything except 22/80/443, and the systemd unit restarts
+the stack on reboot.
+
+### What's where after install
+
+| URL | Service | Auth |
+|---|---|---|
+| `https://DOMAIN` | Portal web (Next.js) | App-level (registration/login) |
+| `https://api.DOMAIN` | Portal API | Bearer token from `/auth/login` |
+| `https://hook.DOMAIN/webhook` | Trade webhook ingress | Per-license HMAC + optional perimeter token |
+| `https://admin.DOMAIN` | Grafana | Basic-auth (password printed by `configure-prod.sh` and saved in `/etc/caddy/admin_password.txt`) |
+
+Internal services (Postgres, NATS, Redis, MinIO, Prometheus, Alertmanager,
+Tempo, MLflow, and the other app services) are bound to `127.0.0.1` by the
+override file `docker-compose.override.yml` written by `configure-prod.sh`.
+They are reachable from Caddy on the host but not from the public internet.
+
+### Post-install checklist
+
+1. **Replace test licenses.** `.env`'s `EXECRELAY_LICENSES` line contains a
+   test UUID. Replace it with your real licenses, then:
+   `docker compose restart ingress`
+2. **Alert destinations.** Set `PAGERDUTY_INTEGRATION_KEY` and/or
+   `SLACK_WEBHOOK_URL` in `.env`, then
+   `docker compose restart alertmanager`.
+3. **Save the Grafana password** that `configure-prod.sh` printed once, then
+   `sudo shred -u /etc/caddy/admin_password.txt`.
+4. **Test the backup.** `sudo systemctl start execrelay-backup.service` then
+   `ls /var/backups/execrelay/daily/`.
+
+---
+
+## Operations cookbook
+
+| Goal | Command |
+|---|---|
+| Tail all logs | `docker compose --profile apps logs -f` |
+| Tail one service | `docker compose logs -f ingress` |
+| Restart one service | `docker compose restart portal-api` |
+| Apply a new migration | `docker compose run --rm migrate` (or `make migrate-up`) |
+| See current status | `docker compose --profile apps ps` |
+| Halt all trading NOW | `curl -X POST "https://hook.DOMAIN/admin/kill-switch?token=$TOKEN&state=on"` |
+| Resume trading | `curl -X POST "https://hook.DOMAIN/admin/kill-switch?token=$TOKEN&state=off"` |
+| Manual backup | `sudo systemctl start execrelay-backup.service` |
+| List recent backups | `ls -la /var/backups/execrelay/daily/` |
+| Restore from backup | `gunzip -c FILE.sql.gz \| docker compose exec -T postgres psql -U execrelay execrelay` |
+| Pull a new release | `git pull && docker compose --profile apps up -d --build` |
+| Upgrade Docker images | `docker compose --profile apps pull && docker compose --profile apps up -d` |
+
+---
+
+## Upgrading
 
 ```bash
-# Terminal 1: PostgreSQL
-docker run -d \
-  -e POSTGRES_PASSWORD=execrelay_dev_password \
-  -e POSTGRES_DB=execrelay \
-  -p 5432:5432 \
-  --name execrelay-postgres \
-  postgres:14
-
-# Terminal 2: NATS with JetStream
-docker run -d \
-  -p 4222:4222 \
-  -p 8222:8222 \
-  --name execrelay-nats \
-  nats:latest -js
-
-# Wait for services to be ready
-sleep 5
+cd /path/to/ExecRelay
+git pull
+docker compose --profile apps build
+docker compose run --rm migrate         # apply any new schema changes
+docker compose --profile apps up -d     # zero-downtime per service via compose
 ```
 
-### 3. Initialize Database
+If a release notes a breaking config change, the upgrade notes will be in
+`CHANGES.md`.
+
+---
+
+## Disaster recovery
+
+1. Provision a fresh Ubuntu 22.04/24.04 box.
+2. `git clone` the repo and run `scripts/install.sh` (don't run
+   `configure-prod.sh` yet).
+3. Drop your latest backup into `/var/backups/execrelay/daily/`.
+4. Restore:
+   ```bash
+   gunzip -c /var/backups/execrelay/daily/execrelay-LATEST.sql.gz \
+     | docker compose exec -T postgres psql -U execrelay execrelay
+   ```
+5. Now run `configure-prod.sh` with the same `DOMAIN` and re-issue DNS if
+   the IP changed.
+
+---
+
+## Local development
+
+For local dev (anywhere with Docker) you can skip the installer entirely:
 
 ```bash
-psql postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay < infra/postgres/init/001_schema.sql
-psql postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay < infra/postgres/init/002_advanced_features.sql
+cp .env.example .env                    # the defaults work for local
+docker compose --profile apps up -d --build
 ```
 
-### 4. Build Go Services
+The `apps` profile starts the 9 application services; without it you get
+just the infrastructure tier. Compose binds every port to `0.0.0.0` in dev
+so you can hit each service directly:
 
-```bash
-cd apps/ingress
-go build -o ../../ingress cmd/ingress/main.go
-cd ../..
-
-cd apps/bridge
-go build -o ../../bridge cmd/bridge/main.go
-cd ../..
-
-cd apps/dxtrade
-go build -o ../../dxtrade cmd/dxtrade/main.go
-cd ../..
+```
+Ingress      → http://localhost:8081/webhook
+Portal web   → http://localhost:3001
+Portal API   → http://localhost:8085
+Grafana      → http://localhost:3000   (admin / admin)
 ```
 
-### 5. Start Go Services (in separate terminals)
+Stop everything: `docker compose --profile apps down`.
 
-```bash
-# Terminal 3: Ingress
-DEBUG=true HTTP_ADDR=:8080 NATS_URL=nats://localhost:4222 ./ingress
+---
 
-# Terminal 4: Bridge
-DEBUG=true NATS_URL=nats://localhost:4222 HTTP_ADDR=:8081 ./bridge
+## Manual installation (without scripts)
 
-# Terminal 5: DXTrade
-DEBUG=true HTTP_ADDR=:8082 ./dxtrade
-```
+If you need to deploy on a non-Ubuntu host or want full control, the
+installer does roughly:
 
-### 6. Start Python Services (in separate terminals)
+1. Install Docker Engine + the compose plugin.
+2. Copy `.env.example` → `.env`, generate secrets, set
+   `DATABASE_URL` and `NATS_URL` to use the new credentials.
+3. `docker compose --profile apps up -d --build`.
+4. `docker compose run --rm migrate`.
 
-```bash
-# Terminal 6: Persist
-DEBUG=true HTTP_PORT=8083 DATABASE_URL=postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay NATS_URL=nats://localhost:4222 python3 apps/persist/app.py
-
-# Terminal 7: Portal API
-DEBUG=true HTTP_ADDR=0.0.0.0:8084 DATABASE_URL=postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay python3 apps/portal-api/app.py
-
-# Terminal 8: Risk Service
-DEBUG=true HTTP_PORT=8085 DATABASE_URL=postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay NATS_URL=nats://localhost:4222 python3 apps/risk/app.py
-
-# Additional services as needed
-python3 apps/ml-feature-extractor/app.py
-python3 apps/ml-predictor/app.py
-python3 apps/backtester/app.py
-python3 apps/tasks/app.py
-python3 apps/analytics/app.py
-python3 apps/reports/app.py
-```
-
-## Testing the Deployment
-
-### Health Check
-
-```bash
-# Ingress service
-curl -s http://localhost:8080/health | jq .
-
-# Portal API
-curl -s http://localhost:8084/health | jq .
-```
-
-### Send Test Signal
-
-```bash
-curl -X POST \
-  -H "Content-Type: text/plain" \
-  -H "X-ExecRelay-Timestamp: $(date +%s)" \
-  -d "550e8400-e29b-41d4-a716-446655440000:buy:test-instance:symbol=EURUSD" \
-  http://localhost:8080/webhook
-
-# Should return:
-# {"status":"accepted","trace_id":"...", "ml_confidence":"..."}
-```
-
-### View Metrics
-
-```bash
-# Ingress metrics
-curl -s http://localhost:8080/metrics | grep "ingress_"
-
-# Portal API metrics
-curl -s http://localhost:8084/metrics | grep "portal_"
-```
-
-### Check Logs for Debug Messages
-
-Each service logs to stdout with debug messages when `DEBUG=true`:
-
-```bash
-# In ingress terminal, you should see:
-# ... "msg":"webhook request received","client":"127.0.0.1","method":"POST"
-# ... "msg":"signal parsed","client":"127.0.0.1","license":"550e8400-...","symbol":"EURUSD"
-# ... "msg":"ML scoring completed","symbol":"EURUSD","confidence":0.75
-# ... "msg":"signal published successfully","license":"550e8400-...","symbol":"EURUSD"
-```
-
-## Debug Logging
-
-### Enable/Disable Debug Logging
-
-```bash
-# Enable debug (default)
-DEBUG=true ./ingress
-
-# Disable debug
-DEBUG=false ./ingress
-
-# Also accepts: DEBUG=1, DEBUG=yes, DEBUG=on (enable)
-#              DEBUG=0, DEBUG=no, DEBUG=off (disable)
-```
-
-### Debug Output Includes
-
-- **Ingress Service**: All webhook processing, license validation, signature verification, ML scoring, exposure checks
-- **Bridge Service**: Signal subscription, EA connections, order dispatch, error handling
-- **DXTrade Service**: Broker connections, command execution, circuit breaker state
-- **Persist Service**: Signal storage, fill processing, database operations
-- **Python Services**: Request handling, database queries, NATS messages, error cases
-
-### Common Debug Patterns
-
-```bash
-# Filter logs by service and trace
-./ingress 2>&1 | grep "trace_id"
-
-# Watch for errors
-./ingress 2>&1 | grep "ERR\|WARN\|error\|failed"
-
-# Monitor signal flow
-./ingress 2>&1 | grep "signal parsed\|signal published"
-
-# Check exposure limit enforcement
-./ingress 2>&1 | grep "exposure"
-
-# Monitor ML scoring
-./ingress 2>&1 | grep "ML scoring\|confidence"
-```
-
-## Configuration for Different Environments
-
-### Local Development (Current)
-```bash
-DEBUG=true
-HTTP_ADDR=:8080
-NATS_URL=nats://localhost:4222
-DATABASE_URL=postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay
-```
-
-### Staging (Docker Network)
-```bash
-DEBUG=false  # Reduce log volume
-HTTP_ADDR=0.0.0.0:8080
-NATS_URL=nats://nats:4222
-DATABASE_URL=postgresql://execrelay:password@postgres:5432/execrelay
-```
-
-### Production (AWS)
-```bash
-DEBUG=false
-HTTP_ADDR=0.0.0.0:8080
-NATS_URL=nats://aws-mq-broker.amazonaws.com:4222
-DATABASE_URL=postgresql://user:password@db.rds.amazonaws.com:5432/execrelay
-WEBHOOK_TIMESTAMP_WINDOW_SECS=30
-WEBHOOK_RATE_LIMIT=5000
-WEBHOOK_ALLOWED_CIDRS=1.2.3.4/32,5.6.7.8/32
-```
-
-## Stopping Services
-
-```bash
-# Kill all running services
-pkill -f "ingress\|bridge\|dxtrade\|python3 apps"
-
-# Stop Docker containers
-docker stop execrelay-postgres execrelay-nats
-docker rm execrelay-postgres execrelay-nats
-```
-
-## Troubleshooting
-
-### Service won't start
-- Check logs: `tail -f service.log`
-- Verify ports are available: `lsof -i :8080`
-- Check database connection: `psql $DATABASE_URL -c "SELECT 1"`
-
-### NATS connection errors
-- Verify NATS is running: `ps aux | grep nats`
-- Check NATS URL in .env matches running instance
-- Test NATS connection: `telnet localhost 4222`
-
-### Database connection errors
-- Verify PostgreSQL is running: `psql $DATABASE_URL -c "SELECT 1"`
-- Check database exists: `psql -l`
-- Initialize schema if needed: `psql $DATABASE_URL < infra/postgres/init/001_schema.sql`
-
-### High log volume
-- Set `DEBUG=false` to switch to INFO level only
-- Redirect logs to file: `./ingress > logs/ingress.log 2>&1 &`
-
-### Memory usage growing
-- Check for NATS consumer lag: `curl http://localhost:8222/jsz`
-- Review task cleanup in `apps/tasks/app.py`
-- Check database connection pooling settings
-
-## Performance Monitoring
-
-### Key Metrics to Watch
-
-```bash
-# Ingress request rate
-curl -s http://localhost:8080/metrics | grep "ingress_signals_accepted_total"
-
-# Bridge dispatch latency
-curl -s http://localhost:8081/metrics | grep "bridge_.*latency"
-
-# Database lag
-curl -s http://localhost:8083/metrics | grep "persist_lag"
-
-# ML prediction time
-curl -s http://localhost:8080/metrics | grep "ml_prediction_duration"
-```
-
-### Load Testing
-
-```bash
-# Simple load test: 10 requests/sec for 60 seconds
-for i in {1..600}; do
-  curl -s -X POST \
-    -H "Content-Type: text/plain" \
-    -d "550e8400-e29b-41d4-a716-446655440000:buy:test:symbol=EURUSD" \
-    http://localhost:8080/webhook > /dev/null &
-  [ $((i % 10)) -eq 0 ] && sleep 1
-done
-```
-
-## Next Steps
-
-1. **Integration Testing**: Run `bash infra/test/integration_test.sh`
-2. **Chaos Testing**: Run `bash infra/test/chaos_test.sh`
-3. **Production Deployment**: Use Docker Compose or Kubernetes (see other guides)
-4. **Monitoring**: Setup Prometheus and Grafana (see Phase 2 guide)
-5. **Load Testing**: Run `make loadtest-suite` for baseline performance data
-
-## Support
-
-For issues or questions:
-- Check debug logs with `DEBUG=true`
-- Review logs in service terminal windows
-- Examine database directly: `psql $DATABASE_URL`
-- Check NATS status: `curl http://localhost:8222/jsz`
+Reverse proxy, firewall, and systemd are entirely optional but recommended
+for any internet-facing deployment. See `infra/caddy/Caddyfile.template`
+and `infra/systemd/execrelay.service` for the templates the installer uses.

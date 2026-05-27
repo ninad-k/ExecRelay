@@ -1,0 +1,12 @@
+[Unit]
+Description=Run ExecRelay backup nightly at 03:15 UTC
+Requires=execrelay-backup.service
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=10min
+Unit=execrelay-backup.service
+
+[Install]
+WantedBy=timers.target

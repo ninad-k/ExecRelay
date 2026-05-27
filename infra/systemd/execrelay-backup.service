@@ -1,0 +1,12 @@
+[Unit]
+Description=ExecRelay Postgres backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={{REPO_ROOT}}
+ExecStart=/usr/bin/bash {{REPO_ROOT}}/scripts/backup.sh
+# Logs go to journald — view with: journalctl -u execrelay-backup
+StandardOutput=journal
+StandardError=journal

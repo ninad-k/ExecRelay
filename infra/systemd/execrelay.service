@@ -1,0 +1,17 @@
+[Unit]
+Description=ExecRelay docker compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{REPO_ROOT}}
+ExecStart=/usr/bin/docker compose --profile apps up -d
+ExecStop=/usr/bin/docker compose --profile apps down
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

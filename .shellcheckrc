@@ -1,0 +1,3 @@
+# Silence SC1091 "Not following: ..." — fires on `source "$(dirname "$0")/lib.sh"`
+# patterns that resolve at runtime. We verify the helpers exist via tests.
+disable=SC1091
