@@ -1,0 +1,20 @@
+name: app-portal-web
+
+on:
+  pull_request:
+    paths:
+      - 'apps/portal-web/**'
+      - '.github/workflows/app-portal-web.yml'
+      - '.github/workflows/reusable-node-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/portal-web/**'
+      - '.github/workflows/app-portal-web.yml'
+      - '.github/workflows/reusable-node-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-node-app.yml
+    with:
+      app_name: portal-web

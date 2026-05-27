@@ -1,0 +1,21 @@
+name: app-portal-api
+
+on:
+  pull_request:
+    paths:
+      - 'apps/portal-api/**'
+      - '.github/workflows/app-portal-api.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/portal-api/**'
+      - '.github/workflows/app-portal-api.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: portal-api
+      has_requirements: true

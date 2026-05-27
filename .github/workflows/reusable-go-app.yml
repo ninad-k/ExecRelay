@@ -1,0 +1,56 @@
+name: reusable-go-app
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'App directory name under apps/'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go vet
+        env:
+          APP: ${{ inputs.app_name }}
+        run: go vet "./apps/${APP}/..."
+
+      - name: Go unit tests
+        env:
+          APP: ${{ inputs.app_name }}
+        run: go test -race -count=1 -coverprofile=coverage.out "./apps/${APP}/..."
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.app_name }}
+          path: coverage.out
+          if-no-files-found: ignore
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker build
+        env:
+          APP: ${{ inputs.app_name }}
+        run: docker build -f "apps/${APP}/Dockerfile" -t "execrelay/${APP}:ci" .
+
+      - name: Trivy scan (informational)
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: "execrelay/${{ inputs.app_name }}:ci"
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '0'

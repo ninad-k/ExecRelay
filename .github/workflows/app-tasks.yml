@@ -1,0 +1,21 @@
+name: app-tasks
+
+on:
+  pull_request:
+    paths:
+      - 'apps/tasks/**'
+      - '.github/workflows/app-tasks.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/tasks/**'
+      - '.github/workflows/app-tasks.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: tasks
+      has_requirements: true

@@ -1,0 +1,21 @@
+name: app-ml-feature-extractor
+
+on:
+  pull_request:
+    paths:
+      - 'apps/ml-feature-extractor/**'
+      - '.github/workflows/app-ml-feature-extractor.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/ml-feature-extractor/**'
+      - '.github/workflows/app-ml-feature-extractor.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: ml-feature-extractor
+      has_requirements: true

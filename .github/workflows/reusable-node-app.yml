@@ -1,0 +1,89 @@
+name: reusable-node-app
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'App directory name under apps/'
+        required: true
+        type: string
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '22'
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/${{ inputs.app_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect lockfile
+        id: lockfile
+        working-directory: ${{ github.workspace }}
+        env:
+          APP: ${{ inputs.app_name }}
+        run: |
+          if [ -f "apps/${APP}/package-lock.json" ]; then
+            echo "exists=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node (with cache)
+        if: steps.lockfile.outputs.exists == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: apps/${{ inputs.app_name }}/package-lock.json
+
+      - name: Setup Node (no cache)
+        if: steps.lockfile.outputs.exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install deps
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Type check
+        run: npm run type-check --if-present
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Unit tests
+        run: npm test --if-present -- --watch=false
+
+      - name: Next build
+        run: npm run build --if-present
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker build
+        working-directory: ${{ github.workspace }}
+        env:
+          APP: ${{ inputs.app_name }}
+        run: docker build -f "apps/${APP}/Dockerfile" -t "execrelay/${APP}:ci" .
+
+      - name: Trivy scan (informational)
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: "execrelay/${{ inputs.app_name }}:ci"
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '0'

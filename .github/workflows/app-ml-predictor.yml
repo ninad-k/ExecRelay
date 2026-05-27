@@ -1,0 +1,21 @@
+name: app-ml-predictor
+
+on:
+  pull_request:
+    paths:
+      - 'apps/ml-predictor/**'
+      - '.github/workflows/app-ml-predictor.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/ml-predictor/**'
+      - '.github/workflows/app-ml-predictor.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: ml-predictor
+      has_requirements: true

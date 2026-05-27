@@ -1,0 +1,28 @@
+name: app-ingress
+
+on:
+  pull_request:
+    paths:
+      - 'apps/ingress/**'
+      - 'internal/**'
+      - 'packages/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/app-ingress.yml'
+      - '.github/workflows/reusable-go-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/ingress/**'
+      - 'internal/**'
+      - 'packages/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/app-ingress.yml'
+      - '.github/workflows/reusable-go-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-go-app.yml
+    with:
+      app_name: ingress

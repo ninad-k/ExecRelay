@@ -1,0 +1,21 @@
+name: app-persist
+
+on:
+  pull_request:
+    paths:
+      - 'apps/persist/**'
+      - '.github/workflows/app-persist.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/persist/**'
+      - '.github/workflows/app-persist.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: persist
+      has_requirements: true

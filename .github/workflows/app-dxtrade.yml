@@ -1,0 +1,28 @@
+name: app-dxtrade
+
+on:
+  pull_request:
+    paths:
+      - 'apps/dxtrade/**'
+      - 'internal/**'
+      - 'packages/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/app-dxtrade.yml'
+      - '.github/workflows/reusable-go-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/dxtrade/**'
+      - 'internal/**'
+      - 'packages/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/app-dxtrade.yml'
+      - '.github/workflows/reusable-go-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-go-app.yml
+    with:
+      app_name: dxtrade

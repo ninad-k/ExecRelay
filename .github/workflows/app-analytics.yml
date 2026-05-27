@@ -1,0 +1,21 @@
+name: app-analytics
+
+on:
+  pull_request:
+    paths:
+      - 'apps/analytics/**'
+      - '.github/workflows/app-analytics.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/analytics/**'
+      - '.github/workflows/app-analytics.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: analytics
+      has_requirements: true

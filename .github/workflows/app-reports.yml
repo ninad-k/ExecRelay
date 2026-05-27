@@ -1,0 +1,21 @@
+name: app-reports
+
+on:
+  pull_request:
+    paths:
+      - 'apps/reports/**'
+      - '.github/workflows/app-reports.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/reports/**'
+      - '.github/workflows/app-reports.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: reports
+      has_requirements: true
