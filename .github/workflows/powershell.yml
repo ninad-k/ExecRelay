@@ -1,0 +1,73 @@
+name: powershell
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**.ps1'
+      - '.github/workflows/powershell.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**.ps1'
+      - '.github/workflows/powershell.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  psscriptanalyzer:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -SkipPublisherCheck -Scope CurrentUser
+      - name: Lint scripts
+        shell: pwsh
+        run: |
+          $fail = $false
+          # Treat parse errors and high-severity diagnostics as failures.
+          $rulesToFailOn = @('PSAvoidUsingPlainTextForPassword', 'PSAvoidUsingComputerNameHardcoded')
+          Get-ChildItem -Path scripts -Filter *.ps1 | ForEach-Object {
+            Write-Host "::group::analyzing $($_.Name)"
+            $diagnostics = Invoke-ScriptAnalyzer -Path $_.FullName -Severity 'Error','Warning'
+            if ($diagnostics) {
+              $diagnostics | Format-Table -AutoSize
+              # Fail on any Error severity, or specific high-risk rules.
+              if (($diagnostics | Where-Object { $_.Severity -eq 'Error' }).Count -gt 0) {
+                $fail = $true
+              }
+              if (($diagnostics | Where-Object { $rulesToFailOn -contains $_.RuleName }).Count -gt 0) {
+                $fail = $true
+              }
+            } else {
+              Write-Host "  clean."
+            }
+            Write-Host "::endgroup::"
+          }
+          if ($fail) { exit 1 }
+
+  parse-only:
+    # Cheaper, faster syntax-only check. Runs in parallel with the analyzer.
+    name: Parse syntax
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse all .ps1 files
+        shell: pwsh
+        run: |
+          $errors = $null
+          Get-ChildItem -Path scripts -Filter *.ps1 | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            if ($errs) {
+              Write-Host "::error file=$($_.FullName)::parse errors:" -ForegroundColor Red
+              $errs | ForEach-Object { Write-Host "  $($_.Message) at line $($_.Extent.StartLineNumber)" }
+              $errors = $true
+            } else {
+              Write-Host "ok: $($_.Name)"
+            }
+          }
+          if ($errors) { exit 1 }

@@ -2,14 +2,18 @@
 
 Run the entire ExecRelay stack — 9 application services plus Postgres, NATS,
 Redis, MinIO, Prometheus, Grafana, Alertmanager, Tempo, MLflow — on **one
-Ubuntu 22.04/24.04 box** via the installer scripts.
+host** via the installer scripts. Supported targets:
+
+- **Ubuntu 22.04 / 24.04** — bash scripts under `scripts/*.sh`
+- **Windows Server 2022** — PowerShell scripts under `scripts/*.ps1` that
+  set up WSL2 + Ubuntu and call the same Linux installers underneath
 
 For dev (anywhere with Docker): see the [Local development](#local-development)
 section at the bottom.
 
 ---
 
-## Production install (fresh VM)
+## Production install on Ubuntu 22.04/24.04
 
 ```bash
 # 1. As root, clone the repo and run the bootstrap installer.
@@ -61,6 +65,86 @@ They are reachable from Caddy on the host but not from the public internet.
    `sudo shred -u /etc/caddy/admin_password.txt`.
 4. **Test the backup.** `sudo systemctl start execrelay-backup.service` then
    `ls /var/backups/execrelay/daily/`.
+
+---
+
+## Production install on Windows Server 2022
+
+All application containers are Linux images, so the Windows path runs them
+inside **WSL2 + Ubuntu 22.04** and uses a Windows-native **Caddy** for TLS.
+You're paying for Windows licenses to host Linux containers — if you have
+no AD/group-policy/on-prem reason for Windows, deploy on Ubuntu instead.
+
+Prereqs: Windows Server 2022 with **hardware virtualization enabled in
+BIOS/UEFI** (required for WSL2). The bootstrap will fail-fast with a
+clear message if it's not.
+
+From an **elevated PowerShell prompt** (Run as Administrator):
+
+```powershell
+# 1. Clone the repo (just to get the scripts; the bootstrap will re-clone
+#    inside WSL where it can run fast).
+git clone https://github.com/ninad-k/ExecRelay.git
+cd ExecRelay
+
+# 2. Bootstrap WSL2 + Ubuntu 22.04 + Docker + .env + stack.
+#    On a fresh host this REBOOTS after enabling Windows features;
+#    re-run the same command after reboot — it's idempotent.
+.\scripts\install.ps1
+
+# 3. Harden: Caddy as a Windows Service, Windows Firewall rules, and a
+#    boot-time Scheduled Task that brings the WSL stack up.
+.\scripts\configure-prod.ps1 `
+  -Domain execrelay.example.com `
+  -Email  ops@example.com
+
+# 4. Nightly Postgres backups (Scheduled Task wrapping the same backup.sh).
+.\scripts\install-backups.ps1
+```
+
+After step 4 the box is internet-ready: Windows Firewall allows only
+22/80/443 inbound, Caddy holds Let's Encrypt certs for your domains, and
+the boot task brings the WSL stack back up after every restart.
+
+### Windows-specific notes
+
+| | |
+|---|---|
+| Stack lives in | `~/ExecRelay` **inside WSL** (`\\wsl$\Ubuntu-22.04\root\ExecRelay` from Windows Explorer) — not under `C:\` |
+| WSL networking | Mirrored mode (`%USERPROFILE%\.wslconfig`) so services bound in WSL show up as `localhost` on Windows |
+| Caddy install path | `C:\caddy\caddy.exe` (managed by the `ExecRelay-Caddy` Windows Service) |
+| Grafana admin password | Printed once + saved to `C:\caddy\admin_password.txt` (delete after copying) |
+| Auto-start at boot | Scheduled Task `ExecRelay-Stack-Startup` running as SYSTEM |
+| Backups visible from Windows | `C:\backups\execrelay\` (symlink into the WSL filesystem) |
+| Restart everything | `Restart-Service ExecRelay-Caddy; wsl --shutdown; wsl -d Ubuntu-22.04 -- echo ok` |
+| Tail logs | `wsl -d Ubuntu-22.04 -- bash -lc 'docker compose --profile apps logs -f'` |
+
+### Differences from the Ubuntu install
+
+- **Two layers, two timers.** Both the Windows Scheduled Task and the
+  Linux systemd timer fire the backup. The script writes uniquely
+  timestamped files so duplicates don't conflict — it's defense in depth.
+- **WSL2 has lower IO throughput** than bare-metal Linux (~10–20% in
+  benchmarks). For most workloads this is invisible; if you're saturating
+  Postgres, bare-metal Ubuntu is faster.
+- **`docker compose --profile apps` runs inside WSL**, not on the
+  Windows host. There is no Docker Desktop dependency.
+
+### Uninstall (Windows)
+
+```powershell
+# Stop and remove the Windows Service
+Stop-Service ExecRelay-Caddy; sc.exe delete ExecRelay-Caddy
+
+# Remove scheduled tasks
+Unregister-ScheduledTask -TaskName ExecRelay-Stack-Startup, ExecRelay-Postgres-Backup -Confirm:$false
+
+# Remove firewall rules
+Get-NetFirewallRule -DisplayName 'ExecRelay-*' | Remove-NetFirewallRule
+
+# Optionally tear down the WSL distro (DESTROYS DATA — including DB):
+wsl --unregister Ubuntu-22.04
+```
 
 ---
 
