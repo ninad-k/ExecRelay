@@ -52,8 +52,12 @@ type FillMsg struct {
 }
 
 // PingMsg / PongMsg are application-level heartbeat messages.
-type PingMsg struct{ Type string `json:"type"` }
-type PongMsg struct{ Type string `json:"type"` }
+type PingMsg struct {
+	Type string `json:"type"`
+}
+type PongMsg struct {
+	Type string `json:"type"`
+}
 
 // HeartbeatMsg is sent by the EA to report account health.
 type HeartbeatMsg struct {

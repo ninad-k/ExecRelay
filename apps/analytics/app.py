@@ -6,7 +6,6 @@ import os
 import sys
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 import asyncpg
@@ -98,7 +97,9 @@ async def signals_summary(
     return {
         "window_hours": window_hours,
         "total": total,
-        "by_command": [{"command": r["command"], "count": r["cnt"]} for r in by_command],
+        "by_command": [
+            {"command": r["command"], "count": r["cnt"]} for r in by_command
+        ],
         "by_symbol": [{"symbol": r["symbol"], "count": r["cnt"]} for r in by_symbol],
     }
 
@@ -116,8 +117,7 @@ async def fills_summary(
         where += f" AND license_id = ${len(params)}::uuid"
 
     rows = await pool.fetch(
-        f"SELECT status, COUNT(*) AS cnt FROM fills WHERE {where}"
-        " GROUP BY status",
+        f"SELECT status, COUNT(*) AS cnt FROM fills WHERE {where}" " GROUP BY status",
         *params,
     )
     counts: dict[str, int] = {r["status"]: r["cnt"] for r in rows}
@@ -181,6 +181,7 @@ async def latency_stats(
 # ---------------------------------------------------------------------------
 # CLI (healthcheck + server start)
 # ---------------------------------------------------------------------------
+
 
 def healthcheck(addr: str) -> None:
     host = "127.0.0.1" if addr.startswith("0.0.0.0:") else addr.rsplit(":", 1)[0]

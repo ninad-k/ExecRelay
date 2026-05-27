@@ -17,36 +17,48 @@ import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-SERVICE   = "persist"
+SERVICE = "persist"
 HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
-NATS_URL  = os.environ.get("NATS_URL",  "nats://nats:4222")
-DB_DSN    = os.environ.get("DATABASE_URL",
-                            "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
-DEBUG     = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
+NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+)
+DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 
 logger = logging.getLogger(SERVICE)
 log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-                    stream=sys.stdout)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
 if DEBUG:
     logger.info("Debug logging enabled")
 
 # Prometheus metrics
-signals_processed = Counter("persist_signals_processed_total", "Total signals processed")
+signals_processed = Counter(
+    "persist_signals_processed_total", "Total signals processed"
+)
 fills_processed = Counter("persist_fills_processed_total", "Total fills processed")
-events_processed = Counter("persist_events_processed_total", "Total events processed", ["event_type"])
-persist_lag = Histogram("persist_processing_duration_seconds", "Duration of persist operations")
+events_processed = Counter(
+    "persist_events_processed_total", "Total events processed", ["event_type"]
+)
+persist_lag = Histogram(
+    "persist_processing_duration_seconds", "Duration of persist operations"
+)
 
 # ---------------------------------------------------------------------------
 # Protobuf wire-format parser for Signal (field layout matches signal.pb.go)
 # ---------------------------------------------------------------------------
 
+
 def _varint(data: bytes, pos: int) -> tuple[int, int]:
     result, shift = 0, 0
     while True:
-        b = data[pos]; pos += 1
+        b = data[pos]
+        pos += 1
         result |= (b & 0x7F) << shift
         if not (b & 0x80):
             return result, pos
@@ -56,9 +68,16 @@ def _varint(data: bytes, pos: int) -> tuple[int, int]:
 def parse_signal(data: bytes) -> dict[str, Any]:
     sig: dict[str, Any] = {"params": []}
     pos = 0
-    string_fields = {1: "trace_id", 2: "license_id", 3: "instance_id",
-                     4: "command",  5: "raw_command", 6: "symbol",
-                     7: "ingress_region", 9: "body_sha256"}
+    string_fields = {
+        1: "trace_id",
+        2: "license_id",
+        3: "instance_id",
+        4: "command",
+        5: "raw_command",
+        6: "symbol",
+        7: "ingress_region",
+        9: "body_sha256",
+    }
     while pos < len(data):
         tag, pos = _varint(data, pos)
         field_num, wire_type = tag >> 3, tag & 0x7
@@ -68,7 +87,8 @@ def parse_signal(data: bytes) -> dict[str, Any]:
                 sig["received_unix_nano"] = val
         elif wire_type == 2:
             length, pos = _varint(data, pos)
-            raw = data[pos: pos + length]; pos += length
+            raw = data[pos : pos + length]
+            pos += length
             if field_num in string_fields:
                 sig[string_fields[field_num]] = raw.decode("utf-8", errors="replace")
             elif field_num == 10:  # repeated SignalParam nested message
@@ -79,7 +99,8 @@ def parse_signal(data: bytes) -> dict[str, Any]:
                     fn, wt = t >> 3, t & 0x7
                     if wt == 2:
                         ln, p = _varint(raw, p)
-                        v = raw[p: p + ln].decode("utf-8", errors="replace"); p += ln
+                        v = raw[p : p + ln].decode("utf-8", errors="replace")
+                        p += ln
                         if fn == 1:
                             param["key"] = v
                         elif fn == 2:
@@ -89,11 +110,15 @@ def parse_signal(data: bytes) -> dict[str, Any]:
             break
     return sig
 
+
 # ---------------------------------------------------------------------------
 # Persistence helpers
 # ---------------------------------------------------------------------------
 
-async def persist_signal(pool: asyncpg.Pool, sig: dict[str, Any], raw_data: bytes) -> None:
+
+async def persist_signal(
+    pool: asyncpg.Pool, sig: dict[str, Any], raw_data: bytes
+) -> None:
     async with pool.acquire() as conn:
         lic = await conn.fetchrow(
             "SELECT id FROM licenses WHERE license_key = $1 AND active = TRUE",
@@ -112,14 +137,16 @@ async def persist_signal(pool: asyncpg.Pool, sig: dict[str, Any], raw_data: byte
                 ON CONFLICT (license_id, body_sha256) DO NOTHING
                 RETURNING TRUE
                 """,
-                license_uuid, body_sha256,
+                license_uuid,
+                body_sha256,
             )
             if not inserted:
                 return  # duplicate signal
 
         inst = await conn.fetchrow(
             "SELECT id FROM instances WHERE license_id = $1 AND instance_key = $2",
-            license_uuid, sig.get("instance_id", ""),
+            license_uuid,
+            sig.get("instance_id", ""),
         )
         instance_uuid = inst["id"] if inst else None
 
@@ -133,13 +160,15 @@ async def persist_signal(pool: asyncpg.Pool, sig: dict[str, Any], raw_data: byte
             ON CONFLICT DO NOTHING
             """,
             sig.get("received_unix_nano", 0),
-            license_uuid, instance_uuid,
+            license_uuid,
+            instance_uuid,
             sig.get("trace_id", ""),
             sig.get("ingress_region", ""),
             sig.get("command", ""),
             sig.get("symbol", ""),
-            json.dumps({"raw_command": sig.get("raw_command"),
-                        "params": sig.get("params", [])}),
+            json.dumps(
+                {"raw_command": sig.get("raw_command"), "params": sig.get("params", [])}
+            ),
             raw_data,
         )
 
@@ -176,9 +205,11 @@ async def persist_fill(pool: asyncpg.Pool, fill: dict[str, Any]) -> None:
             json.dumps(fill),
         )
 
+
 # ---------------------------------------------------------------------------
 # NATS message handlers
 # ---------------------------------------------------------------------------
+
 
 async def on_signal(pool: asyncpg.Pool | None, msg: Any) -> None:
     signals_processed.inc()
@@ -186,7 +217,8 @@ async def on_signal(pool: asyncpg.Pool | None, msg: Any) -> None:
         sig = parse_signal(msg.data)
     except Exception as exc:
         logger.error("parse signal: %s", exc)
-        await msg.ack(); return
+        await msg.ack()
+        return
     if pool:
         try:
             with persist_lag.time():
@@ -205,7 +237,8 @@ async def on_fill(pool: asyncpg.Pool | None, msg: Any) -> None:
         fill["instance_id"] = instance_id
     except Exception as exc:
         logger.error("parse fill: %s", exc)
-        await msg.ack(); return
+        await msg.ack()
+        return
     if pool:
         try:
             with persist_lag.time():
@@ -220,7 +253,8 @@ async def on_event(pool: asyncpg.Pool | None, msg: Any) -> None:
         evt = json.loads(msg.data)
     except Exception as exc:
         logger.error("parse event: %s", exc)
-        await msg.ack(); return
+        await msg.ack()
+        return
 
     subject = msg.subject
     event_type = subject.split(".")[-1] if "." in subject else "unknown"
@@ -309,18 +343,25 @@ async def _persist_rejection(pool: asyncpg.Pool, evt: dict[str, Any]) -> None:
             evt.get("payload_hash", ""),
         )
 
+
 # ---------------------------------------------------------------------------
 # Async worker
 # ---------------------------------------------------------------------------
 
+
 async def run(stop_event: asyncio.Event) -> None:
     try:
         pool: asyncpg.Pool | None = await asyncpg.create_pool(
-            DB_DSN, min_size=2, max_size=10, command_timeout=5,
+            DB_DSN,
+            min_size=2,
+            max_size=10,
+            command_timeout=5,
         )
         logger.info("db connected")
     except Exception as exc:
-        logger.warning("db unavailable, signals will be acked without persistence: %s", exc)
+        logger.warning(
+            "db unavailable, signals will be acked without persistence: %s", exc
+        )
         pool = None
 
     nc = await nats.connect(NATS_URL, name="execrelay-persist")
@@ -330,21 +371,27 @@ async def run(stop_event: asyncio.Event) -> None:
         "signals.>",
         cb=lambda msg: asyncio.ensure_future(on_signal(pool, msg)),
         durable="persist-signals",
-        config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW, ack_policy=nats.js.api.AckPolicy.EXPLICIT),
+        config=ConsumerConfig(
+            deliver_policy=DeliverPolicy.NEW, ack_policy=nats.js.api.AckPolicy.EXPLICIT
+        ),
         stream="SIGNALS",
     )
     fill_sub = await js.subscribe(
         "fills.>",
         cb=lambda msg: asyncio.ensure_future(on_fill(pool, msg)),
         durable="persist-fills",
-        config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW, ack_policy=nats.js.api.AckPolicy.EXPLICIT),
+        config=ConsumerConfig(
+            deliver_policy=DeliverPolicy.NEW, ack_policy=nats.js.api.AckPolicy.EXPLICIT
+        ),
         stream="FILLS",
     )
     event_sub = await js.subscribe(
         "events.>",
         cb=lambda msg: asyncio.ensure_future(on_event(pool, msg)),
         durable="persist-events",
-        config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW, ack_policy=nats.js.api.AckPolicy.EXPLICIT),
+        config=ConsumerConfig(
+            deliver_policy=DeliverPolicy.NEW, ack_policy=nats.js.api.AckPolicy.EXPLICIT
+        ),
         stream="EVENTS",
     )
 
@@ -359,9 +406,11 @@ async def run(stop_event: asyncio.Event) -> None:
         await pool.close()
     logger.info("persist worker stopped")
 
+
 # ---------------------------------------------------------------------------
 # HTTP health server
 # ---------------------------------------------------------------------------
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
@@ -380,7 +429,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         else:
-            self.send_response(404); self.end_headers()
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass
@@ -392,9 +442,11 @@ def start_http(addr: str) -> ThreadingHTTPServer:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def healthcheck(addr: str) -> None:
     host = "127.0.0.1" if addr.startswith("0.0.0.0:") else addr.rsplit(":", 1)[0]
@@ -409,18 +461,19 @@ def main() -> None:
     parser.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args()
     if args.healthcheck:
-        healthcheck(HTTP_ADDR); return
+        healthcheck(HTTP_ADDR)
+        return
 
     http_server = start_http(HTTP_ADDR)
-    loop        = asyncio.new_event_loop()
-    stop_event  = asyncio.Event()
+    loop = asyncio.new_event_loop()
+    stop_event = asyncio.Event()
 
     def _shutdown(signum: int, frame: object) -> None:
         loop.call_soon_threadsafe(stop_event.set)
         http_server.shutdown()
 
     signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT,  _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     try:
         loop.run_until_complete(run(stop_event))

@@ -21,25 +21,25 @@ import (
 	"time"
 
 	oldproto "github.com/golang/protobuf/proto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	parser "github.com/ninadk/execrelay/packages/parser-go"
 	execrelaypb "github.com/ninadk/execrelay/packages/proto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Handler struct {
-	store            LicenseStore
-	publisher        Publisher
-	eventPublisher   Publisher
-	region           string
-	maxBodyBytes     int64
-	now              func() time.Time
-	timestampWindow  time.Duration
-	rateLimiter      *ipRateLimiter
-	allowedCIDRs     []*net.IPNet
-	dailyCounter     *dailyCounter
-	db               *sql.DB
-	perimeterToken   []byte // empty = gate disabled
-	debug            bool
+	store           LicenseStore
+	publisher       Publisher
+	eventPublisher  Publisher
+	region          string
+	maxBodyBytes    int64
+	now             func() time.Time
+	timestampWindow time.Duration
+	rateLimiter     *ipRateLimiter
+	allowedCIDRs    []*net.IPNet
+	dailyCounter    *dailyCounter
+	db              *sql.DB
+	perimeterToken  []byte // empty = gate disabled
+	debug           bool
 }
 
 type Options struct {

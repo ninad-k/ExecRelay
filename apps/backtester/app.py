@@ -4,10 +4,9 @@ import asyncio
 import json
 import logging
 import os
-import signal
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -15,27 +14,37 @@ from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATE
 
 SERVICE = "backtester"
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-DB_DSN = os.environ.get("DATABASE_URL",
-                        "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+)
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 
 logger = logging.getLogger(SERVICE)
 log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-                    stream=sys.stdout)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
 if DEBUG:
     logger.info("Debug logging enabled")
 
 # Prometheus metrics
-backtests_started = Counter("backtester_backtests_started_total", "Total backtests started")
-backtests_completed = Counter("backtester_backtests_completed_total", "Total backtests completed")
+backtests_started = Counter(
+    "backtester_backtests_started_total", "Total backtests started"
+)
+backtests_completed = Counter(
+    "backtester_backtests_completed_total", "Total backtests completed"
+)
 backtest_errors = Counter("backtester_errors_total", "Total backtest errors")
 active_backtests = Gauge("backtester_active_backtests", "Currently active backtests")
 
 
-async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, date_end: str) -> dict[str, Any]:
+async def run_backtest(
+    pool: asyncpg.Pool, license_id: str, date_start: str, date_end: str
+) -> dict[str, Any]:
     """Run a backtest simulation for a date range."""
     backtests_started.inc()
     backtest_job_id = str(uuid.uuid4())
@@ -63,7 +72,9 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
                 WHERE license_id = $1 AND DATE(received_at) >= $2 AND DATE(received_at) <= $3
                 ORDER BY received_at
                 """,
-                license_uuid, start_date, end_date,
+                license_uuid,
+                start_date,
+                end_date,
             )
 
             if not signals:
@@ -72,7 +83,7 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
                     "job_id": backtest_job_id,
                     "total_signals": 0,
                     "total_fills": 0,
-                    "status": "completed"
+                    "status": "completed",
                 }
 
             # Get corresponding fills
@@ -99,7 +110,11 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
 
             for fill in fills:
                 try:
-                    payload = json.loads(fill["payload"]) if isinstance(fill["payload"], str) else fill["payload"]
+                    payload = (
+                        json.loads(fill["payload"])
+                        if isinstance(fill["payload"], str)
+                        else fill["payload"]
+                    )
                     # Extract simulated PnL from fill payload (if available)
                     pnl = payload.get("simulated_pnl", 0.0)
                     gross_pnl += pnl
@@ -114,18 +129,34 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
                     logger.warning(f"parse fill payload: {exc}")
 
             win_pct = (win_count / total_fills * 100) if total_fills > 0 else 0
-            avg_win = sum(p for p in pnl_values if p > 0) / max(win_count, 1) if pnl_values else 0
-            avg_loss = sum(p for p in pnl_values if p < 0) / max(loss_count, 1) if pnl_values else 0
+            avg_win = (
+                sum(p for p in pnl_values if p > 0) / max(win_count, 1)
+                if pnl_values
+                else 0
+            )
+            avg_loss = (
+                sum(p for p in pnl_values if p < 0) / max(loss_count, 1)
+                if pnl_values
+                else 0
+            )
 
             # Calculate Sharpe ratio (simplified: using daily returns)
             daily_returns = {}
             for fill in fills:
                 try:
-                    payload = json.loads(fill["payload"]) if isinstance(fill["payload"], str) else fill["payload"]
+                    payload = (
+                        json.loads(fill["payload"])
+                        if isinstance(fill["payload"], str)
+                        else fill["payload"]
+                    )
                     pnl = payload.get("simulated_pnl", 0.0)
                     # Group by day for daily P&L
                     created_at = fill.get("created_at", datetime.utcnow())
-                    day = str(created_at.date()) if isinstance(created_at, datetime) else str(created_at)
+                    day = (
+                        str(created_at.date())
+                        if isinstance(created_at, datetime)
+                        else str(created_at)
+                    )
                     if day not in daily_returns:
                         daily_returns[day] = 0
                     daily_returns[day] += pnl
@@ -137,7 +168,7 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
                 returns = list(daily_returns.values())
                 mean_return = sum(returns) / len(returns)
                 variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
-                std_dev = variance ** 0.5
+                std_dev = variance**0.5
                 sharpe_ratio = (mean_return / std_dev) if std_dev > 0 else 0
 
             # Max drawdown (simplified)
@@ -162,14 +193,28 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
                      avg_win_pnl, avg_loss_pnl, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
                 """,
-                backtest_job_id, license_id, date_start, date_end,
-                total_signals, total_fills, fill_rate, gross_pnl, gross_pnl * 0.95,  # net_pnl with 5% fee
-                sharpe_ratio, max_drawdown, win_count, loss_count, win_pct,
-                avg_win, avg_loss,
+                backtest_job_id,
+                license_id,
+                date_start,
+                date_end,
+                total_signals,
+                total_fills,
+                fill_rate,
+                gross_pnl,
+                gross_pnl * 0.95,  # net_pnl with 5% fee
+                sharpe_ratio,
+                max_drawdown,
+                win_count,
+                loss_count,
+                win_pct,
+                avg_win,
+                avg_loss,
             )
 
             backtests_completed.inc()
-            logger.info(f"backtest {backtest_job_id} completed: signals={total_signals}, fills={total_fills}, pnl={gross_pnl:.2f}")
+            logger.info(
+                f"backtest {backtest_job_id} completed: signals={total_signals}, fills={total_fills}, pnl={gross_pnl:.2f}"
+            )
 
             return {
                 "job_id": backtest_job_id,
@@ -183,17 +228,13 @@ async def run_backtest(pool: asyncpg.Pool, license_id: str, date_start: str, dat
                 "win_count": win_count,
                 "loss_count": loss_count,
                 "win_pct": win_pct,
-                "status": "completed"
+                "status": "completed",
             }
 
     except Exception as exc:
         logger.error(f"backtest error: {exc}")
         backtest_errors.inc()
-        return {
-            "job_id": backtest_job_id,
-            "status": "failed",
-            "error": str(exc)
-        }
+        return {"job_id": backtest_job_id, "status": "failed", "error": str(exc)}
 
 
 async def http_handler(reader, writer):
@@ -212,7 +253,7 @@ async def http_handler(reader, writer):
     path = parts[1]
 
     if path == "/health" and method == "GET":
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}"
+        response = b'HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{"status":"ok"}'
 
     elif path == "/metrics" and method == "GET":
         metrics_data = generate_latest()
@@ -271,7 +312,9 @@ async def http_handler(reader, writer):
 
         except Exception as exc:
             logger.error(f"backtest endpoint error: {exc}")
-            response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+            response = (
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+            )
 
     else:
         response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
@@ -304,6 +347,7 @@ async def main():
             loop.stop()
 
         import signal as signal_module
+
         for sig in [signal_module.SIGINT, signal_module.SIGTERM]:
             loop.add_signal_handler(sig, shutdown)
 

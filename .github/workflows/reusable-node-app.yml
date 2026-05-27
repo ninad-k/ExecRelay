@@ -78,4 +78,3 @@ jobs:
         env:
           APP: ${{ inputs.app_name }}
         run: docker build -f "apps/${APP}/Dockerfile" -t "execrelay/${APP}:ci" .
-

@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ninadk/execrelay/apps/dxtrade/internal/dxtrade"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {

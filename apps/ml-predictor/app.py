@@ -6,32 +6,43 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Any
 
 import asyncpg
 import numpy as np
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
 SERVICE = "ml-predictor"
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-DB_DSN = os.environ.get("DATABASE_URL",
-                        "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+)
 
 logger = logging.getLogger(SERVICE)
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-                    stream=sys.stdout)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
 if DEBUG:
     logger.info("Debug logging enabled")
 
 # Prometheus metrics
 predictions_made = Counter("ml_predictions_total", "Total predictions made", ["model"])
-prediction_latency = Histogram("ml_prediction_latency_seconds", "Prediction latency", ["model"])
+prediction_latency = Histogram(
+    "ml_prediction_latency_seconds", "Prediction latency", ["model"]
+)
 model_training_runs = Counter("ml_training_runs_total", "Total model training runs")
 model_accuracy = Gauge("ml_model_accuracy", "Model accuracy on test set", ["model"])
 
@@ -39,13 +50,19 @@ model_accuracy = Gauge("ml_model_accuracy", "Model accuracy on test set", ["mode
 model = None
 scaler = None
 feature_names = [
-    "time_of_day_hour", "day_of_week", "symbol_volatility",
-    "signal_frequency", "win_rate_pct", "account_drawdown_pct",
-    "portfolio_correlation_exposure"
+    "time_of_day_hour",
+    "day_of_week",
+    "symbol_volatility",
+    "signal_frequency",
+    "win_rate_pct",
+    "account_drawdown_pct",
+    "portfolio_correlation_exposure",
 ]
 
 
-async def train_model(pool: asyncpg.Pool) -> tuple[RandomForestClassifier, StandardScaler]:
+async def train_model(
+    pool: asyncpg.Pool,
+) -> tuple[RandomForestClassifier, StandardScaler]:
     """Train ML model on historical signal data."""
     try:
         async with pool.acquire() as conn:
@@ -78,15 +95,17 @@ async def train_model(pool: asyncpg.Pool) -> tuple[RandomForestClassifier, Stand
         X = []
         y = []
         for row in rows:
-            X.append([
-                float(row["time_of_day_hour"] or 0),
-                float(row["day_of_week"] or 0),
-                float(row["symbol_volatility"] or 0),
-                float(row["signal_frequency"] or 0),
-                float(row["win_rate_pct"] or 0),
-                float(row["account_drawdown_pct"] or 0),
-                float(row["portfolio_correlation_exposure"] or 0),
-            ])
+            X.append(
+                [
+                    float(row["time_of_day_hour"] or 0),
+                    float(row["day_of_week"] or 0),
+                    float(row["symbol_volatility"] or 0),
+                    float(row["signal_frequency"] or 0),
+                    float(row["win_rate_pct"] or 0),
+                    float(row["account_drawdown_pct"] or 0),
+                    float(row["portfolio_correlation_exposure"] or 0),
+                ]
+            )
             y.append(row["fill_success"])
 
         X_array = np.array(X)
@@ -108,7 +127,9 @@ async def train_model(pool: asyncpg.Pool) -> tuple[RandomForestClassifier, Stand
 
         # Evaluate
         accuracy = clf.score(X_test_scaled, y_test)
-        logger.info(f"model trained: accuracy={accuracy:.2%} on {len(X_test)} test samples")
+        logger.info(
+            f"model trained: accuracy={accuracy:.2%} on {len(X_test)} test samples"
+        )
         model_accuracy.labels(model="signal_success").set(accuracy)
 
         # Store model version in DB
@@ -125,7 +146,13 @@ async def train_model(pool: asyncpg.Pool) -> tuple[RandomForestClassifier, Stand
                 VALUES ('signal_success_predictor', $1, NOW(), $2, TRUE)
                 """,
                 model_version,
-                json.dumps({"accuracy": float(accuracy), "train_samples": len(X_train), "test_samples": len(X_test)})
+                json.dumps(
+                    {
+                        "accuracy": float(accuracy),
+                        "train_samples": len(X_train),
+                        "test_samples": len(X_test),
+                    }
+                ),
             )
 
         model_training_runs.inc()
@@ -134,7 +161,9 @@ async def train_model(pool: asyncpg.Pool) -> tuple[RandomForestClassifier, Stand
     except Exception as exc:
         logger.error(f"train_model error: {exc}")
         # Return default model
-        return RandomForestClassifier(n_estimators=10, random_state=42), StandardScaler()
+        return RandomForestClassifier(
+            n_estimators=10, random_state=42
+        ), StandardScaler()
 
 
 async def predict_signal_success(features: dict[str, float]) -> float:
@@ -145,15 +174,19 @@ async def predict_signal_success(features: dict[str, float]) -> float:
         return 0.5  # Default confidence if model not loaded
 
     try:
-        X = np.array([[
-            float(features.get("time_of_day_hour", 0)),
-            float(features.get("day_of_week", 0)),
-            float(features.get("symbol_volatility", 0)),
-            float(features.get("signal_frequency", 0)),
-            float(features.get("win_rate_pct", 0)),
-            float(features.get("account_drawdown_pct", 0)),
-            float(features.get("portfolio_correlation_exposure", 0)),
-        ]])
+        X = np.array(
+            [
+                [
+                    float(features.get("time_of_day_hour", 0)),
+                    float(features.get("day_of_week", 0)),
+                    float(features.get("symbol_volatility", 0)),
+                    float(features.get("signal_frequency", 0)),
+                    float(features.get("win_rate_pct", 0)),
+                    float(features.get("account_drawdown_pct", 0)),
+                    float(features.get("portfolio_correlation_exposure", 0)),
+                ]
+            ]
+        )
 
         X_scaled = scaler.transform(X)
         confidence = float(model.predict_proba(X_scaled)[0][1])
@@ -180,7 +213,7 @@ async def http_handler(reader, writer):
     path = parts[1]
 
     if path == "/health" and method == "GET":
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}"
+        response = b'HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{"status":"ok"}'
 
     elif path == "/metrics" and method == "GET":
         metrics_data = generate_latest()
@@ -214,13 +247,16 @@ async def http_handler(reader, writer):
 
             # Make prediction
             import time
+
             start = time.time()
             confidence = await predict_signal_success(features)
             latency = time.time() - start
             prediction_latency.labels(model="signal_success").observe(latency)
             predictions_made.labels(model="signal_success").inc()
 
-            result = json.dumps({"confidence": confidence, "timestamp": datetime.utcnow().isoformat()})
+            result = json.dumps(
+                {"confidence": confidence, "timestamp": datetime.utcnow().isoformat()}
+            )
             response_body = result.encode()
             response = (
                 b"HTTP/1.1 200 OK\r\n"
@@ -231,7 +267,9 @@ async def http_handler(reader, writer):
 
         except Exception as exc:
             logger.error(f"predict endpoint error: {exc}")
-            response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+            response = (
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+            )
 
     else:
         response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
@@ -269,6 +307,7 @@ async def main():
             loop.stop()
 
         import signal as signal_module
+
         for sig in [signal_module.SIGINT, signal_module.SIGTERM]:
             loop.add_signal_handler(sig, shutdown)
 

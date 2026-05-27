@@ -11,7 +11,7 @@ const (
 	// DXTrade signals (signals.dxtrade.>) are handled by the dxtrade service.
 	SignalSubjectMT5    = "signals.mt5.>"
 	SignalSubjectMT4    = "signals.mt4.>"
-	signalSubjectFilter = "signals.>"  // stream capture pattern (all platforms)
+	signalSubjectFilter = "signals.>" // stream capture pattern (all platforms)
 	fillSubjectFilter   = "fills.>"
 )
 

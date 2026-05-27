@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	signalSubject      = "signals.dxtrade.>"
+	signalSubject        = "signals.dxtrade.>"
 	maxDeliverBeforeTerm = 10
 )
 

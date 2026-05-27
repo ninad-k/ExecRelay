@@ -85,7 +85,8 @@ async def list_reports(
             "SELECT id, report_type, data_as_of, status, created_at"
             " FROM report_runs WHERE report_type = $1"
             " ORDER BY created_at DESC LIMIT $2",
-            report_type, limit,
+            report_type,
+            limit,
         )
     else:
         rows = await pool.fetch(
@@ -138,14 +139,21 @@ async def generate_report(
         )
     pool = get_pool()
     data_as_of = datetime(
-        target_date.year, target_date.month, target_date.day,
-        23, 59, 59, tzinfo=timezone.utc,
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        23,
+        59,
+        59,
+        tzinfo=timezone.utc,
     )
 
     if report_type == "daily_signal_summary":
         payload = await _build_daily_signal_summary(pool, target_date)
     else:
-        payload = await _build_weekly_performance(pool, target_date, license_id=license_id)
+        payload = await _build_weekly_performance(
+            pool, target_date, license_id=license_id
+        )
 
     payload_json = json.dumps(payload)
     content_hash = hashlib.sha256(payload_json.encode()).hexdigest()
@@ -158,7 +166,10 @@ async def generate_report(
             SET status = 'completed'
         RETURNING id, created_at
         """,
-        report_type, data_as_of, content_hash, payload_json,
+        report_type,
+        data_as_of,
+        content_hash,
+        payload_json,
     )
     assert row is not None
     logger.info("generated %s for %s", report_type, target_date)
@@ -171,31 +182,39 @@ async def generate_report(
     }
 
 
-async def _build_daily_signal_summary(pool: asyncpg.Pool, target_date: date) -> dict[str, Any]:
-    day_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
+async def _build_daily_signal_summary(
+    pool: asyncpg.Pool, target_date: date
+) -> dict[str, Any]:
+    day_start = datetime(
+        target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc
+    )
     day_end = day_start + timedelta(days=1)
 
     total_signals = await pool.fetchval(
         "SELECT COUNT(*) FROM accepted_signals WHERE received_at >= $1 AND received_at < $2",
-        day_start, day_end,
+        day_start,
+        day_end,
     )
     by_command = await pool.fetch(
         "SELECT command, COUNT(*) AS cnt FROM accepted_signals"
         " WHERE received_at >= $1 AND received_at < $2"
         " GROUP BY command ORDER BY cnt DESC",
-        day_start, day_end,
+        day_start,
+        day_end,
     )
     by_symbol = await pool.fetch(
         "SELECT symbol, COUNT(*) AS cnt FROM accepted_signals"
         " WHERE received_at >= $1 AND received_at < $2"
         " GROUP BY symbol ORDER BY cnt DESC LIMIT 20",
-        day_start, day_end,
+        day_start,
+        day_end,
     )
     fill_row = await pool.fetchrow(
         "SELECT status, COUNT(*) AS cnt FROM fills"
         " WHERE created_at >= $1 AND created_at < $2"
         " GROUP BY status",
-        day_start, day_end,
+        day_start,
+        day_end,
     )
 
     fills_by_status: dict[str, int] = {}
@@ -203,12 +222,17 @@ async def _build_daily_signal_summary(pool: asyncpg.Pool, target_date: date) -> 
         rows = await pool.fetch(
             "SELECT status, COUNT(*) AS cnt FROM fills"
             " WHERE created_at >= $1 AND created_at < $2 GROUP BY status",
-            day_start, day_end,
+            day_start,
+            day_end,
         )
         fills_by_status = {r["status"]: r["cnt"] for r in rows}
 
     total_fills = sum(fills_by_status.values())
-    fill_rate = round(fills_by_status.get("filled", 0) / total_fills * 100, 2) if total_fills > 0 else 0.0
+    fill_rate = (
+        round(fills_by_status.get("filled", 0) / total_fills * 100, 2)
+        if total_fills > 0
+        else 0.0
+    )
 
     return {
         "date": target_date.isoformat(),
@@ -216,8 +240,12 @@ async def _build_daily_signal_summary(pool: asyncpg.Pool, target_date: date) -> 
         "total_fills": total_fills,
         "fill_rate_pct": fill_rate,
         "fills_by_status": fills_by_status,
-        "signals_by_command": [{"command": r["command"], "count": r["cnt"]} for r in by_command],
-        "signals_by_symbol": [{"symbol": r["symbol"], "count": r["cnt"]} for r in by_symbol],
+        "signals_by_command": [
+            {"command": r["command"], "count": r["cnt"]} for r in by_command
+        ],
+        "signals_by_symbol": [
+            {"symbol": r["symbol"], "count": r["cnt"]} for r in by_symbol
+        ],
     }
 
 
@@ -226,7 +254,9 @@ async def _build_weekly_performance(
     target_date: date,
     license_id: str | None = None,
 ) -> dict[str, Any]:
-    week_end = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc) + timedelta(days=1)
+    week_end = datetime(
+        target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc
+    ) + timedelta(days=1)
     week_start = week_end - timedelta(days=7)
 
     license_filter = "AND s.license_id = $3::uuid" if license_id else ""
@@ -280,8 +310,7 @@ async def _build_weekly_performance(
         "latency_p95_ms": _ms(latency_row["p95_ms"]) if latency_row else None,
         "latency_p99_ms": _ms(latency_row["p99_ms"]) if latency_row else None,
         "daily_signal_counts": [
-            {"date": r["day"].date().isoformat(), "count": r["cnt"]}
-            for r in daily_rows
+            {"date": r["day"].date().isoformat(), "count": r["cnt"]} for r in daily_rows
         ],
     }
     if license_id:
@@ -292,6 +321,7 @@ async def _build_weekly_performance(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def healthcheck(addr: str) -> None:
     host = "127.0.0.1" if addr.startswith("0.0.0.0:") else addr.rsplit(":", 1)[0]

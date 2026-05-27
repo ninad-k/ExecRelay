@@ -3,6 +3,7 @@
 Catches missing deps, syntax errors past the top of app.py, and import-time
 exceptions. Real unit tests should be added alongside this file.
 """
+
 import importlib.util
 from pathlib import Path
 

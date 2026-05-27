@@ -5,7 +5,7 @@ Rates tested: [10 50 100 500] req/s
 
 --- Webhook Throughput Test: 10 req/s ---
 Total: 599 | Success: 0 (0.0%) | Failed: 599
-Error codes: 401: 119 429: 480 
+Error codes: 401: 119 429: 480
 
 PASS: 0.0% success rate, p99=0.00ms
 
@@ -13,7 +13,7 @@ WARNING: Success rate below 99%
 
 --- Webhook Throughput Test: 50 req/s ---
 Total: 2999 | Success: 0 (0.0%) | Failed: 2999
-Error codes: 401: 60 429: 2939 
+Error codes: 401: 60 429: 2939
 
 PASS: 0.0% success rate, p99=0.00ms
 
@@ -21,7 +21,7 @@ WARNING: Success rate below 99%
 
 --- Webhook Throughput Test: 100 req/s ---
 Total: 5999 | Success: 0 (0.0%) | Failed: 5999
-Error codes: 401: 60 429: 5939 
+Error codes: 401: 60 429: 5939
 
 PASS: 0.0% success rate, p99=0.00ms
 

@@ -15,26 +15,26 @@ import (
 )
 
 type WebhookConfig struct {
-	Target       string
-	License      string
-	HMACSecret   string
-	AlertSecret  string
-	Rate         int           // req/s
-	Duration     time.Duration
-	Workers      int
-	Symbol       string
-	Command      string
+	Target      string
+	License     string
+	HMACSecret  string
+	AlertSecret string
+	Rate        int // req/s
+	Duration    time.Duration
+	Workers     int
+	Symbol      string
+	Command     string
 }
 
 type Result struct {
-	Total       int64
-	Success     int64
-	Failed      int64
-	Latencies   []float64
-	ErrorRates  map[int]int64
+	Total         int64
+	Success       int64
+	Failed        int64
+	Latencies     []float64
+	ErrorRates    map[int]int64
 	P50, P95, P99 float64
-	MinLatency  float64
-	MaxLatency  float64
+	MinLatency    float64
+	MaxLatency    float64
 }
 
 func RunWebhookScenario(config WebhookConfig) *Result {

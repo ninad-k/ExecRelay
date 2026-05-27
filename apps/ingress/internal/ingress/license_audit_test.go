@@ -72,9 +72,9 @@ func TestAuditLicensesCleanWhenFullyConfigured(t *testing.T) {
 func TestAuditLicensesMixedFleet(t *testing.T) {
 	warnings := AuditLicenses([]LicenseRecord{
 		{LicenseID: "a", Secret: "s", HMACSecret: "k", InstanceID: "x"},
-		{LicenseID: "b", InstanceID: "y"},                       // no_auth
-		{LicenseID: "c", Secret: "s", InstanceID: "z"},          // no_hmac
-		{LicenseID: "d", HMACSecret: "k", InstanceID: "w"},      // no_secret
+		{LicenseID: "b", InstanceID: "y"},                  // no_auth
+		{LicenseID: "c", Secret: "s", InstanceID: "z"},     // no_hmac
+		{LicenseID: "d", HMACSecret: "k", InstanceID: "w"}, // no_secret
 	})
 	if len(warnings) != 3 {
 		t.Fatalf("expected 3 warnings, got %d (%#v)", len(warnings), warnings)

@@ -17,31 +17,53 @@ from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATE
 SERVICE = "risk"
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
-DB_DSN = os.environ.get("DATABASE_URL",
-                        "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+)
 
 logger = logging.getLogger(SERVICE)
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-                    stream=sys.stdout)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
 if DEBUG:
     logger.info("Debug logging enabled")
 
 # Prometheus metrics
-fills_processed = Counter("risk_fills_processed_total", "Total fills processed by risk service")
+fills_processed = Counter(
+    "risk_fills_processed_total", "Total fills processed by risk service"
+)
 positions_updated = Counter("risk_positions_updated_total", "Total position updates")
 drawdowns_recorded = Counter("risk_drawdowns_recorded_total", "Total drawdown records")
-breaches_detected = Counter("risk_limit_breaches_total", "Total exposure limit breaches", ["account_id"])
-account_exposure = Gauge("risk_account_exposure_usd", "Current account notional exposure", ["license_id", "account_id"])
-account_drawdown = Gauge("risk_account_drawdown_pct", "Current account drawdown percentage", ["license_id", "account_id"])
+breaches_detected = Counter(
+    "risk_limit_breaches_total", "Total exposure limit breaches", ["account_id"]
+)
+account_exposure = Gauge(
+    "risk_account_exposure_usd",
+    "Current account notional exposure",
+    ["license_id", "account_id"],
+)
+account_drawdown = Gauge(
+    "risk_account_drawdown_pct",
+    "Current account drawdown percentage",
+    ["license_id", "account_id"],
+)
 
 
-async def update_position(pool: asyncpg.Pool, license_id: str, account_id: str,
-                         symbol: str, size: float, entry_price: float | None,
-                         current_price: float | None) -> None:
+async def update_position(
+    pool: asyncpg.Pool,
+    license_id: str,
+    account_id: str,
+    symbol: str,
+    size: float,
+    entry_price: float | None,
+    current_price: float | None,
+) -> None:
     """Update or insert account position."""
     async with pool.acquire() as conn:
         await conn.execute(
@@ -56,12 +78,19 @@ async def update_position(pool: asyncpg.Pool, license_id: str, account_id: str,
                 current_price = $6,
                 updated_at = NOW()
             """,
-            license_id, account_id, symbol, size, entry_price, current_price,
+            license_id,
+            account_id,
+            symbol,
+            size,
+            entry_price,
+            current_price,
         )
         positions_updated.inc()
 
 
-async def check_exposure_limits(pool: asyncpg.Pool, license_id: str, account_id: str) -> dict[str, Any]:
+async def check_exposure_limits(
+    pool: asyncpg.Pool, license_id: str, account_id: str
+) -> dict[str, Any]:
     """Check if account exceeds exposure limits."""
     async with pool.acquire() as conn:
         # Get current positions and their notional value
@@ -71,12 +100,12 @@ async def check_exposure_limits(pool: asyncpg.Pool, license_id: str, account_id:
             FROM account_positions
             WHERE license_id = $1 AND account_id = $2 AND position_size != 0
             """,
-            license_id, account_id,
+            license_id,
+            account_id,
         )
 
         total_notional = sum(
-            (p["position_size"] or 0) * (p["current_price"] or 0)
-            for p in positions
+            (p["position_size"] or 0) * (p["current_price"] or 0) for p in positions
         )
 
         # Get exposure limits
@@ -86,7 +115,8 @@ async def check_exposure_limits(pool: asyncpg.Pool, license_id: str, account_id:
             FROM portfolio_exposure_limits
             WHERE license_id = $1 AND account_id = $2
             """,
-            license_id, account_id,
+            license_id,
+            account_id,
         )
 
         breached = False
@@ -97,7 +127,9 @@ async def check_exposure_limits(pool: asyncpg.Pool, license_id: str, account_id:
                 breached = True
                 breach_reason = f"Notional exposure ${total_notional:.2f} exceeds limit ${limit['max_notional_usd']:.2f}"
 
-        account_exposure.labels(license_id=license_id, account_id=account_id).set(total_notional)
+        account_exposure.labels(license_id=license_id, account_id=account_id).set(
+            total_notional
+        )
 
         return {
             "account_id": account_id,
@@ -108,8 +140,13 @@ async def check_exposure_limits(pool: asyncpg.Pool, license_id: str, account_id:
         }
 
 
-async def record_drawdown(pool: asyncpg.Pool, license_id: str, account_id: str,
-                         peak_equity: float, current_equity: float) -> None:
+async def record_drawdown(
+    pool: asyncpg.Pool,
+    license_id: str,
+    account_id: str,
+    peak_equity: float,
+    current_equity: float,
+) -> None:
     """Record account drawdown."""
     if peak_equity > 0:
         drawdown_pct = ((peak_equity - current_equity) / peak_equity) * 100
@@ -129,14 +166,21 @@ async def record_drawdown(pool: asyncpg.Pool, license_id: str, account_id: str,
                 drawdown_pct = $5,
                 recorded_at = NOW()
             """,
-            license_id, account_id, peak_equity, current_equity, drawdown_pct,
+            license_id,
+            account_id,
+            peak_equity,
+            current_equity,
+            drawdown_pct,
         )
         drawdowns_recorded.inc()
-        account_drawdown.labels(license_id=license_id, account_id=account_id).set(drawdown_pct)
+        account_drawdown.labels(license_id=license_id, account_id=account_id).set(
+            drawdown_pct
+        )
 
 
-async def on_fill(pool: asyncpg.Pool | None, js: nats.aio.JetStreamContext | None,
-                  msg: Any) -> None:
+async def on_fill(
+    pool: asyncpg.Pool | None, js: nats.aio.JetStreamContext | None, msg: Any
+) -> None:
     """Process fill message and update positions."""
     fills_processed.inc()
 
@@ -184,8 +228,15 @@ async def on_fill(pool: asyncpg.Pool | None, js: nats.aio.JetStreamContext | Non
 
         if symbol and account_id:
             # Update position
-            await update_position(pool, license_id, account_id, symbol,
-                                position_size, entry_price, current_price)
+            await update_position(
+                pool,
+                license_id,
+                account_id,
+                symbol,
+                position_size,
+                entry_price,
+                current_price,
+            )
 
             # Check exposure limits
             exposure = await check_exposure_limits(pool, license_id, account_id)
@@ -201,8 +252,11 @@ async def on_fill(pool: asyncpg.Pool | None, js: nats.aio.JetStreamContext | Non
                             (license_id, account_id, breach_type, current_value, limit_value, metadata, created_at)
                         VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC')
                         """,
-                        license_id, account_id, "notional_exposure",
-                        exposure["total_notional"], exposure["limit"],
+                        license_id,
+                        account_id,
+                        "notional_exposure",
+                        exposure["total_notional"],
+                        exposure["limit"],
                         json.dumps({"reason": exposure["reason"]}),
                     )
 
@@ -217,8 +271,10 @@ async def on_fill(pool: asyncpg.Pool | None, js: nats.aio.JetStreamContext | Non
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                     try:
-                        await js.publish(f"events.risk.breach.{account_id}",
-                                       json.dumps(alert).encode())
+                        await js.publish(
+                            f"events.risk.breach.{account_id}",
+                            json.dumps(alert).encode(),
+                        )
                     except Exception as exc:
                         logger.error("publish risk alert: %s", exc)
 
@@ -241,7 +297,9 @@ async def setup_fills_stream(js: nats.aio.JetStreamContext) -> None:
         logger.info("created FILLS stream")
 
 
-async def subscribe_fills(js: nats.aio.JetStreamContext, pool: asyncpg.Pool) -> nats.aio.subscription.Subscription:
+async def subscribe_fills(
+    js: nats.aio.JetStreamContext, pool: asyncpg.Pool
+) -> nats.aio.subscription.Subscription:
     """Subscribe to fills stream."""
     consumer_config = ConsumerConfig(
         deliver_policy=DeliverPolicy.ALL,
@@ -267,7 +325,7 @@ async def http_handler(reader, writer):
     path = request_line.split()[1]
 
     if path == "/health":
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}"
+        response = b'HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{"status":"ok"}'
     elif path == "/metrics":
         metrics_data = generate_latest()
         response = (

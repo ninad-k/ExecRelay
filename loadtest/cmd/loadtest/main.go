@@ -51,10 +51,10 @@ func main() {
 	deadline := time.Now().Add(*duration)
 
 	var (
-		sent    int64
-		success int64
-		failed  int64
-		mu      sync.Mutex
+		sent      int64
+		success   int64
+		failed    int64
+		mu        sync.Mutex
 		latencies []float64
 	)
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import os
@@ -26,30 +25,41 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from pydantic import BaseModel, EmailStr
 
-SERVICE      = "portal-api"
-HTTP_ADDR    = os.environ.get("HTTP_ADDR",    "0.0.0.0:8080")
-DB_DSN       = os.environ.get("DATABASE_URL", "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
-JWT_SECRET   = os.environ.get("JWT_SECRET",   "changeme-in-production")
-JWT_ALGO     = "HS256"
+SERVICE = "portal-api"
+HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+)
+JWT_SECRET = os.environ.get("JWT_SECRET", "changeme-in-production")
+JWT_ALGO = "HS256"
 JWT_TTL_DAYS = 7
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("PORTAL_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-_INSTANCE_KEY_RE = re.compile(r'^[A-Za-z0-9_-]+$')
-NATS_URL    = os.environ.get("NATS_URL",    "nats://execrelay:execrelay_nats_dev@nats:4222")
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("PORTAL_ALLOWED_ORIGINS", "*").split(",")
+    if o.strip()
+]
+_INSTANCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+NATS_URL = os.environ.get("NATS_URL", "nats://execrelay:execrelay_nats_dev@nats:4222")
 INGRESS_URL = os.environ.get("INGRESS_URL", "http://ingress:8080")
 SIGNALS_STREAM = os.environ.get("SIGNALS_STREAM", "SIGNALS")
 
 logger = logging.getLogger(SERVICE)
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-                    stream=sys.stdout)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
 if DEBUG:
     logger.info("Debug logging enabled")
 
 if JWT_SECRET == "changeme-in-production":
-    logger.warning("JWT_SECRET is using the default value — set it before any non-local deployment")
+    logger.warning(
+        "JWT_SECRET is using the default value — set it before any non-local deployment"
+    )
 
 # ---------------------------------------------------------------------------
 # DB pool lifecycle
@@ -62,7 +72,9 @@ _nc: Any | None = None
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _pool, _nc
-    _pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=20, command_timeout=10)
+    _pool = await asyncpg.create_pool(
+        DB_DSN, min_size=2, max_size=20, command_timeout=10
+    )
     logger.info("db pool ready")
     try:
         _nc = await nats.connect(NATS_URL, name="execrelay-portal-api")
@@ -86,6 +98,7 @@ def get_nats():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "nats unavailable")
     return _nc
 
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -94,13 +107,18 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="ExecRelay Portal API", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
-                   allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 bearer = HTTPBearer()
 
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
+
 
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
@@ -135,9 +153,11 @@ async def current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
     return dict(row)
 
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
 
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -164,7 +184,7 @@ class LicenseOut(BaseModel):
 class CreateLicenseOut(BaseModel):
     id: str
     license_key: str
-    hmac_secret: str      # returned once on creation
+    hmac_secret: str  # returned once on creation
     active: bool
     created_at: datetime
 
@@ -183,11 +203,11 @@ class InstanceOut(BaseModel):
 
 class CreateInstanceIn(BaseModel):
     instance_key: str
-    platform: str         # mt4, mt5, dxtrade
+    platform: str  # mt4, mt5, dxtrade
 
 
 class ConfigExportOut(BaseModel):
-    execrelay_licenses: str   # ready to paste as env var value
+    execrelay_licenses: str  # ready to paste as env var value
 
 
 class SignalOut(BaseModel):
@@ -221,9 +241,11 @@ class TraceTimeline(BaseModel):
     fills: list[dict]
     events: list[dict]
 
+
 # ---------------------------------------------------------------------------
 # Audit log helper
 # ---------------------------------------------------------------------------
+
 
 async def _audit(
     pool: asyncpg.Pool,
@@ -244,14 +266,16 @@ async def _audit(
             action,
             reason,
             json.dumps(before) if before else None,
-            json.dumps(after)  if after  else None,
+            json.dumps(after) if after else None,
         )
     except Exception as exc:
         logger.warning("audit log failed: %s", exc)
 
+
 # ---------------------------------------------------------------------------
 # Minimal protobuf encoder for Signal message (avoids protobuf library dep)
 # ---------------------------------------------------------------------------
+
 
 def _pb_varint(n: int) -> bytes:
     out = []
@@ -265,17 +289,21 @@ def _pb_varint(n: int) -> bytes:
             break
     return bytes(out)
 
+
 def _pb_str_field(field_num: int, s: str) -> bytes:
     enc = s.encode("utf-8")
     tag = _pb_varint((field_num << 3) | 2)
     return tag + _pb_varint(len(enc)) + enc
 
+
 def _pb_int64_field(field_num: int, n: int) -> bytes:
     return _pb_varint((field_num << 3) | 0) + _pb_varint(n)
+
 
 def _pb_bytes_field(field_num: int, data: bytes) -> bytes:
     tag = _pb_varint((field_num << 3) | 2)
     return tag + _pb_varint(len(data)) + data
+
 
 def encode_signal_proto(sig: dict[str, Any]) -> bytes:
     out = b""
@@ -298,25 +326,37 @@ def encode_signal_proto(sig: dict[str, Any]) -> bytes:
     if sig.get("body_sha256"):
         out += _pb_str_field(9, sig["body_sha256"])
     for param in sig.get("params", []):
-        param_bytes = _pb_str_field(1, param.get("key", "")) + _pb_str_field(2, param.get("value", ""))
+        param_bytes = _pb_str_field(1, param.get("key", "")) + _pb_str_field(
+            2, param.get("value", "")
+        )
         out += _pb_bytes_field(10, param_bytes)
     return out
+
 
 def _varint(data: bytes, pos: int) -> tuple[int, int]:
     result, shift = 0, 0
     while True:
-        b = data[pos]; pos += 1
+        b = data[pos]
+        pos += 1
         result |= (b & 0x7F) << shift
         if not (b & 0x80):
             return result, pos
         shift += 7
 
+
 def decode_signal_proto(data: bytes) -> dict[str, Any]:
     sig: dict[str, Any] = {"params": []}
     pos = 0
-    string_fields = {1: "trace_id", 2: "license_id", 3: "instance_id",
-                     4: "command", 5: "raw_command", 6: "symbol",
-                     7: "ingress_region", 9: "body_sha256"}
+    string_fields = {
+        1: "trace_id",
+        2: "license_id",
+        3: "instance_id",
+        4: "command",
+        5: "raw_command",
+        6: "symbol",
+        7: "ingress_region",
+        9: "body_sha256",
+    }
     while pos < len(data):
         tag, pos = _varint(data, pos)
         field_num, wire_type = tag >> 3, tag & 0x7
@@ -326,7 +366,8 @@ def decode_signal_proto(data: bytes) -> dict[str, Any]:
                 sig["received_unix_nano"] = val
         elif wire_type == 2:
             length, pos = _varint(data, pos)
-            raw = data[pos: pos + length]; pos += length
+            raw = data[pos : pos + length]
+            pos += length
             if field_num in string_fields:
                 sig[string_fields[field_num]] = raw.decode("utf-8", errors="replace")
             elif field_num == 10:
@@ -337,7 +378,8 @@ def decode_signal_proto(data: bytes) -> dict[str, Any]:
                     fn, wt = t >> 3, t & 0x7
                     if wt == 2:
                         ln, p = _varint(raw, p)
-                        v = raw[p: p + ln].decode("utf-8", errors="replace"); p += ln
+                        v = raw[p : p + ln].decode("utf-8", errors="replace")
+                        p += ln
                         if fn == 1:
                             param["key"] = v
                         elif fn == 2:
@@ -347,26 +389,36 @@ def decode_signal_proto(data: bytes) -> dict[str, Any]:
             break
     return sig
 
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"service": SERVICE, "status": "ok"}
 
 
-@app.post("/auth/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED
+)
 @limiter.limit("10/minute")
-async def register(request: Request, body: RegisterIn, pool: asyncpg.Pool = Depends(get_pool)) -> TokenOut:
+async def register(
+    request: Request, body: RegisterIn, pool: asyncpg.Pool = Depends(get_pool)
+) -> TokenOut:
     if len(body.password) < 12:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "password must be at least 12 characters")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "password must be at least 12 characters",
+        )
     existing = await pool.fetchrow("SELECT id FROM users WHERE email = $1", body.email)
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
     user_id = await pool.fetchval(
         "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
-        body.email, hash_password(body.password),
+        body.email,
+        hash_password(body.password),
     )
     await pool.execute(
         "INSERT INTO user_roles (user_id, role_id) "
@@ -378,7 +430,9 @@ async def register(request: Request, body: RegisterIn, pool: asyncpg.Pool = Depe
 
 @app.post("/auth/login", response_model=TokenOut)
 @limiter.limit("20/minute")
-async def login(request: Request, body: LoginIn, pool: asyncpg.Pool = Depends(get_pool)) -> TokenOut:
+async def login(
+    request: Request, body: LoginIn, pool: asyncpg.Pool = Depends(get_pool)
+) -> TokenOut:
     row = await pool.fetchrow(
         "SELECT id, password_hash FROM users WHERE email = $1", body.email
     )
@@ -397,11 +451,20 @@ async def list_licenses(
         "WHERE user_id = $1 ORDER BY created_at DESC",
         user["id"],
     )
-    return [LicenseOut(id=str(r["id"]), license_key=r["license_key"],
-                       active=r["active"], created_at=r["created_at"]) for r in rows]
+    return [
+        LicenseOut(
+            id=str(r["id"]),
+            license_key=r["license_key"],
+            active=r["active"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
 
 
-@app.post("/licenses", response_model=CreateLicenseOut, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/licenses", response_model=CreateLicenseOut, status_code=status.HTTP_201_CREATED
+)
 async def create_license(
     user: dict = Depends(current_user),
     pool: asyncpg.Pool = Depends(get_pool),
@@ -411,12 +474,17 @@ async def create_license(
     row = await pool.fetchrow(
         "INSERT INTO licenses (user_id, license_key, hmac_secret) "
         "VALUES ($1, $2, $3) RETURNING id, created_at",
-        user["id"], license_key, hmac_secret,
+        user["id"],
+        license_key,
+        hmac_secret,
     )
     await _audit(pool, user["id"], "create_license", after={"license_key": license_key})
     return CreateLicenseOut(
-        id=str(row["id"]), license_key=license_key,
-        hmac_secret=hmac_secret, active=True, created_at=row["created_at"],
+        id=str(row["id"]),
+        license_key=license_key,
+        hmac_secret=hmac_secret,
+        active=True,
+        created_at=row["created_at"],
     )
 
 
@@ -431,13 +499,26 @@ async def patch_license(
         "UPDATE licenses SET active = $1 "
         "WHERE id = $2 AND user_id = $3 "
         "RETURNING id, license_key, active, created_at",
-        body.active, uuid.UUID(license_id), user["id"],
+        body.active,
+        uuid.UUID(license_id),
+        user["id"],
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "license not found")
-    await _audit(pool, user["id"], "patch_license", before={"active": not body.active}, after={"active": body.active}, reason=f"license_id={license_id}")
-    return LicenseOut(id=str(row["id"]), license_key=row["license_key"],
-                      active=row["active"], created_at=row["created_at"])
+    await _audit(
+        pool,
+        user["id"],
+        "patch_license",
+        before={"active": not body.active},
+        after={"active": body.active},
+        reason=f"license_id={license_id}",
+    )
+    return LicenseOut(
+        id=str(row["id"]),
+        license_key=row["license_key"],
+        active=row["active"],
+        created_at=row["created_at"],
+    )
 
 
 @app.get("/licenses/{license_id}/instances", response_model=list[InstanceOut])
@@ -452,13 +533,23 @@ async def list_instances(
         "WHERE license_id = $1 ORDER BY created_at DESC",
         lic["id"],
     )
-    return [InstanceOut(id=str(r["id"]), instance_key=r["instance_key"],
-                        platform=r["platform"], active=r["active"],
-                        created_at=r["created_at"]) for r in rows]
+    return [
+        InstanceOut(
+            id=str(r["id"]),
+            instance_key=r["instance_key"],
+            platform=r["platform"],
+            active=r["active"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
 
 
-@app.post("/licenses/{license_id}/instances",
-          response_model=InstanceOut, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/licenses/{license_id}/instances",
+    response_model=InstanceOut,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_instance(
     license_id: str,
     body: CreateInstanceIn,
@@ -466,28 +557,48 @@ async def create_instance(
     pool: asyncpg.Pool = Depends(get_pool),
 ) -> InstanceOut:
     if body.platform not in ("mt4", "mt5", "dxtrade"):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            "platform must be mt4, mt5, or dxtrade")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "platform must be mt4, mt5, or dxtrade",
+        )
     if not _INSTANCE_KEY_RE.match(body.instance_key):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            "instance_key must contain only letters, digits, _ or -")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "instance_key must contain only letters, digits, _ or -",
+        )
     lic = await _own_license(pool, license_id, user["id"])
     try:
         row = await pool.fetchrow(
             "INSERT INTO instances (license_id, instance_key, platform) "
             "VALUES ($1, $2, $3) RETURNING id, instance_key, platform, active, created_at",
-            lic["id"], body.instance_key, body.platform,
+            lic["id"],
+            body.instance_key,
+            body.platform,
         )
     except asyncpg.UniqueViolationError:
-        raise HTTPException(status.HTTP_409_CONFLICT, "instance_key already exists for this license")
-    await _audit(pool, user["id"], "create_instance", after={"instance_key": body.instance_key, "platform": body.platform, "license_id": license_id})
-    return InstanceOut(id=str(row["id"]), instance_key=row["instance_key"],
-                       platform=row["platform"], active=row["active"],
-                       created_at=row["created_at"])
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "instance_key already exists for this license"
+        )
+    await _audit(
+        pool,
+        user["id"],
+        "create_instance",
+        after={
+            "instance_key": body.instance_key,
+            "platform": body.platform,
+            "license_id": license_id,
+        },
+    )
+    return InstanceOut(
+        id=str(row["id"]),
+        instance_key=row["instance_key"],
+        platform=row["platform"],
+        active=row["active"],
+        created_at=row["created_at"],
+    )
 
 
-@app.patch("/licenses/{license_id}/instances/{instance_id}",
-           response_model=InstanceOut)
+@app.patch("/licenses/{license_id}/instances/{instance_id}", response_model=InstanceOut)
 async def patch_instance(
     license_id: str,
     instance_id: str,
@@ -500,14 +611,27 @@ async def patch_instance(
         "UPDATE instances SET active = $1 "
         "WHERE id = $2 AND license_id = $3 "
         "RETURNING id, instance_key, platform, active, created_at",
-        body.active, uuid.UUID(instance_id), lic["id"],
+        body.active,
+        uuid.UUID(instance_id),
+        lic["id"],
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found")
-    await _audit(pool, user["id"], "patch_instance", before={"active": not body.active}, after={"active": body.active}, reason=f"instance_id={instance_id}")
-    return InstanceOut(id=str(row["id"]), instance_key=row["instance_key"],
-                       platform=row["platform"], active=row["active"],
-                       created_at=row["created_at"])
+    await _audit(
+        pool,
+        user["id"],
+        "patch_instance",
+        before={"active": not body.active},
+        after={"active": body.active},
+        reason=f"instance_id={instance_id}",
+    )
+    return InstanceOut(
+        id=str(row["id"]),
+        instance_key=row["instance_key"],
+        platform=row["platform"],
+        active=row["active"],
+        created_at=row["created_at"],
+    )
 
 
 @app.get("/licenses/{license_id}/config", response_model=ConfigExportOut)
@@ -521,7 +645,7 @@ async def export_config(
         "SELECT instance_key, platform FROM instances WHERE license_id = $1 AND active = TRUE",
         lic["id"],
     )
-    pending = lic['pending_hmac_secret'] or ''
+    pending = lic["pending_hmac_secret"] or ""
     parts = [
         f"{lic['license_key']}::{lic['hmac_secret']}:{row['instance_key']}:{row['platform']}:{pending}"
         for row in instances
@@ -541,15 +665,25 @@ async def list_signals(
         "SELECT id, received_at, trace_id, ingress_region, command, symbol "
         "FROM accepted_signals WHERE license_id = $1 "
         "ORDER BY received_at DESC LIMIT $2",
-        lic["id"], max(1, min(limit, 500)),
+        lic["id"],
+        max(1, min(limit, 500)),
     )
-    return [SignalOut(id=str(r["id"]), received_at=r["received_at"],
-                      trace_id=r["trace_id"], ingress_region=r["ingress_region"],
-                      command=r["command"], symbol=r["symbol"]) for r in rows]
+    return [
+        SignalOut(
+            id=str(r["id"]),
+            received_at=r["received_at"],
+            trace_id=r["trace_id"],
+            ingress_region=r["ingress_region"],
+            command=r["command"],
+            symbol=r["symbol"],
+        )
+        for r in rows
+    ]
 
 
-@app.get("/licenses/{license_id}/instances/{instance_id}/fills",
-         response_model=list[FillOut])
+@app.get(
+    "/licenses/{license_id}/instances/{instance_id}/fills", response_model=list[FillOut]
+)
 async def list_fills(
     license_id: str,
     instance_id: str,
@@ -560,7 +694,8 @@ async def list_fills(
     lic = await _own_license(pool, license_id, user["id"])
     inst = await pool.fetchrow(
         "SELECT id FROM instances WHERE id = $1 AND license_id = $2",
-        uuid.UUID(instance_id), lic["id"],
+        uuid.UUID(instance_id),
+        lic["id"],
     )
     if inst is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found")
@@ -569,13 +704,22 @@ async def list_fills(
         "       error_code, error_message "
         "FROM fills WHERE instance_id = $1 "
         "ORDER BY created_at DESC LIMIT $2",
-        inst["id"], max(1, min(limit, 500)),
+        inst["id"],
+        max(1, min(limit, 500)),
     )
-    return [FillOut(id=str(r["id"]), created_at=r["created_at"],
-                    trace_id=r["trace_id"], status=r["status"],
-                    broker_order_id=r["broker_order_id"],
-                    error_code=r["error_code"],
-                    error_message=r["error_message"]) for r in rows]
+    return [
+        FillOut(
+            id=str(r["id"]),
+            created_at=r["created_at"],
+            trace_id=r["trace_id"],
+            status=r["status"],
+            broker_order_id=r["broker_order_id"],
+            error_code=r["error_code"],
+            error_message=r["error_message"],
+        )
+        for r in rows
+    ]
+
 
 @app.post("/licenses/{license_id}/rotate-hmac")
 async def rotate_hmac(
@@ -587,10 +731,16 @@ async def rotate_hmac(
     new_secret = secrets.token_hex(16)
     await pool.execute(
         "UPDATE licenses SET pending_hmac_secret = $1 WHERE id = $2",
-        new_secret, lic["id"],
+        new_secret,
+        lic["id"],
     )
-    await _audit(pool, user["id"], "rotate_hmac_start", reason=f"license_id={license_id}")
-    return {"pending_hmac_secret": new_secret, "message": "Update TradingView to use this secret, then call /confirm-rotation"}
+    await _audit(
+        pool, user["id"], "rotate_hmac_start", reason=f"license_id={license_id}"
+    )
+    return {
+        "pending_hmac_secret": new_secret,
+        "message": "Update TradingView to use this secret, then call /confirm-rotation",
+    }
 
 
 @app.post("/licenses/{license_id}/confirm-rotation")
@@ -601,12 +751,16 @@ async def confirm_rotation(
 ) -> dict:
     lic = await _own_license(pool, license_id, user["id"])
     if not lic.get("pending_hmac_secret"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no pending rotation in progress")
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "no pending rotation in progress"
+        )
     await pool.execute(
         "UPDATE licenses SET hmac_secret = pending_hmac_secret, pending_hmac_secret = NULL WHERE id = $1",
         lic["id"],
     )
-    await _audit(pool, user["id"], "rotate_hmac_confirm", reason=f"license_id={license_id}")
+    await _audit(
+        pool, user["id"], "rotate_hmac_confirm", reason=f"license_id={license_id}"
+    )
     return {"message": "HMAC secret rotation complete"}
 
 
@@ -625,7 +779,8 @@ async def get_trace(
         WHERE s.trace_id = $1 AND l.user_id = $2
         LIMIT 1
         """,
-        trace_id, user["id"],
+        trace_id,
+        user["id"],
     )
 
     fills = await pool.fetch(
@@ -649,7 +804,9 @@ async def get_trace(
             "symbol": sig["symbol"],
             "ingress_region": sig["ingress_region"],
             "payload": json.loads(sig["payload"]),
-        } if sig else None,
+        }
+        if sig
+        else None,
         "fills": [
             {
                 "id": str(f["id"]),
@@ -699,14 +856,17 @@ async def replay_signal(
         WHERE s.id = $1 AND l.user_id = $2
         LIMIT 1
         """,
-        sid, user["id"],
+        sid,
+        user["id"],
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "signal not found")
 
     if row["raw_payload"] is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            "signal predates replay support (no raw_payload stored)")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "signal predates replay support (no raw_payload stored)",
+        )
 
     nc = get_nats()
     js = nc.jetstream()
@@ -722,8 +882,12 @@ async def replay_signal(
 
     await js.publish(subject, new_payload)
 
-    await _audit(pool, user["id"], "replay_signal",
-                 reason=f"original_trace_id={row['trace_id']} new_trace_id={new_trace_id}")
+    await _audit(
+        pool,
+        user["id"],
+        "replay_signal",
+        reason=f"original_trace_id={row['trace_id']} new_trace_id={new_trace_id}",
+    )
 
     return {"trace_id": new_trace_id, "subject": subject}
 
@@ -744,7 +908,8 @@ async def correlate_signals(
     signals = await pool.fetch(
         "SELECT id, symbol, command, entry_price FROM accepted_signals "
         "WHERE id = ANY($1) AND license_id = $2",
-        signal_ids, lic["id"],
+        signal_ids,
+        lic["id"],
     )
 
     if not signals:
@@ -758,13 +923,17 @@ async def correlate_signals(
         symbol_groups[sym].append(sig)
 
     correlations = {}
-    for sym_a, sym_b in [(list(symbol_groups.keys())[i], list(symbol_groups.keys())[j])
-                          for i in range(len(symbol_groups))
-                          for j in range(i+1, len(symbol_groups))]:
+    for sym_a, sym_b in [
+        (list(symbol_groups.keys())[i], list(symbol_groups.keys())[j])
+        for i in range(len(symbol_groups))
+        for j in range(i + 1, len(symbol_groups))
+    ]:
         corr = await pool.fetchval(
             "SELECT correlation_coefficient FROM symbol_correlations "
             "WHERE license_id = $1 AND symbol_a = $2 AND symbol_b = $3",
-            lic["id"], sym_a, sym_b,
+            lic["id"],
+            sym_a,
+            sym_b,
         )
         if corr is not None:
             correlations[f"{sym_a}-{sym_b}"] = corr
@@ -776,7 +945,10 @@ async def correlate_signals(
             conflicts.append(f"{sym}: conflicting buy/sell signals")
 
     return {
-        "signals": [{"id": s["id"], "symbol": s["symbol"], "command": s["command"]} for s in signals],
+        "signals": [
+            {"id": s["id"], "symbol": s["symbol"], "command": s["command"]}
+            for s in signals
+        ],
         "correlation_matrix": correlations,
         "symbol_groups": {k: len(v) for k, v in symbol_groups.items()},
         "conflicts": conflicts,
@@ -800,14 +972,18 @@ async def create_signal_group(
     group_id = await pool.fetchval(
         "INSERT INTO signal_groups (license_id, group_name, metadata) "
         "VALUES ($1, $2, $3) RETURNING id",
-        lic["id"], group_name, body.get("metadata", {}),
+        lic["id"],
+        group_name,
+        body.get("metadata", {}),
     )
 
     for sig_id in signal_ids:
         await pool.execute(
             "INSERT INTO signal_group_members (group_id, signal_id, membership_reason) "
             "VALUES ($1, $2, $3)",
-            group_id, sig_id, body.get("reason", "user_grouped"),
+            group_id,
+            sig_id,
+            body.get("reason", "user_grouped"),
         )
 
     return {"group_id": group_id, "signal_count": len(signal_ids)}
@@ -834,26 +1010,36 @@ async def portfolio_exposure(
         positions = await pool.fetch(
             "SELECT symbol, position_size, entry_price, current_price FROM account_positions "
             "WHERE license_id = $1 AND account_id = $2",
-            lic["id"], account_id,
+            lic["id"],
+            account_id,
         )
 
         limit = await pool.fetchrow(
             "SELECT max_notional_usd, max_position_size_pct, max_loss_pct FROM portfolio_exposure_limits "
             "WHERE license_id = $1 AND account_id = $2",
-            lic["id"], account_id,
+            lic["id"],
+            account_id,
         )
 
-        notional = sum(float(p["position_size"]) * float(p["current_price"] or p["entry_price"] or 1.0)
-                      for p in positions)
+        notional = sum(
+            float(p["position_size"])
+            * float(p["current_price"] or p["entry_price"] or 1.0)
+            for p in positions
+        )
         limit_usd = float(limit["max_notional_usd"] or 200000) if limit else 200000
 
-        result["accounts"].append({
-            "account_id": account_id,
-            "notional_usd": notional,
-            "limit_usd": limit_usd,
-            "utilization_pct": round(notional / limit_usd * 100, 2),
-            "positions": [{"symbol": p["symbol"], "size": float(p["position_size"])} for p in positions],
-        })
+        result["accounts"].append(
+            {
+                "account_id": account_id,
+                "notional_usd": notional,
+                "limit_usd": limit_usd,
+                "utilization_pct": round(notional / limit_usd * 100, 2),
+                "positions": [
+                    {"symbol": p["symbol"], "size": float(p["position_size"])}
+                    for p in positions
+                ],
+            }
+        )
 
     return result
 
@@ -885,22 +1071,27 @@ async def risk_metrics(
         drawdown = await pool.fetchrow(
             "SELECT peak_equity, current_equity, drawdown_pct FROM account_drawdowns "
             "WHERE license_id = $1 AND account_id = $2",
-            lic["id"], account_id,
+            lic["id"],
+            account_id,
         )
 
         positions = await pool.fetch(
             "SELECT symbol, position_size, current_price FROM account_positions "
             "WHERE license_id = $1 AND account_id = $2 AND position_size != 0",
-            lic["id"], account_id,
+            lic["id"],
+            account_id,
         )
 
-        notional = sum(float(p["position_size"]) * float(p["current_price"] or 0)
-                      for p in positions)
+        notional = sum(
+            float(p["position_size"]) * float(p["current_price"] or 0)
+            for p in positions
+        )
 
         limit = await pool.fetchrow(
             "SELECT max_notional_usd FROM portfolio_exposure_limits "
             "WHERE license_id = $1 AND account_id = $2",
-            lic["id"], account_id,
+            lic["id"],
+            account_id,
         )
 
         limit_usd = float(limit["max_notional_usd"]) if limit else 0
@@ -908,26 +1099,38 @@ async def risk_metrics(
         result["total_limit"] += limit_usd
 
         largest_position = max(
-            [(p["symbol"], p["position_size"], float(p["position_size"]) * float(p["current_price"] or 0))
-             for p in positions],
+            [
+                (
+                    p["symbol"],
+                    p["position_size"],
+                    float(p["position_size"]) * float(p["current_price"] or 0),
+                )
+                for p in positions
+            ],
             key=lambda x: abs(x[2]),
             default=None,
         )
 
-        result["accounts"].append({
-            "account_id": account_id,
-            "notional_exposure": notional,
-            "exposure_limit": limit_usd,
-            "exposure_ratio": round(notional / limit_usd * 100, 2) if limit_usd else 0,
-            "peak_equity": float(drawdown["peak_equity"]) if drawdown else 0,
-            "current_equity": float(drawdown["current_equity"]) if drawdown else 0,
-            "drawdown_pct": float(drawdown["drawdown_pct"]) if drawdown else 0,
-            "largest_position": {
-                "symbol": largest_position[0],
-                "size": float(largest_position[1]),
-                "value": float(largest_position[2]),
-            } if largest_position else None,
-        })
+        result["accounts"].append(
+            {
+                "account_id": account_id,
+                "notional_exposure": notional,
+                "exposure_limit": limit_usd,
+                "exposure_ratio": round(notional / limit_usd * 100, 2)
+                if limit_usd
+                else 0,
+                "peak_equity": float(drawdown["peak_equity"]) if drawdown else 0,
+                "current_equity": float(drawdown["current_equity"]) if drawdown else 0,
+                "drawdown_pct": float(drawdown["drawdown_pct"]) if drawdown else 0,
+                "largest_position": {
+                    "symbol": largest_position[0],
+                    "size": float(largest_position[1]),
+                    "value": float(largest_position[2]),
+                }
+                if largest_position
+                else None,
+            }
+        )
 
     breaches = await pool.fetch(
         "SELECT account_id, breach_type, current_value, limit_value, created_at "
@@ -959,7 +1162,9 @@ async def backtest(
     date_end = body.get("date_end")
 
     if not license_id or not date_start or not date_end:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "license_id, date_start, date_end required")
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "license_id, date_start, date_end required"
+        )
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         try:
@@ -986,7 +1191,10 @@ async def test_signal(
     user: dict = Depends(current_user),
     pool: asyncpg.Pool = Depends(get_pool),
 ) -> dict:
-    import hashlib, hmac as _hmac, time as _time2
+    import hashlib
+    import hmac as _hmac
+    import time as _time2
+
     lic = await _own_license(pool, license_id, user["id"])
     inst = await pool.fetchrow(
         "SELECT instance_key, platform FROM instances "
@@ -994,8 +1202,9 @@ async def test_signal(
         lic["id"],
     )
     if inst is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            "no active instances — add one first")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "no active instances — add one first"
+        )
 
     body = f"{lic['license_key']}:buy:{inst['instance_key']}:symbol=EURUSD".encode()
     ts = str(int(_time2.time()))
@@ -1020,13 +1229,19 @@ async def test_signal(
         )
 
     trace_id = resp.json().get("trace_id", "")
-    await _audit(pool, user["id"], "test_signal",
-                 after={"trace_id": trace_id, "license_id": license_id})
+    await _audit(
+        pool,
+        user["id"],
+        "test_signal",
+        after={"trace_id": trace_id, "license_id": license_id},
+    )
     return {"trace_id": trace_id, "status": "accepted"}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 async def _own_license(pool: asyncpg.Pool, license_id: str, user_id: Any) -> Any:
     try:
@@ -1036,15 +1251,18 @@ async def _own_license(pool: asyncpg.Pool, license_id: str, user_id: Any) -> Any
     row = await pool.fetchrow(
         "SELECT id, license_key, hmac_secret, pending_hmac_secret, active FROM licenses "
         "WHERE id = $1 AND user_id = $2",
-        lid, user_id,
+        lid,
+        user_id,
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "license not found")
     return row
 
+
 # ---------------------------------------------------------------------------
 # Entry point (uvicorn)
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     import urllib.request
@@ -1054,14 +1272,21 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.healthcheck:
-        host_part = "127.0.0.1" if HTTP_ADDR.startswith("0.0.0.0:") else HTTP_ADDR.rsplit(":", 1)[0]
+        host_part = (
+            "127.0.0.1"
+            if HTTP_ADDR.startswith("0.0.0.0:")
+            else HTTP_ADDR.rsplit(":", 1)[0]
+        )
         port_part = HTTP_ADDR.rsplit(":", 1)[1]
-        with urllib.request.urlopen(f"http://{host_part}:{port_part}/health", timeout=1.5) as r:
+        with urllib.request.urlopen(
+            f"http://{host_part}:{port_part}/health", timeout=1.5
+        ) as r:
             if r.status != 200:
                 raise SystemExit(1)
         return
 
     import uvicorn
+
     host, port = HTTP_ADDR.rsplit(":", 1)
     uvicorn.run(app, host=host, port=int(port), log_level="info")
 

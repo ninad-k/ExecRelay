@@ -42,6 +42,7 @@ if DEBUG:
 # Background task implementations
 # ---------------------------------------------------------------------------
 
+
 async def fill_timeout_check(pool: asyncpg.Pool) -> None:
     """Insert synthetic timeout fills for signals that never received a fill report."""
     rows = await pool.fetch(
@@ -78,11 +79,13 @@ async def fill_timeout_check(pool: asyncpg.Pool) -> None:
                 row["license_id"],
                 row["instance_id"],
                 row["trace_id"],
-                json.dumps({
-                    "signal_id": str(row["id"]),
-                    "received_at": row["received_at"].isoformat(),
-                    "timeout_secs": FILL_TIMEOUT_SECS,
-                }),
+                json.dumps(
+                    {
+                        "signal_id": str(row["id"]),
+                        "received_at": row["received_at"].isoformat(),
+                        "timeout_secs": FILL_TIMEOUT_SECS,
+                    }
+                ),
             )
             await conn.execute(
                 """
@@ -90,12 +93,16 @@ async def fill_timeout_check(pool: asyncpg.Pool) -> None:
                 VALUES ($1, 'fill_timeout', 'warning', $2::jsonb)
                 """,
                 row["trace_id"],
-                json.dumps({
-                    "signal_id": str(row["id"]),
-                    "instance_id": str(row["instance_id"]) if row["instance_id"] else None,
-                    "received_at": row["received_at"].isoformat(),
-                    "timeout_secs": FILL_TIMEOUT_SECS,
-                }),
+                json.dumps(
+                    {
+                        "signal_id": str(row["id"]),
+                        "instance_id": str(row["instance_id"])
+                        if row["instance_id"]
+                        else None,
+                        "received_at": row["received_at"].isoformat(),
+                        "timeout_secs": FILL_TIMEOUT_SECS,
+                    }
+                ),
             )
 
 
@@ -117,16 +124,23 @@ async def data_retention(pool: asyncpg.Pool) -> None:
             "SELECT drop_chunks('accepted_signals', NOW() - ($1 || ' days')::interval)",
             str(RETENTION_DAYS),
         )
-        logger.info("retention: dropped old chunks from accepted_signals, deleted %s fills, %s fingerprints",
-                    deleted_fills, deleted_fps)
+        logger.info(
+            "retention: dropped old chunks from accepted_signals, deleted %s fills, %s fingerprints",
+            deleted_fills,
+            deleted_fps,
+        )
     except Exception:
         deleted_signals = await pool.fetchval(
             "WITH d AS (DELETE FROM accepted_signals WHERE received_at < NOW() - ($1 || ' days')::interval RETURNING 1)"
             " SELECT count(*) FROM d",
             str(RETENTION_DAYS),
         )
-        logger.info("retention: deleted %s signals, %s fills, %s fingerprints",
-                    deleted_signals, deleted_fills, deleted_fps)
+        logger.info(
+            "retention: deleted %s signals, %s fills, %s fingerprints",
+            deleted_signals,
+            deleted_fills,
+            deleted_fps,
+        )
 
 
 async def task_processor(pool: asyncpg.Pool) -> None:
@@ -167,6 +181,7 @@ async def task_processor(pool: asyncpg.Pool) -> None:
 # Periodic runner
 # ---------------------------------------------------------------------------
 
+
 async def run_periodically(interval: int, fn, pool: asyncpg.Pool) -> None:
     while True:
         try:
@@ -179,6 +194,7 @@ async def run_periodically(interval: int, fn, pool: asyncpg.Pool) -> None:
 # ---------------------------------------------------------------------------
 # Health HTTP server (daemon thread)
 # ---------------------------------------------------------------------------
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
@@ -207,6 +223,7 @@ def start_health_server(addr: str) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+
 async def async_main() -> None:
     pool: asyncpg.Pool | None = None
     try:
@@ -226,9 +243,15 @@ async def async_main() -> None:
     bg_tasks = []
     if pool is not None:
         bg_tasks = [
-            asyncio.create_task(run_periodically(FILL_CHECK_INTERVAL, fill_timeout_check, pool)),
-            asyncio.create_task(run_periodically(RETENTION_INTERVAL, data_retention, pool)),
-            asyncio.create_task(run_periodically(TASK_POLL_INTERVAL, task_processor, pool)),
+            asyncio.create_task(
+                run_periodically(FILL_CHECK_INTERVAL, fill_timeout_check, pool)
+            ),
+            asyncio.create_task(
+                run_periodically(RETENTION_INTERVAL, data_retention, pool)
+            ),
+            asyncio.create_task(
+                run_periodically(TASK_POLL_INTERVAL, task_processor, pool)
+            ),
         ]
 
     logger.info("tasks service started")

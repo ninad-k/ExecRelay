@@ -14,18 +14,18 @@ import (
 )
 
 const (
-	maxRetries    = 3
-	retryBaseMs   = 200
+	maxRetries  = 3
+	retryBaseMs = 200
 )
 
 // Client executes trading commands against the DXTrade REST API.
 // It maintains a session token and re-authenticates on 401.
 type Client struct {
-	cfg    InstanceConfig
-	http   *http.Client
-	mu     sync.Mutex
-	token  string
-	cb     *gobreaker.CircuitBreaker
+	cfg   InstanceConfig
+	http  *http.Client
+	mu    sync.Mutex
+	token string
+	cb    *gobreaker.CircuitBreaker
 }
 
 func NewClient(cfg InstanceConfig) *Client {

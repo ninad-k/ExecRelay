@@ -12,32 +12,47 @@ from typing import Any
 import asyncpg
 import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
-from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 SERVICE = "ml-feature-extractor"
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
-DB_DSN = os.environ.get("DATABASE_URL",
-                        "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay")
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+)
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 
 logger = logging.getLogger(SERVICE)
 log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-                    stream=sys.stdout)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
 if DEBUG:
     logger.info("Debug logging enabled")
 
 # Prometheus metrics
-signals_processed = Counter("ml_signals_processed_total", "Total signals processed for feature extraction")
-features_extracted = Counter("ml_features_extracted_total", "Total signal features extracted")
-extraction_errors = Counter("ml_extraction_errors_total", "Total feature extraction errors")
+signals_processed = Counter(
+    "ml_signals_processed_total", "Total signals processed for feature extraction"
+)
+features_extracted = Counter(
+    "ml_features_extracted_total", "Total signal features extracted"
+)
+extraction_errors = Counter(
+    "ml_extraction_errors_total", "Total feature extraction errors"
+)
 
 
-async def extract_signal_features(pool: asyncpg.Pool, signal_id: int, license_id: str,
-                                 symbol: str, signal_data: dict[str, Any]) -> dict[str, Any]:
+async def extract_signal_features(
+    pool: asyncpg.Pool,
+    signal_id: int,
+    license_id: str,
+    symbol: str,
+    signal_data: dict[str, Any],
+) -> dict[str, Any]:
     """Extract features from a signal for ML model training."""
     features = {
         "signal_id": signal_id,
@@ -73,7 +88,8 @@ async def extract_signal_features(pool: asyncpg.Pool, signal_id: int, license_id
                 FROM accepted_signals
                 WHERE license_id = $1 AND symbol = $2 AND created_at > now() - interval '7 days'
                 """,
-                license_id, symbol,
+                license_id,
+                symbol,
             )
             if freq_row:
                 features["signal_frequency"] = freq_row["count"]
@@ -88,7 +104,8 @@ async def extract_signal_features(pool: asyncpg.Pool, signal_id: int, license_id
                 LEFT JOIN fills f ON s.id = f.signal_id
                 WHERE s.license_id = $1 AND s.symbol = $2 AND s.created_at > now() - interval '30 days'
                 """,
-                license_id, symbol,
+                license_id,
+                symbol,
             )
             if win_rate_row and win_rate_row["win_pct"] is not None:
                 features["win_rate_pct"] = float(win_rate_row["win_pct"])
@@ -101,10 +118,13 @@ async def extract_signal_features(pool: asyncpg.Pool, signal_id: int, license_id
                     WHERE license_id = $1 AND account_id = $2
                     LIMIT 1
                     """,
-                    license_id, signal_data["account_id"],
+                    license_id,
+                    signal_data["account_id"],
                 )
                 if drawdown_row:
-                    features["account_drawdown_pct"] = float(drawdown_row["drawdown_pct"])
+                    features["account_drawdown_pct"] = float(
+                        drawdown_row["drawdown_pct"]
+                    )
 
             # Calculate portfolio correlation exposure
             corr_row = await conn.fetchrow(
@@ -113,7 +133,8 @@ async def extract_signal_features(pool: asyncpg.Pool, signal_id: int, license_id
                 FROM symbol_correlations
                 WHERE license_id = $1 AND (symbol_a = $2 OR symbol_b = $2)
                 """,
-                license_id, symbol,
+                license_id,
+                symbol,
             )
             if corr_row and corr_row["avg_corr"] is not None:
                 features["portfolio_correlation_exposure"] = float(corr_row["avg_corr"])
@@ -144,7 +165,9 @@ async def on_signal(pool: asyncpg.Pool | None, msg: Any) -> None:
             await msg.ack()
             return
 
-        features = await extract_signal_features(pool, signal_id, license_id, symbol, signal_data)
+        features = await extract_signal_features(
+            pool, signal_id, license_id, symbol, signal_data
+        )
 
         if features:
             async with pool.acquire() as conn:
@@ -164,10 +187,15 @@ async def on_signal(pool: asyncpg.Pool | None, msg: Any) -> None:
                         account_drawdown_pct = $9,
                         portfolio_correlation_exposure = $10
                     """,
-                    features["signal_id"], features["license_id"], features["symbol"],
-                    features["time_of_day_hour"], features["day_of_week"],
-                    features["symbol_volatility"], features["signal_frequency"],
-                    features["win_rate_pct"], features["account_drawdown_pct"],
+                    features["signal_id"],
+                    features["license_id"],
+                    features["symbol"],
+                    features["time_of_day_hour"],
+                    features["day_of_week"],
+                    features["symbol_volatility"],
+                    features["signal_frequency"],
+                    features["win_rate_pct"],
+                    features["account_drawdown_pct"],
                     features["portfolio_correlation_exposure"],
                 )
                 features_extracted.inc()
@@ -192,7 +220,9 @@ async def setup_signals_stream(js: nats.aio.JetStreamContext) -> None:
         logger.info("created SIGNALS stream")
 
 
-async def subscribe_signals(js: nats.aio.JetStreamContext, pool: asyncpg.Pool) -> nats.aio.subscription.Subscription:
+async def subscribe_signals(
+    js: nats.aio.JetStreamContext, pool: asyncpg.Pool
+) -> nats.aio.subscription.Subscription:
     """Subscribe to signals stream."""
     consumer_config = ConsumerConfig(
         deliver_policy=DeliverPolicy.ALL,
@@ -218,7 +248,7 @@ async def http_handler(reader, writer):
     path = request_line.split()[1]
 
     if path == "/health":
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}"
+        response = b'HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Type: application/json\r\n\r\n{"status":"ok"}'
     elif path == "/metrics":
         metrics_data = generate_latest()
         response = (

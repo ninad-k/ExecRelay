@@ -75,4 +75,4 @@ func (p *NatsPublisher) Close() {
 type NoopPublisher struct{}
 
 func (NoopPublisher) Publish(context.Context, string, []byte) error { return nil }
-func (NoopPublisher) Close()                                       {}
+func (NoopPublisher) Close()                                        {}

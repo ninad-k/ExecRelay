@@ -12,12 +12,12 @@ import (
 )
 
 type MLPredictRequest struct {
-	TimeOfDayHour              int     `json:"time_of_day_hour"`
-	DayOfWeek                  int     `json:"day_of_week"`
-	SymbolVolatility           float64 `json:"symbol_volatility"`
-	SignalFrequency            float64 `json:"signal_frequency"`
-	WinRatePct                 float64 `json:"win_rate_pct"`
-	AccountDrawdownPct         float64 `json:"account_drawdown_pct"`
+	TimeOfDayHour                int     `json:"time_of_day_hour"`
+	DayOfWeek                    int     `json:"day_of_week"`
+	SymbolVolatility             float64 `json:"symbol_volatility"`
+	SignalFrequency              float64 `json:"signal_frequency"`
+	WinRatePct                   float64 `json:"win_rate_pct"`
+	AccountDrawdownPct           float64 `json:"account_drawdown_pct"`
 	PortfolioCorrelationExposure float64 `json:"portfolio_correlation_exposure"`
 }
 
@@ -36,13 +36,13 @@ func (h *Handler) scoreSignalWithML(ctx context.Context, symbol string, timeRece
 	// Extract features from signal
 	now := h.now()
 	req := MLPredictRequest{
-		TimeOfDayHour:              now.Hour(),
-		DayOfWeek:                  int(now.Weekday()),
-		SymbolVolatility:           0.025, // default 2.5% volatility
-		SignalFrequency:            1.0,   // default 1 signal/day
-		WinRatePct:                 50.0,  // default 50% win rate
-		AccountDrawdownPct:         0.0,   // default 0% drawdown
-		PortfolioCorrelationExposure: 0.0, // default 0 correlation
+		TimeOfDayHour:                now.Hour(),
+		DayOfWeek:                    int(now.Weekday()),
+		SymbolVolatility:             0.025, // default 2.5% volatility
+		SignalFrequency:              1.0,   // default 1 signal/day
+		WinRatePct:                   50.0,  // default 50% win rate
+		AccountDrawdownPct:           0.0,   // default 0% drawdown
+		PortfolioCorrelationExposure: 0.0,   // default 0 correlation
 	}
 
 	if h.debug {

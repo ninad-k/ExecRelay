@@ -8,11 +8,11 @@ import (
 )
 
 const (
-	defaultHTTPAddr  = ":8080"
-	defaultNATSURL   = "nats://nats:4222"
-	defaultRegion    = "local"
+	defaultHTTPAddr   = ":8080"
+	defaultNATSURL    = "nats://nats:4222"
+	defaultRegion     = "local"
 	defaultStreamName = "SIGNALS"
-	defaultConsumer  = "dxtrade"
+	defaultConsumer   = "dxtrade"
 )
 
 type Config struct {
