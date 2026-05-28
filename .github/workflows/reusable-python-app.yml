@@ -48,15 +48,34 @@ jobs:
           APP: ${{ inputs.app_name }}
         run: python -m py_compile "apps/${APP}/app.py"
 
-      - name: Run unit tests (if present)
+      - name: Run unit tests + coverage report
         env:
           APP: ${{ inputs.app_name }}
         run: |
           if [ -d "apps/${APP}/tests" ] || ls "apps/${APP}"/test_*.py >/dev/null 2>&1; then
+            # --cov-report=term prints the per-file percentage. The 80% gate
+            # below is intentionally NOT enforced yet (see note).
             pytest "apps/${APP}" --cov="apps/${APP}" --cov-report=term
           else
             echo "No tests found under apps/${APP} — skipping pytest."
           fi
+
+      # 80% unit-coverage gate (pytest --cov-fail-under=80).
+      #
+      # DISABLED for the FastAPI/worker services (portal-api, persist, tasks,
+      # analytics, reports, risk, backtester, ml-*). The bulk of their lines
+      # are asyncpg queries and NATS-consumer handlers that need a live
+      # Postgres + NATS to execute; the unit tests cover the pure logic
+      # (auth/JWT, prod-config validation, the strict protobuf parser,
+      # request middleware). Enforcing 80% here would require testcontainers
+      # (Postgres + NATS), which belongs in an integration job, not the unit
+      # workflow. The e2e-smoke workflow exercises the live DB/NATS path.
+      # See the PR summary "Coverage gate" section for current numbers.
+      #
+      # - name: Coverage gate (>=80%)
+      #   env:
+      #     APP: ${{ inputs.app_name }}
+      #   run: pytest "apps/${APP}" --cov="apps/${APP}" --cov-fail-under=80 -q
 
       - uses: docker/setup-buildx-action@v3
 

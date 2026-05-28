@@ -69,4 +69,3 @@ See [`docs/customer/webhook-integration.md#supported-commands`](../../docs/custo
 - [`docs/customer/webhook-integration.md`](../../docs/customer/webhook-integration.md) — full end-to-end customer guide
 - [`docs/runbooks/fills-not-arriving.md`](../../docs/runbooks/fills-not-arriving.md) — when signals are accepted but fills don't land
 - [`ea/mt4/README.md`](../mt4/README.md) — MT4 equivalent (requires DLL)
-

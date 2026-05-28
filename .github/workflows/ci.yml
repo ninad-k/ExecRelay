@@ -35,6 +35,32 @@ jobs:
       - run: go vet ./internal/... ./packages/...
       - run: go test -race -count=1 ./internal/... ./packages/...
 
+      # 80% unit-coverage gate on the pure-logic shared packages. These have
+      # no external-service dependencies, so 80% is a fair bar and is enforced
+      # here. (internal/bootstrap is a thin main() wrapper and packages/proto
+      # is generated code — both intentionally excluded from the gate.)
+      - name: Coverage gate (>=80% on gated packages)
+        env:
+          MIN: "80.0"
+        run: |
+          gated=(
+            "github.com/ninadk/execrelay/internal/obs"
+            "github.com/ninadk/execrelay/packages/parser-go"
+          )
+          fail=0
+          for pkg in "${gated[@]}"; do
+            pct=$(go test -cover "$pkg" 2>/dev/null | sed -nE 's/.*coverage: ([0-9.]+)% of statements.*/\1/p')
+            if [ -z "$pct" ]; then
+              echo "::error::no coverage reported for $pkg"; fail=1; continue
+            fi
+            if awk -v p="$pct" -v m="$MIN" 'BEGIN{exit !(p+0 >= m+0)}'; then
+              echo "ok   $pkg: ${pct}% (>= ${MIN}%)"
+            else
+              echo "::error::$pkg coverage ${pct}% < ${MIN}%"; fail=1
+            fi
+          done
+          exit $fail
+
   compose-config:
     name: docker compose config
     runs-on: ubuntu-latest

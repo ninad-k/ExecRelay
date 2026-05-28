@@ -39,34 +39,40 @@ def test_prod_refuses_dev_db_default():
 
 def test_prod_refuses_wildcard_origins():
     with pytest.raises(SystemExit):
-        _load_app({
-            "ENV": "production",
-            "DATABASE_URL": "postgresql://u:p@db:5432/x",
-            "NATS_URL": "nats://x:y@nats:4222",
-            "JWT_SECRET": "x" * 64,
-            "PORTAL_ALLOWED_ORIGINS": "*",
-        })
+        _load_app(
+            {
+                "ENV": "production",
+                "DATABASE_URL": "postgresql://u:p@db:5432/x",
+                "NATS_URL": "nats://x:y@nats:4222",
+                "JWT_SECRET": "x" * 64,
+                "PORTAL_ALLOWED_ORIGINS": "*",
+            }
+        )
 
 
 def test_prod_refuses_short_jwt():
     with pytest.raises(SystemExit):
-        _load_app({
-            "ENV": "production",
-            "DATABASE_URL": "postgresql://u:p@db:5432/x",
-            "NATS_URL": "nats://x:y@nats:4222",
-            "JWT_SECRET": "tooshort",
-            "PORTAL_ALLOWED_ORIGINS": "https://example.com",
-        })
+        _load_app(
+            {
+                "ENV": "production",
+                "DATABASE_URL": "postgresql://u:p@db:5432/x",
+                "NATS_URL": "nats://x:y@nats:4222",
+                "JWT_SECRET": "tooshort",
+                "PORTAL_ALLOWED_ORIGINS": "https://example.com",
+            }
+        )
 
 
 def test_prod_accepts_complete_config():
-    module = _load_app({
-        "ENV": "production",
-        "DATABASE_URL": "postgresql://u:p@db:5432/x",
-        "NATS_URL": "nats://x:y@nats:4222",
-        "JWT_SECRET": "x" * 64,
-        "PORTAL_ALLOWED_ORIGINS": "https://app.example.com,https://staging.example.com",
-    })
+    module = _load_app(
+        {
+            "ENV": "production",
+            "DATABASE_URL": "postgresql://u:p@db:5432/x",
+            "NATS_URL": "nats://x:y@nats:4222",
+            "JWT_SECRET": "x" * 64,
+            "PORTAL_ALLOWED_ORIGINS": "https://app.example.com,https://staging.example.com",
+        }
+    )
     assert module.IS_PROD is True
     assert module.ALLOWED_ORIGINS == [
         "https://app.example.com",

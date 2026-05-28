@@ -14,6 +14,7 @@ def test_app_module_imports() -> None:
     # the "duplicated timeseries" check on Counter/Histogram registration.
     try:
         from prometheus_client import REGISTRY
+
         for collector in list(REGISTRY._collector_to_names.keys()):
             try:
                 REGISTRY.unregister(collector)

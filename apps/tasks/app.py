@@ -21,7 +21,10 @@ HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
 _DEV_DB = "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay"
 DATABASE_URL = os.environ.get("DATABASE_URL", _DEV_DB)
 DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
-    "true", "1", "yes", "on"
+    "true",
+    "1",
+    "yes",
+    "on",
 )
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 FILL_TIMEOUT_SECS = int(os.environ.get("FILL_TIMEOUT_SECS", "30"))
@@ -36,6 +39,7 @@ class _JSONFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         from datetime import datetime, timezone
+
         payload = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
@@ -304,17 +308,19 @@ async def async_main() -> None:
 
     bg_tasks = [asyncio.create_task(_refresh_readiness(pool))]
     if pool is not None:
-        bg_tasks.extend([
-            asyncio.create_task(
-                run_periodically(FILL_CHECK_INTERVAL, fill_timeout_check, pool)
-            ),
-            asyncio.create_task(
-                run_periodically(RETENTION_INTERVAL, data_retention, pool)
-            ),
-            asyncio.create_task(
-                run_periodically(TASK_POLL_INTERVAL, task_processor, pool)
-            ),
-        ])
+        bg_tasks.extend(
+            [
+                asyncio.create_task(
+                    run_periodically(FILL_CHECK_INTERVAL, fill_timeout_check, pool)
+                ),
+                asyncio.create_task(
+                    run_periodically(RETENTION_INTERVAL, data_retention, pool)
+                ),
+                asyncio.create_task(
+                    run_periodically(TASK_POLL_INTERVAL, task_processor, pool)
+                ),
+            ]
+        )
 
     logger.info("tasks service started")
     await stop_event.wait()

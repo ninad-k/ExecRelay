@@ -48,6 +48,10 @@ jobs:
           # Keep ENV=development so portal-api doesn't refuse the dev defaults.
           # The smoke test only exercises ingress + bridge + nats + postgres.
           echo "EXECRELAY_LICENSES=60000000001:test-secret:test-hmac-secret:test-instance:mt5" >> .env
+          # Disable rate limit and timestamp check — the smoke loadtest hits
+          # ingress from a single IP and doesn't send X-ExecRelay-Timestamp.
+          echo "WEBHOOK_RATE_LIMIT=0" >> .env
+          echo "WEBHOOK_TIMESTAMP_WINDOW_SECS=0" >> .env
 
       - name: Start infra (postgres + nats + migrate)
         run: |
@@ -65,11 +69,32 @@ jobs:
           done
           docker compose run --rm migrate
 
-      - name: Build ingress and bring it up
+      - name: Build + start bridge (creates SIGNALS + FILLS streams)
         run: |
-          docker compose build ingress
-          docker compose up -d ingress
-          # Wait for /readyz to flip green (DB + NATS reachable).
+          # Bridge owns SIGNALS/FILLS stream creation; ingress only creates
+          # EVENTS. Persist subscribes to all three, so bridge must be up
+          # before persist or persist crashes with "stream not found".
+          docker compose build bridge
+          docker compose up -d bridge
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8082/healthz || echo 000)
+            if [ "$code" = "200" ]; then echo "bridge ready"; break; fi
+            sleep 2
+            if [ "$i" -eq 30 ]; then
+              echo "::error::bridge never returned 200 on /healthz (last $code)"
+              docker compose logs bridge
+              exit 1
+            fi
+          done
+
+      - name: Build ingress + persist and bring them up
+        run: |
+          # ingress creates the EVENTS stream on startup. persist uses
+          # DeliverPolicy.NEW so it MUST be subscribed before the loadtest
+          # fires or it'll miss the messages.
+          docker compose build ingress persist
+          docker compose up -d ingress persist
+          # Wait for ingress /readyz (DB + NATS reachable).
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/readyz || echo 000)
             if [ "$code" = "200" ]; then echo "ingress ready"; break; fi
@@ -80,32 +105,39 @@ jobs:
               exit 1
             fi
           done
+          # Wait for persist /readyz so we know its NATS consumers are bound.
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8084/readyz || echo 000)
+            if [ "$code" = "200" ]; then echo "persist ready"; break; fi
+            sleep 2
+            if [ "$i" -eq 30 ]; then
+              echo "::error::persist /readyz never returned 200 (last $code)"
+              docker compose logs persist
+              exit 1
+            fi
+          done
 
       - name: Smoke load test
         run: |
           set +e
-          # ~150 requests at 30/s for 5s — enough to exercise the HMAC +
-          # license + NATS publish path without burning CI minutes. The
-          # binary exits 0 on PASS, 2 on slow-but-OK (logged as WARN).
+          # ~50 requests over 5s — enough to exercise HMAC + license +
+          # NATS publish without burning CI minutes. The binary exits 0
+          # on PASS, 2 on slow-but-OK (still 2xx).
           go run ./loadtest/cmd/loadtest \
             -target http://localhost:8081/webhook \
             -license 60000000001 \
             -hmac-secret test-hmac-secret \
             -alert-secret test-secret \
-            -rate 30 \
+            -rate 10 \
             -duration 5s \
             -workers 4 \
             | tee loadtest.out
           rc=${PIPESTATUS[0]}
-          # rc==0 -> all 2xx and p99 within target. rc==2 -> all 2xx but slow.
-          # Any other rc means the loadtest itself failed (network, etc.).
           if [ "$rc" != "0" ] && [ "$rc" != "2" ]; then
             echo "::error::loadtest exited with rc=$rc"
             docker compose logs ingress
             exit 1
           fi
-          # Independent assertion: failed must be exactly zero. Guards
-          # against future changes to loadtest exit codes.
           if ! grep -qE '^failed: +0$' loadtest.out; then
             echo "::error::loadtest reported non-zero failure count"
             grep -E '^(sent|success|failed):' loadtest.out
@@ -115,19 +147,20 @@ jobs:
 
       - name: Verify request_log captured the calls
         run: |
-          # We pushed 150 requests; persist consumes events.ingress.request
-          # and writes to request_log. Allow up to 30s for the async pipeline.
-          docker compose up -d persist
+          # persist was running before the loadtest so it should have
+          # consumed events.ingress.request and written to request_log.
+          # We sent at least 30 requests; allow up to 30s for the async
+          # NATS → consumer → INSERT pipeline.
           for i in $(seq 1 30); do
             n=$(docker compose exec -T postgres psql -U execrelay -d execrelay -tAc \
                   'SELECT COUNT(*) FROM request_log' 2>/dev/null | tr -d '[:space:]' || echo 0)
-            if [ "${n:-0}" -ge 100 ]; then
+            if [ "${n:-0}" -ge 30 ]; then
               echo "request_log rows: $n"; exit 0
             fi
             sleep 1
           done
           echo "::error::request_log only has ${n:-0} rows after 30s"
-          docker compose logs persist | tail -50
+          docker compose logs persist | tail -80
           exit 1
 
       - name: Dump logs on failure

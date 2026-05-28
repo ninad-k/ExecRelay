@@ -29,15 +29,16 @@ _DEV_DB = "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay
 NATS_URL = os.environ.get("NATS_URL", _DEV_NATS)
 DB_DSN = os.environ.get("DATABASE_URL", _DEV_DB)
 DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
-    "true", "1", "yes", "on"
+    "true",
+    "1",
+    "yes",
+    "on",
 )
 
 # Structured JSON logging with trace_id correlation (the worker pulls trace_id
 # from each NATS message into a contextvar so every log line in the handler
 # carries it; lets the operator pivot from a failing trade to its logs).
-_trace_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "trace_id", default=""
-)
+_trace_id: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="")
 
 
 class _JSONFormatter(logging.Formatter):
@@ -55,11 +56,30 @@ class _JSONFormatter(logging.Formatter):
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         for k, v in record.__dict__.items():
-            if k in ("args", "msg", "exc_info", "exc_text", "stack_info",
-                     "msecs", "relativeCreated", "thread", "threadName",
-                     "processName", "process", "levelname", "levelno",
-                     "name", "pathname", "filename", "module", "funcName",
-                     "lineno", "created", "asctime", "message"):
+            if k in (
+                "args",
+                "msg",
+                "exc_info",
+                "exc_text",
+                "stack_info",
+                "msecs",
+                "relativeCreated",
+                "thread",
+                "threadName",
+                "processName",
+                "process",
+                "levelname",
+                "levelno",
+                "name",
+                "pathname",
+                "filename",
+                "module",
+                "funcName",
+                "lineno",
+                "created",
+                "asctime",
+                "message",
+            ):
                 continue
             payload[k] = v
         return json.dumps(payload, default=str)
@@ -180,9 +200,7 @@ def parse_signal(data: bytes) -> dict[str, Any]:
                 try:
                     sig[string_fields[field_num]] = raw.decode("utf-8")
                 except UnicodeDecodeError as exc:
-                    raise ProtoParseError(
-                        f"field {field_num} not valid utf-8"
-                    ) from exc
+                    raise ProtoParseError(f"field {field_num} not valid utf-8") from exc
             elif field_num == 10:  # repeated SignalParam nested message
                 param: dict[str, str] = {}
                 p = 0
@@ -190,9 +208,7 @@ def parse_signal(data: bytes) -> dict[str, Any]:
                     try:
                         t, p = _varint(raw, p)
                     except IndexError as exc:
-                        raise ProtoParseError(
-                            "truncated nested param tag"
-                        ) from exc
+                        raise ProtoParseError("truncated nested param tag") from exc
                     fn, wt = t >> 3, t & 0x7
                     if wt == 2:
                         try:
@@ -206,18 +222,14 @@ def parse_signal(data: bytes) -> dict[str, Any]:
                         try:
                             v = raw[p : p + ln].decode("utf-8")
                         except UnicodeDecodeError as exc:
-                            raise ProtoParseError(
-                                "nested param not utf-8"
-                            ) from exc
+                            raise ProtoParseError("nested param not utf-8") from exc
                         p += ln
                         if fn == 1:
                             param["key"] = v
                         elif fn == 2:
                             param["value"] = v
                     else:
-                        raise ProtoParseError(
-                            f"unknown nested wire type {wt}"
-                        )
+                        raise ProtoParseError(f"unknown nested wire type {wt}")
                 sig["params"].append(param)
         else:
             raise ProtoParseError(f"unknown wire type {wire_type}")
@@ -485,9 +497,21 @@ async def _persist_request_log(pool: asyncpg.Pool, evt: dict[str, Any]) -> None:
     'what happened to this call' for any past request."""
     received_at = evt.get("received_at")
     detail_keys = (
-        "request_id", "trace_id", "license_key", "method", "path", "client_ip",
-        "status", "outcome", "reason_code", "latency_ms", "body_sha256",
-        "user_agent", "received_at", "region", "service",
+        "request_id",
+        "trace_id",
+        "license_key",
+        "method",
+        "path",
+        "client_ip",
+        "status",
+        "outcome",
+        "reason_code",
+        "latency_ms",
+        "body_sha256",
+        "user_agent",
+        "received_at",
+        "region",
+        "service",
     )
     detail = {k: v for k, v in evt.items() if k not in detail_keys}
     async with pool.acquire() as conn:
@@ -606,7 +630,9 @@ async def _probe_db(pool: asyncpg.Pool | None) -> None:
         _set_readiness(db_ok=False, db_err=repr(exc)[:200])
 
 
-async def _readiness_loop(pool: asyncpg.Pool | None, nc: Any, stop_event: asyncio.Event) -> None:
+async def _readiness_loop(
+    pool: asyncpg.Pool | None, nc: Any, stop_event: asyncio.Event
+) -> None:
     """Refresh readiness state every 5s. Cheap (one SELECT 1 + attribute read)
     so /readyz returns the most recent ground truth without blocking."""
     while not stop_event.is_set():

@@ -7,6 +7,7 @@ ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+COPY internal ./internal
 COPY packages/proto ./packages/proto
 COPY apps/bridge ./apps/bridge
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/bridge ./apps/bridge/cmd/bridge

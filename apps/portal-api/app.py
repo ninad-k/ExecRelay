@@ -53,7 +53,10 @@ INGRESS_URL = os.environ.get("INGRESS_URL", "http://ingress:8080")
 SIGNALS_STREAM = os.environ.get("SIGNALS_STREAM", "SIGNALS")
 
 DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
-    "true", "1", "yes", "on"
+    "true",
+    "1",
+    "yes",
+    "on",
 )
 
 # --- Structured JSON logging -------------------------------------------------
@@ -62,9 +65,7 @@ DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default=""
 )
-_trace_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "trace_id", default=""
-)
+_trace_id: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="")
 
 
 class _JSONFormatter(logging.Formatter):
@@ -85,11 +86,30 @@ class _JSONFormatter(logging.Formatter):
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         for k, v in record.__dict__.items():
-            if k in ("args", "msg", "exc_info", "exc_text", "stack_info",
-                     "msecs", "relativeCreated", "thread", "threadName",
-                     "processName", "process", "levelname", "levelno",
-                     "name", "pathname", "filename", "module", "funcName",
-                     "lineno", "created", "asctime", "message"):
+            if k in (
+                "args",
+                "msg",
+                "exc_info",
+                "exc_text",
+                "stack_info",
+                "msecs",
+                "relativeCreated",
+                "thread",
+                "threadName",
+                "processName",
+                "process",
+                "levelname",
+                "levelno",
+                "name",
+                "pathname",
+                "filename",
+                "module",
+                "funcName",
+                "lineno",
+                "created",
+                "asctime",
+                "message",
+            ):
                 continue
             payload[k] = v
         return json.dumps(payload, default=str)
@@ -1012,9 +1032,9 @@ async def get_request(
                 "latency_ms": r["latency_ms"],
                 "body_sha256": r["body_sha256"],
                 "user_agent": r["user_agent"],
-                "detail": r["detail"] if isinstance(r["detail"], dict) else (
-                    json.loads(r["detail"]) if r["detail"] else {}
-                ),
+                "detail": r["detail"]
+                if isinstance(r["detail"], dict)
+                else (json.loads(r["detail"]) if r["detail"] else {}),
             }
             for r in rows
         ],
@@ -1022,7 +1042,9 @@ async def get_request(
     }
 
 
-async def _trace_payload(pool: asyncpg.Pool, trace_id: str, user_id: Any) -> dict[str, Any]:
+async def _trace_payload(
+    pool: asyncpg.Pool, trace_id: str, user_id: Any
+) -> dict[str, Any]:
     """Shared trace lookup used by /traces/{id} and /requests/{id}.
     Returns signal + fills + events scoped to the user's licenses."""
     sig = await pool.fetchrow(

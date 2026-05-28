@@ -19,6 +19,7 @@ def app_module():
     # at import time and Counter() refuses to re-register on the same names.
     try:
         from prometheus_client import REGISTRY
+
         for collector in list(REGISTRY._collector_to_names.keys()):
             try:
                 REGISTRY.unregister(collector)
