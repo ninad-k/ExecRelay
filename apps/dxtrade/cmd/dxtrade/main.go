@@ -13,6 +13,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/ninadk/execrelay/apps/dxtrade/internal/dxtrade"
+	"github.com/ninadk/execrelay/internal/obs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -73,15 +74,29 @@ func main() {
 	defer sub.Drain()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+	health := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"service": "dxtrade", "status": "ok"})
+	}
+	mux.HandleFunc("/health", health)
+	mux.HandleFunc("/healthz", health)
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ok := nc.IsConnected()
+		if !ok {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"service": "dxtrade",
+			"ok":      ok,
+			"checks":  map[string]any{"nats": map[string]any{"ok": ok}},
+		})
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           mux,
+		Handler:           obs.Middleware("dxtrade")(mux),
 		ReadHeaderTimeout: cfg.ReadTimeout,
 	}
 

@@ -41,7 +41,14 @@
 [CmdletBinding()]
 param(
     [string]$RepoUrl   = 'https://github.com/ninad-k/ExecRelay.git',
-    [string]$WslDistro = 'Ubuntu-22.04'
+    [string]$WslDistro = 'Ubuntu-22.04',
+    # When set, skip `git pull` in Initialize-Stack so a re-run on a
+    # working host doesn't yank in an unintended new revision.
+    [switch]$SkipUpdate,
+    # When set, never call `wsl --shutdown`. The mirrored-networking config
+    # only matters at WSL boot; on a working host you may want to apply
+    # other changes without an outage.
+    [switch]$SkipWslRestart
 )
 
 . "$PSScriptRoot\lib.ps1"
@@ -49,6 +56,10 @@ param(
 Assert-Administrator
 Assert-WindowsServer2022
 Test-Virtualization
+
+# Track whether *anything* actually changed this run. If nothing did, we
+# skip the disruptive `wsl --shutdown`. Lets safe re-runs stay quiet.
+$script:configChanged = $false
 
 # ---- 1. Windows features ------------------------------------------------------
 function Enable-WslFeatures {
@@ -99,22 +110,44 @@ function Install-UbuntuDistro {
 
 # ---- 3. systemd + mirrored networking -----------------------------------------
 function Set-WslSystemd {
-    Write-Log "enabling systemd inside $WslDistro (required for service auto-start)"
-    Invoke-Wsl -Distro $WslDistro -AsRoot -Command @"
-cat > /etc/wsl.conf <<EOF
+    # Only write /etc/wsl.conf if its content differs — repeated runs of the
+    # installer must NOT cause a WSL restart loop on a working host.
+    $desired = @"
 [boot]
 systemd=true
 
 [network]
 generateResolvConf=true
-EOF
 "@
+    $heredoc = $desired -replace "`r`n","`n"
+    # Compare against current content; rewrite only on drift.
+    $check = @"
+existing=`$(cat /etc/wsl.conf 2>/dev/null)
+desired=`$(cat <<'EOF'
+$heredoc
+EOF
+)
+if [ "`$existing" = "`$desired" ]; then
+    echo unchanged
+else
+    cat > /etc/wsl.conf <<'EOF'
+$heredoc
+EOF
+    echo updated
+fi
+"@
+    $result = Invoke-Wsl -Distro $WslDistro -AsRoot -Command $check
+    if ($result -match 'updated') {
+        Write-Log "updated /etc/wsl.conf"
+        $script:configChanged = $true
+    } else {
+        Write-Ok "/etc/wsl.conf already up to date"
+    }
 }
 
 function Set-WslMirroredNetworking {
     $cfgPath = Join-Path $env:USERPROFILE '.wslconfig'
-    Write-Log "writing $cfgPath for mirrored networking"
-    @'
+    $content = @'
 [wsl2]
 networkingMode=mirrored
 firewall=true
@@ -122,11 +155,24 @@ dnsTunneling=true
 
 [experimental]
 hostAddressLoopback=true
-'@ | Out-File -FilePath $cfgPath -Encoding ascii -Force
-    Write-Ok "wrote $cfgPath"
+'@
+    if (Set-FileIfChanged -Path $cfgPath -Content $content) {
+        Write-Log "wrote $cfgPath"
+        $script:configChanged = $true
+    } else {
+        Write-Ok "$cfgPath already up to date"
+    }
 }
 
 function Restart-Wsl {
+    if ($SkipWslRestart) {
+        Write-Warn "skipping wsl --shutdown (-SkipWslRestart). Config changes will not take effect until the next manual restart."
+        return
+    }
+    if (-not $script:configChanged) {
+        Write-Ok "no WSL config changed; skipping wsl --shutdown to avoid stack downtime"
+        return
+    }
     Write-Log "restarting WSL so the new config takes effect"
     & wsl.exe --shutdown
     Start-Sleep -Seconds 5
@@ -137,13 +183,17 @@ function Restart-Wsl {
 # ---- 4. Run the existing bash installer inside WSL ----------------------------
 function Initialize-Stack {
     # Clone the repo INSIDE the WSL native filesystem (much faster than /mnt/c).
-    Write-Log "cloning $RepoUrl into ~/ExecRelay inside $WslDistro"
+    # On re-runs we skip `git pull` by default with -SkipUpdate so the operator
+    # opts into pulling new commits explicitly. Without that guard a routine
+    # re-run could quietly upgrade a working production stack.
+    $pullCmd = if ($SkipUpdate) { ': skipping git pull (-SkipUpdate)' } else { 'git pull --ff-only' }
+    Write-Log "ensuring $RepoUrl is checked out at ~/ExecRelay inside $WslDistro"
     Invoke-Wsl -Distro $WslDistro -AsRoot -Command @"
 set -e
 apt-get update -qq
 apt-get install -y -qq git ca-certificates
 if [ -d /root/ExecRelay/.git ]; then
-  cd /root/ExecRelay && git pull --ff-only
+  cd /root/ExecRelay && $pullCmd
 else
   git clone --depth 50 $RepoUrl /root/ExecRelay
 fi

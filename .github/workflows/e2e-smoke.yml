@@ -1,0 +1,139 @@
+name: e2e-smoke
+
+# Brings up the full docker-compose stack, fires ~150 webhook requests with
+# valid HMAC, and asserts the ingress returns 2xx on every one. Cheap smoke
+# test — guards against regressions that break the wire-level contract
+# (license parsing, HMAC, NATS publish, request_log event) without needing
+# a real Kubernetes cluster.
+
+on:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'internal/**'
+      - 'packages/**'
+      - 'docker-compose.yml'
+      - 'infra/**'
+      - 'loadtest/**'
+      - '.github/workflows/e2e-smoke.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'internal/**'
+      - 'packages/**'
+      - 'docker-compose.yml'
+      - 'infra/**'
+      - 'loadtest/**'
+      - '.github/workflows/e2e-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: docker compose + loadtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prepare .env
+        run: |
+          cp .env.example .env
+          # Keep ENV=development so portal-api doesn't refuse the dev defaults.
+          # The smoke test only exercises ingress + bridge + nats + postgres.
+          echo "EXECRELAY_LICENSES=60000000001:test-secret:test-hmac-secret:test-instance:mt5" >> .env
+
+      - name: Start infra (postgres + nats + migrate)
+        run: |
+          docker compose up -d postgres nats
+          # Wait for postgres healthy before running migrations.
+          for i in $(seq 1 30); do
+            if docker compose ps postgres --format json | grep -q '"Health":"healthy"'; then
+              echo "postgres healthy"; break
+            fi
+            sleep 2
+            if [ "$i" -eq 30 ]; then
+              docker compose logs postgres
+              exit 1
+            fi
+          done
+          docker compose run --rm migrate
+
+      - name: Build ingress and bring it up
+        run: |
+          docker compose build ingress
+          docker compose up -d ingress
+          # Wait for /readyz to flip green (DB + NATS reachable).
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/readyz || echo 000)
+            if [ "$code" = "200" ]; then echo "ingress ready"; break; fi
+            sleep 2
+            if [ "$i" -eq 30 ]; then
+              echo "::error::ingress /readyz never returned 200 (last $code)"
+              docker compose logs ingress
+              exit 1
+            fi
+          done
+
+      - name: Smoke load test
+        run: |
+          set +e
+          # ~150 requests at 30/s for 5s — enough to exercise the HMAC +
+          # license + NATS publish path without burning CI minutes. The
+          # binary exits 0 on PASS, 2 on slow-but-OK (logged as WARN).
+          go run ./loadtest/cmd/loadtest \
+            -target http://localhost:8081/webhook \
+            -license 60000000001 \
+            -hmac-secret test-hmac-secret \
+            -alert-secret test-secret \
+            -rate 30 \
+            -duration 5s \
+            -workers 4 \
+            | tee loadtest.out
+          rc=${PIPESTATUS[0]}
+          # rc==0 -> all 2xx and p99 within target. rc==2 -> all 2xx but slow.
+          # Any other rc means the loadtest itself failed (network, etc.).
+          if [ "$rc" != "0" ] && [ "$rc" != "2" ]; then
+            echo "::error::loadtest exited with rc=$rc"
+            docker compose logs ingress
+            exit 1
+          fi
+          # Independent assertion: failed must be exactly zero. Guards
+          # against future changes to loadtest exit codes.
+          if ! grep -qE '^failed: +0$' loadtest.out; then
+            echo "::error::loadtest reported non-zero failure count"
+            grep -E '^(sent|success|failed):' loadtest.out
+            docker compose logs ingress
+            exit 1
+          fi
+
+      - name: Verify request_log captured the calls
+        run: |
+          # We pushed 150 requests; persist consumes events.ingress.request
+          # and writes to request_log. Allow up to 30s for the async pipeline.
+          docker compose up -d persist
+          for i in $(seq 1 30); do
+            n=$(docker compose exec -T postgres psql -U execrelay -d execrelay -tAc \
+                  'SELECT COUNT(*) FROM request_log' 2>/dev/null | tr -d '[:space:]' || echo 0)
+            if [ "${n:-0}" -ge 100 ]; then
+              echo "request_log rows: $n"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::request_log only has ${n:-0} rows after 30s"
+          docker compose logs persist | tail -50
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color | tail -300
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

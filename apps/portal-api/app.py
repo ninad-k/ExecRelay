@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import logging
 import os
 import re
 import secrets
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -19,46 +21,120 @@ import jwt
 import nats
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from pydantic import BaseModel, EmailStr
+from starlette.middleware.base import BaseHTTPMiddleware
 
 SERVICE = "portal-api"
+ENV = os.environ.get("ENV", "development").lower()
+IS_PROD = ENV in ("prod", "production")
 HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
-DB_DSN = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
-)
-JWT_SECRET = os.environ.get("JWT_SECRET", "changeme-in-production")
+
+# --- Required-in-prod config: fail-fast if defaults leak into prod -----------
+_DEV_DB = "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay"
+_DEV_NATS = "nats://execrelay:execrelay_nats_dev@nats:4222"
+_DEV_JWT = "changeme-in-production"
+
+DB_DSN = os.environ.get("DATABASE_URL", _DEV_DB)
+NATS_URL = os.environ.get("NATS_URL", _DEV_NATS)
+JWT_SECRET = os.environ.get("JWT_SECRET", _DEV_JWT)
 JWT_ALGO = "HS256"
 JWT_TTL_DAYS = 7
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.environ.get("PORTAL_ALLOWED_ORIGINS", "*").split(",")
-    if o.strip()
-]
+
+_raw_origins = os.environ.get("PORTAL_ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 _INSTANCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-NATS_URL = os.environ.get("NATS_URL", "nats://execrelay:execrelay_nats_dev@nats:4222")
 INGRESS_URL = os.environ.get("INGRESS_URL", "http://ingress:8080")
 SIGNALS_STREAM = os.environ.get("SIGNALS_STREAM", "SIGNALS")
 
-logger = logging.getLogger(SERVICE)
-DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
-log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(
-    level=log_level,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    stream=sys.stdout,
+DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
+    "true", "1", "yes", "on"
 )
 
-if DEBUG:
-    logger.info("Debug logging enabled")
+# --- Structured JSON logging -------------------------------------------------
+# Every log line is one JSON object. Request middleware injects request_id +
+# trace_id via contextvars so every log inside the handler is correlated.
+_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default=""
+)
+_trace_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "trace_id", default=""
+)
 
-if JWT_SECRET == "changeme-in-production":
+
+class _JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "service": SERVICE,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        rid = _request_id.get()
+        if rid:
+            payload["request_id"] = rid
+        tid = _trace_id.get()
+        if tid:
+            payload["trace_id"] = tid
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        for k, v in record.__dict__.items():
+            if k in ("args", "msg", "exc_info", "exc_text", "stack_info",
+                     "msecs", "relativeCreated", "thread", "threadName",
+                     "processName", "process", "levelname", "levelno",
+                     "name", "pathname", "filename", "module", "funcName",
+                     "lineno", "created", "asctime", "message"):
+                continue
+            payload[k] = v
+        return json.dumps(payload, default=str)
+
+
+logger = logging.getLogger(SERVICE)
+log_level = logging.DEBUG if DEBUG else logging.INFO
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(_JSONFormatter())
+logging.basicConfig(level=log_level, handlers=[_handler], force=True)
+
+# --- Prod config validation: refuse to start with dev defaults ---------------
+_config_errors: list[str] = []
+if IS_PROD:
+    if DB_DSN == _DEV_DB:
+        _config_errors.append("DATABASE_URL is required in prod (refusing dev default)")
+    if NATS_URL == _DEV_NATS:
+        _config_errors.append("NATS_URL is required in prod (refusing dev default)")
+    if JWT_SECRET == _DEV_JWT or len(JWT_SECRET) < 32:
+        _config_errors.append("JWT_SECRET must be set and >=32 chars in prod")
+    if not ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS:
+        _config_errors.append(
+            "PORTAL_ALLOWED_ORIGINS must be an explicit comma-separated list in prod "
+            "(wildcard '*' is rejected)"
+        )
+
+if _config_errors:
+    for err in _config_errors:
+        logger.error(err, extra={"event": "config_error"})
+    sys.stderr.write("\n".join(_config_errors) + "\n")
+    raise SystemExit(2)
+
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ["*"]
     logger.warning(
-        "JWT_SECRET is using the default value — set it before any non-local deployment"
+        "PORTAL_ALLOWED_ORIGINS unset; defaulting to '*' (dev only)",
+        extra={"event": "cors_wildcard_dev"},
+    )
+
+if DEBUG:
+    logger.info("debug logging enabled")
+if not IS_PROD and JWT_SECRET == _DEV_JWT:
+    logger.warning(
+        "JWT_SECRET using dev default — REQUIRED before prod",
+        extra={"event": "weak_jwt_secret"},
     )
 
 # ---------------------------------------------------------------------------
@@ -107,11 +183,80 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="ExecRelay Portal API", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+class RequestLogMiddleware(BaseHTTPMiddleware):
+    """Tags every request with a request_id, propagates trace_id, and logs one
+    line per request with timing + status so any failure can be traced."""
+
+    async def dispatch(self, request: Request, call_next):
+        rid = (
+            request.headers.get("x-request-id")
+            or request.headers.get("X-Request-ID")
+            or uuid.uuid4().hex
+        )
+        tid = (
+            request.headers.get("x-execrelay-trace-id")
+            or request.headers.get("X-ExecRelay-Trace-ID")
+            or ""
+        )
+        rid_token = _request_id.set(rid)
+        tid_token = _trace_id.set(tid)
+        request.state.request_id = rid
+        request.state.trace_id = tid
+        start = time.monotonic()
+        status_code = 500
+        err: str = ""
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["x-request-id"] = rid
+            if tid:
+                response.headers["x-execrelay-trace-id"] = tid
+            return response
+        except Exception as exc:
+            err = repr(exc)
+            logger.exception(
+                "request_failed",
+                extra={
+                    "event": "request_failed",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "err": err,
+                },
+            )
+            return JSONResponse(
+                {"error": "internal_error", "request_id": rid},
+                status_code=500,
+                headers={"x-request-id": rid},
+            )
+        finally:
+            latency_ms = (time.monotonic() - start) * 1000
+            client = request.client.host if request.client else ""
+            logger.info(
+                "request",
+                extra={
+                    "event": "request",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": status_code,
+                    "latency_ms": round(latency_ms, 2),
+                    "client": client,
+                    "ua": request.headers.get("user-agent", "")[:120],
+                    "err": err,
+                },
+            )
+            _request_id.reset(rid_token)
+            _trace_id.reset(tid_token)
+
+
+app.add_middleware(RequestLogMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["x-request-id", "x-execrelay-trace-id"],
 )
 bearer = HTTPBearer()
 
@@ -397,7 +542,52 @@ def decode_signal_proto(data: bytes) -> dict[str, Any]:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Liveness — process is up. Kept for backward compat with healthcheck.
+
+    Use /readyz for full dependency probing."""
     return {"service": SERVICE, "status": "ok"}
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"service": SERVICE, "status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    """Readiness — DB + NATS reachable. Returns 503 with per-check status
+    if any dependency is down so a load balancer can pull this instance."""
+    checks: dict[str, dict[str, Any]] = {}
+    ok = True
+
+    if _pool is None:
+        checks["db"] = {"ok": False, "err": "pool not initialized"}
+        ok = False
+    else:
+        try:
+            await _pool.fetchval("SELECT 1")
+            checks["db"] = {"ok": True}
+        except Exception as exc:
+            checks["db"] = {"ok": False, "err": repr(exc)[:200]}
+            ok = False
+
+    if _nc is None:
+        checks["nats"] = {"ok": False, "err": "not connected"}
+        ok = False
+    else:
+        try:
+            connected = bool(getattr(_nc, "is_connected", False))
+            checks["nats"] = {"ok": connected}
+            if not connected:
+                ok = False
+        except Exception as exc:
+            checks["nats"] = {"ok": False, "err": repr(exc)[:200]}
+            ok = False
+
+    return JSONResponse(
+        {"service": SERVICE, "ok": ok, "checks": checks},
+        status_code=200 if ok else 503,
+    )
 
 
 @app.post(
@@ -764,37 +954,99 @@ async def confirm_rotation(
     return {"message": "HMAC secret rotation complete"}
 
 
-@app.get("/traces/{trace_id}")
-async def get_trace(
-    trace_id: str,
+@app.get("/requests/{request_id}")
+async def get_request(
+    request_id: str,
     user: dict = Depends(current_user),
     pool: asyncpg.Pool = Depends(get_pool),
 ) -> dict:
+    """Look up a single webhook attempt by request_id. Joins request_log
+    with the trace's signal/fills/events so a user can answer
+    'what happened to my call?' from a single endpoint.
+
+    Scoped to the authenticated user's licenses by license_key match —
+    a user cannot read another user's request history."""
+    rows = await pool.fetch(
+        """
+        SELECT r.id, r.received_at, r.request_id, r.trace_id, r.service,
+               r.route, r.method, r.client_ip, r.license_key, r.status_code,
+               r.outcome, r.reason_code, r.latency_ms, r.body_sha256,
+               r.user_agent, r.detail
+        FROM request_log r
+        WHERE r.request_id = $1
+          AND (
+            r.license_key IS NULL
+            OR r.license_key IN (
+              SELECT license_key FROM licenses WHERE user_id = $2
+            )
+          )
+        ORDER BY r.received_at ASC
+        """,
+        request_id,
+        user["id"],
+    )
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "request not found")
+
+    # If we know a trace_id from any of the matching rows, fold in the
+    # downstream signal + fills + events so one call gives the full picture.
+    trace_id = next((r["trace_id"] for r in rows if r["trace_id"]), "")
+    trace: dict[str, Any] = {}
+    if trace_id:
+        trace = await _trace_payload(pool, trace_id, user["id"])
+
+    return {
+        "request_id": request_id,
+        "attempts": [
+            {
+                "received_at": r["received_at"].isoformat(),
+                "service": r["service"],
+                "route": r["route"],
+                "method": r["method"],
+                "client_ip": str(r["client_ip"]) if r["client_ip"] else None,
+                "license_key": r["license_key"],
+                "trace_id": r["trace_id"] or None,
+                "status_code": r["status_code"],
+                "outcome": r["outcome"],
+                "reason_code": r["reason_code"],
+                "latency_ms": r["latency_ms"],
+                "body_sha256": r["body_sha256"],
+                "user_agent": r["user_agent"],
+                "detail": r["detail"] if isinstance(r["detail"], dict) else (
+                    json.loads(r["detail"]) if r["detail"] else {}
+                ),
+            }
+            for r in rows
+        ],
+        "trace": trace,
+    }
+
+
+async def _trace_payload(pool: asyncpg.Pool, trace_id: str, user_id: Any) -> dict[str, Any]:
+    """Shared trace lookup used by /traces/{id} and /requests/{id}.
+    Returns signal + fills + events scoped to the user's licenses."""
     sig = await pool.fetchrow(
         """
         SELECT s.id, s.received_at, s.trace_id, s.command, s.symbol,
-               s.ingress_region, s.payload, l.user_id
+               s.ingress_region, s.payload
         FROM accepted_signals s
         JOIN licenses l ON l.id = s.license_id
         WHERE s.trace_id = $1 AND l.user_id = $2
         LIMIT 1
         """,
         trace_id,
-        user["id"],
+        user_id,
     )
-
     fills = await pool.fetch(
-        "SELECT id, created_at, status, broker_order_id, error_code, error_message, payload "
+        "SELECT id, created_at, status, broker_order_id, error_code, error_message "
         "FROM fills WHERE trace_id = $1 ORDER BY created_at",
         trace_id,
     )
-
     events = await pool.fetch(
         "SELECT event_type, severity, payload, created_at "
         "FROM system_events WHERE trace_id = $1 ORDER BY created_at",
         trace_id,
     )
-
     return {
         "trace_id": trace_id,
         "signal": {
@@ -828,6 +1080,48 @@ async def get_trace(
             for e in events
         ],
     }
+
+
+@app.get("/traces/{trace_id}")
+async def get_trace(
+    trace_id: str,
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    payload = await _trace_payload(pool, trace_id, user["id"])
+    # Include the originating request_log rows for the trace so the user
+    # can pivot to /requests/{request_id} from any trace lookup.
+    req_rows = await pool.fetch(
+        """
+        SELECT received_at, request_id, service, route, status_code,
+               outcome, reason_code, latency_ms
+        FROM request_log
+        WHERE trace_id = $1
+          AND (
+            license_key IS NULL
+            OR license_key IN (
+              SELECT license_key FROM licenses WHERE user_id = $2
+            )
+          )
+        ORDER BY received_at
+        """,
+        trace_id,
+        user["id"],
+    )
+    payload["requests"] = [
+        {
+            "received_at": r["received_at"].isoformat(),
+            "request_id": r["request_id"],
+            "service": r["service"],
+            "route": r["route"],
+            "status_code": r["status_code"],
+            "outcome": r["outcome"],
+            "reason_code": r["reason_code"],
+            "latency_ms": r["latency_ms"],
+        }
+        for r in req_rows
+    ]
+    return payload
 
 
 import time as _time

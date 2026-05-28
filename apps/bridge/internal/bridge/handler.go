@@ -8,6 +8,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
+	"github.com/ninadk/execrelay/internal/obs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -49,9 +50,11 @@ func NewHandlerWithAuth(hub *Hub, nc *nats.Conn, authToken string) *Handler {
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.health)
+	mux.HandleFunc("/healthz", h.health)
+	mux.HandleFunc("/readyz", h.readyz)
 	mux.HandleFunc("/ea/ws", h.eaWS)
 	mux.Handle("/metrics", promhttp.Handler())
-	return mux
+	return obs.Middleware("bridge")(mux)
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
@@ -63,6 +66,24 @@ func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"service":"bridge","status":"ok"}`))
+}
+
+// readyz is the stricter probe used by load balancers / k8s readiness gates.
+// Returns 503 if NATS isn't currently up so the LB can pull this pod.
+func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	natsOK := h.nc == nil || h.nc.IsConnected()
+	body := map[string]any{
+		"service": "bridge",
+		"ok":      natsOK,
+		"checks": map[string]any{
+			"nats": map[string]any{"ok": natsOK},
+		},
+	}
+	if !natsOK {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (h *Handler) eaWS(w http.ResponseWriter, r *http.Request) {

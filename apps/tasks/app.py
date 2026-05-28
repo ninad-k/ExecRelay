@@ -14,28 +14,55 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import asyncpg
 
 SERVICE = "tasks"
+ENV = os.environ.get("ENV", "development").lower()
+IS_PROD = ENV in ("prod", "production")
 HTTP_ADDR = os.environ.get("HTTP_ADDR", "0.0.0.0:8080")
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay",
+
+_DEV_DB = "postgresql://execrelay:execrelay_dev_password@postgres:5432/execrelay"
+DATABASE_URL = os.environ.get("DATABASE_URL", _DEV_DB)
+DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
+    "true", "1", "yes", "on"
 )
-DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 FILL_TIMEOUT_SECS = int(os.environ.get("FILL_TIMEOUT_SECS", "30"))
 FILL_CHECK_INTERVAL = int(os.environ.get("FILL_CHECK_INTERVAL", "60"))
 RETENTION_INTERVAL = int(os.environ.get("RETENTION_INTERVAL", "86400"))
 TASK_POLL_INTERVAL = int(os.environ.get("TASK_POLL_INTERVAL", "10"))
 
+
+class _JSONFormatter(logging.Formatter):
+    """Single-line JSON per log record so logs from this worker are pivotable
+    next to the other services' structured streams."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        from datetime import datetime, timezone
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "service": SERVICE,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
 logger = logging.getLogger(SERVICE)
-log_level = logging.DEBUG if DEBUG else logging.INFO
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(_JSONFormatter())
 logging.basicConfig(
-    level=log_level,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    stream=sys.stdout,
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    handlers=[_handler],
+    force=True,
 )
 
-if DEBUG:
-    logger.info("Debug logging enabled")
+if IS_PROD and DATABASE_URL == _DEV_DB:
+    logger.error("DATABASE_URL required in prod (refusing dev default)")
+    raise SystemExit(2)
+
+# Health state shared between worker loop and HTTP probe thread.
+_readiness = {"db_ok": False, "db_err": "not initialized"}
 
 
 # ---------------------------------------------------------------------------
@@ -198,16 +225,32 @@ async def run_periodically(interval: int, fn, pool: asyncpg.Pool) -> None:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path != "/health":
+        if self.path in ("/health", "/healthz"):
+            self._json(200, {"service": SERVICE, "status": "ok"})
+        elif self.path == "/readyz":
+            snap = dict(_readiness)
+            ok = bool(snap.get("db_ok"))
+            self._json(
+                200 if ok else 503,
+                {
+                    "service": SERVICE,
+                    "ok": ok,
+                    "checks": {
+                        "db": {"ok": ok, "err": snap.get("db_err", "")},
+                    },
+                },
+            )
+        else:
             self.send_response(404)
             self.end_headers()
-            return
-        body = json.dumps({"service": SERVICE, "status": "ok"}).encode()
-        self.send_response(200)
+
+    def _json(self, status: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(data)
 
     def log_message(self, _fmt: str, *_args: object) -> None:
         pass
@@ -224,14 +267,33 @@ def start_health_server(addr: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _refresh_readiness(pool: asyncpg.Pool | None) -> None:
+    while True:
+        try:
+            if pool is None:
+                _readiness["db_ok"] = False
+                _readiness["db_err"] = "pool not initialized"
+            else:
+                await pool.fetchval("SELECT 1")
+                _readiness["db_ok"] = True
+                _readiness["db_err"] = ""
+        except Exception as exc:
+            _readiness["db_ok"] = False
+            _readiness["db_err"] = repr(exc)[:200]
+        await asyncio.sleep(5)
+
+
 async def async_main() -> None:
     pool: asyncpg.Pool | None = None
     try:
         pool = await asyncpg.create_pool(
             DATABASE_URL, min_size=1, max_size=5, command_timeout=10
         )
+        _readiness["db_ok"] = True
+        _readiness["db_err"] = ""
         logger.info("db pool ready")
     except Exception as exc:
+        _readiness["db_err"] = repr(exc)[:200]
         logger.warning("db unavailable at startup: %s — tasks will idle", exc)
 
     loop = asyncio.get_running_loop()
@@ -240,9 +302,9 @@ async def async_main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    bg_tasks = []
+    bg_tasks = [asyncio.create_task(_refresh_readiness(pool))]
     if pool is not None:
-        bg_tasks = [
+        bg_tasks.extend([
             asyncio.create_task(
                 run_periodically(FILL_CHECK_INTERVAL, fill_timeout_check, pool)
             ),
@@ -252,7 +314,7 @@ async def async_main() -> None:
             asyncio.create_task(
                 run_periodically(TASK_POLL_INTERVAL, task_processor, pool)
             ),
-        ]
+        ])
 
     logger.info("tasks service started")
     await stop_event.wait()

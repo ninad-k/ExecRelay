@@ -11,6 +11,14 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Compiled service binaries (`go build ./apps/...` drops these at the repo
+# root). Built artifacts should never live in the source tree.
+/ingress
+/bridge
+/dxtrade
+/loadtest
+/loadtest-suite
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*

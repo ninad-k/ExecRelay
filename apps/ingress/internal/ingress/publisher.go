@@ -65,6 +65,12 @@ func (p *NatsPublisher) Publish(_ context.Context, subject string, payload []byt
 	return p.conn.Publish(subject, payload)
 }
 
+// Healthy reports whether the underlying NATS connection is currently up.
+// Used by /readyz to decide whether this instance can serve traffic.
+func (p *NatsPublisher) Healthy() bool {
+	return p != nil && p.conn != nil && p.conn.IsConnected()
+}
+
 func (p *NatsPublisher) Close() {
 	if p != nil && p.conn != nil {
 		p.conn.Drain()
@@ -75,4 +81,5 @@ func (p *NatsPublisher) Close() {
 type NoopPublisher struct{}
 
 func (NoopPublisher) Publish(context.Context, string, []byte) error { return nil }
+func (NoopPublisher) Healthy() bool                                 { return true }
 func (NoopPublisher) Close()                                        {}

@@ -49,6 +49,34 @@ function New-Secret {
     ([Convert]::ToBase64String($bytes) -replace '\+','-' -replace '/','_' -replace '=','').Substring(0, $Length)
 }
 
+# Write $Content to $Path only if the file is missing or its current content
+# differs. Returns $true when it actually wrote, $false when the existing
+# content already matched. Used so re-running the installer doesn't churn
+# config files (and skip downstream "restart to apply" steps).
+function Set-FileIfChanged {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Content,
+        [string]$Encoding = 'ascii'
+    )
+    if (Test-Path -LiteralPath $Path) {
+        $existing = Get-Content -LiteralPath $Path -Raw -Encoding $Encoding
+        # Normalize line endings on both sides so CRLF vs LF doesn't trigger
+        # a spurious "changed" verdict.
+        $a = ($existing -replace "`r`n","`n").TrimEnd("`n")
+        $b = ($Content  -replace "`r`n","`n").TrimEnd("`n")
+        if ($a -eq $b) {
+            return $false
+        }
+    }
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+    $Content | Out-File -FilePath $Path -Encoding $Encoding -Force
+    return $true
+}
+
 # Run a command inside the named WSL distro as root, fail on non-zero exit.
 function Invoke-Wsl {
     param(

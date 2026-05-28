@@ -1,0 +1,42 @@
+name: helm-lint
+
+on:
+  pull_request:
+    paths:
+      - 'infra/helm/**'
+      - '.github/workflows/helm-lint.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/helm/**'
+      - '.github/workflows/helm-lint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: Lint chart (default values)
+        run: helm lint infra/helm/execrelay
+      - name: Lint chart (minikube values)
+        run: helm lint infra/helm/execrelay --values infra/helm/execrelay/values-minikube.yaml
+      - name: Lint chart (aws values)
+        run: helm lint infra/helm/execrelay --values infra/helm/execrelay/values-aws.yaml
+      - name: Render chart (minikube)
+        run: helm template execrelay infra/helm/execrelay --values infra/helm/execrelay/values-minikube.yaml > /tmp/minikube.yaml
+      - name: Render chart (aws)
+        run: helm template execrelay infra/helm/execrelay --values infra/helm/execrelay/values-aws.yaml > /tmp/aws.yaml
+      - name: Validate rendered manifests
+        run: |
+          # Sanity-check we actually rendered Deployments and the readiness
+          # probe points at /readyz (the upgraded probe path).
+          grep -q '/readyz' /tmp/minikube.yaml || { echo "::error::readiness probe missing /readyz in minikube render"; exit 1; }
+          grep -q '/readyz' /tmp/aws.yaml      || { echo "::error::readiness probe missing /readyz in aws render"; exit 1; }
+          grep -q 'kind: Deployment' /tmp/minikube.yaml || { echo "::error::no Deployment rendered"; exit 1; }

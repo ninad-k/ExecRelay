@@ -5,7 +5,7 @@ GO_SERVICES := ingress bridge dxtrade
 PY_SERVICES := persist portal-api tasks analytics reports
 WEB_SERVICES := portal-web
 
-.PHONY: check test bench compose-config docker-build loadtest loadtest-suite up down ps install-hooks lint
+.PHONY: check test bench compose-config docker-build loadtest loadtest-suite up down ps install-hooks lint helm-lint dr-drill
 
 # Install pre-commit hooks (one-time per clone). Requires:
 #   pipx install pre-commit  (or: pip install --user pre-commit)
@@ -91,3 +91,24 @@ down:
 
 ps:
 	docker compose ps
+
+# ---- Helm chart validation ----
+# Lint + dry-render the chart against both values files. Catches template
+# breakage and value-key drift without needing a real cluster. Requires:
+#   brew install helm
+HELM_CHART := infra/helm/execrelay
+helm-lint:
+	helm lint $(HELM_CHART)
+	helm lint $(HELM_CHART) --values $(HELM_CHART)/values-minikube.yaml
+	helm lint $(HELM_CHART) --values $(HELM_CHART)/values-aws.yaml
+	helm template execrelay $(HELM_CHART) --values $(HELM_CHART)/values-minikube.yaml >/dev/null
+	helm template execrelay $(HELM_CHART) --values $(HELM_CHART)/values-aws.yaml >/dev/null
+	@echo "helm chart OK against both values files"
+
+# ---- DR drill: dump live DB, restore into scratch, verify, time it ----
+# Captures RTO/RPO numbers and writes them to docs/runbooks/dr-drill-log.md.
+# Requires DATABASE_URL pointing at the live DB and a writable scratch host
+# (defaults to localhost:5433 — a second Postgres for the restore target).
+DR_SCRATCH_DSN ?= postgres://execrelay:execrelay_dev_password@localhost:5433/execrelay_restore?sslmode=disable
+dr-drill:
+	bash scripts/dr-drill.sh "$(MIGRATE_DB)" "$(DR_SCRATCH_DSN)"

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	oldproto "github.com/golang/protobuf/proto"
+	"github.com/ninadk/execrelay/internal/obs"
 	parser "github.com/ninadk/execrelay/packages/parser-go"
 	execrelaypb "github.com/ninadk/execrelay/packages/proto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -107,14 +108,58 @@ func NewHandler(opts Options) *Handler {
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.health)
+	mux.HandleFunc("/healthz", h.health)
+	mux.HandleFunc("/readyz", h.readyz)
 	mux.HandleFunc("/webhook", h.webhook)
 	mux.HandleFunc("/admin/kill-switch", h.killSwitch)
 	mux.Handle("/metrics", promhttp.Handler())
-	return metricsMiddleware(mux)
+	return obs.Middleware("ingress")(metricsMiddleware(mux))
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"service": "ingress", "status": "ok"})
+}
+
+// readyz reports whether the ingress can do its job: NATS publisher healthy
+// and (if a DB is configured for exposure checks) DB reachable. Returns 503
+// with per-check detail so a load balancer can pull this instance.
+func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
+	checks := map[string]any{}
+	ok := true
+
+	if hp, isHealth := h.publisher.(interface{ Healthy() bool }); isHealth {
+		alive := hp.Healthy()
+		checks["nats"] = map[string]any{"ok": alive}
+		if !alive {
+			ok = false
+		}
+	} else {
+		checks["nats"] = map[string]any{"ok": true, "note": "publisher does not report health"}
+	}
+
+	if h.db != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 750*time.Millisecond)
+		defer cancel()
+		if err := h.db.PingContext(ctx); err != nil {
+			checks["db"] = map[string]any{"ok": false, "err": err.Error()}
+			ok = false
+		} else {
+			checks["db"] = map[string]any{"ok": true}
+		}
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"service": "ingress",
+		"ok":      ok,
+		"checks":  checks,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	if ok {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_, _ = w.Write(body)
 }
 
 // killSwitch reports or toggles the trading-halt flag.
@@ -173,10 +218,31 @@ func (h *Handler) killSwitch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// webhookCtx threads outcome metadata from the body of the handler back to
+// the deferred publishRequestEvent. The handler updates these fields as it
+// learns more (license_key, trace_id, body_hash, reason_code).
+type webhookCtx struct {
+	requestID  string
+	traceID    string
+	licenseKey string
+	bodySHA256 string
+	reasonCode string
+}
+
 func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 	clientAddr := clientIP(r)
+	reqID := obs.RequestIDFromContext(r.Context())
+	if reqID == "" {
+		reqID = obs.NewID()
+	}
+	wctx := &webhookCtx{requestID: reqID}
+	rec := &webhookRecorder{ResponseWriter: w, status: http.StatusOK}
+	start := h.now()
+	defer h.recordRequestEvent(r, rec, wctx, clientAddr, start)
+	w = rec
+
 	if h.debug {
-		slog.Debug("webhook request received", "client", clientAddr, "method", r.Method)
+		slog.Debug("webhook request received", "request_id", reqID, "client", clientAddr, "method", r.Method)
 	}
 
 	if r.Method != http.MethodPost {
@@ -184,6 +250,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("rejecting non-POST request", "client", clientAddr, "method", r.Method)
 		}
 		w.Header().Set("Allow", http.MethodPost)
+		wctx.reasonCode = "method_not_allowed"
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
 		return
 	}
@@ -196,6 +263,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 				slog.Debug("perimeter token rejected", "client", clientAddr)
 			}
 			recordRejection("perimeter_rejected")
+			wctx.reasonCode = "perimeter_rejected"
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "perimeter_rejected"})
 			return
 		}
@@ -203,6 +271,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 
 	if h.tradingHalted.Load() {
 		recordRejection("trading_halted")
+		wctx.reasonCode = "trading_halted"
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "trading_halted"})
 		return
 	}
@@ -212,6 +281,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("rate limit exceeded", "client", clientAddr)
 		}
 		recordRejection("rate_limit_exceeded")
+		wctx.reasonCode = "rate_limit_exceeded"
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limit_exceeded"})
 		return
 	}
@@ -232,6 +302,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 				slog.Debug("IP not in allowed CIDRs", "client", clientAddr)
 			}
 			recordRejection("ip_not_allowed")
+			wctx.reasonCode = "ip_not_allowed"
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "ip_not_allowed"})
 			return
 		}
@@ -246,6 +317,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 				slog.Debug("timestamp validation failed", "client", clientAddr, "err", err)
 			}
 			recordRejection("timestamp_rejected")
+			wctx.reasonCode = "timestamp_rejected"
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "timestamp_rejected", "reason": err.Error()})
 			return
 		}
@@ -259,10 +331,15 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		if h.debug {
 			slog.Debug("failed to read body", "client", clientAddr, "err", err)
 		}
+		wctx.reasonCode = "body_too_large"
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
 		return
 	}
 	raw := string(body)
+	if len(body) > 0 {
+		hash := sha256.Sum256(body)
+		wctx.bodySHA256 = hex.EncodeToString(hash[:])
+	}
 	if h.debug {
 		slog.Debug("body received", "client", clientAddr, "size", len(body))
 	}
@@ -272,9 +349,11 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		if h.debug {
 			slog.Debug("parse error", "client", clientAddr, "err", err)
 		}
+		wctx.reasonCode = "parse_error"
 		writeJSON(w, http.StatusBadRequest, reject("parse_error", err))
 		return
 	}
+	wctx.licenseKey = parsed.LicenseID
 	if h.debug {
 		slog.Debug("signal parsed", "client", clientAddr, "license", parsed.LicenseID, "symbol", parsed.Symbol, "command", parsed.RawCommand)
 	}
@@ -289,6 +368,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusForbidden
 		}
 		h.publishRejection(parsed.LicenseID, "license_rejected", body)
+		wctx.reasonCode = "license_rejected"
 		writeJSON(w, status, map[string]string{"error": "license_rejected"})
 		return
 	}
@@ -300,6 +380,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		if h.debug {
 			slog.Debug("invalid subject tokens", "client", clientAddr, "license", parsed.LicenseID)
 		}
+		wctx.reasonCode = "invalid_route_token"
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_route_token"})
 		return
 	}
@@ -308,6 +389,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("secret validation failed", "client", clientAddr, "license", parsed.LicenseID)
 		}
 		h.publishRejection(parsed.LicenseID, "secret_rejected", body)
+		wctx.reasonCode = "secret_rejected"
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "secret_rejected"})
 		return
 	}
@@ -323,6 +405,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 				slog.Debug("signature validation failed", "client", clientAddr, "license", parsed.LicenseID)
 			}
 			h.publishRejection(parsed.LicenseID, "signature_rejected", body)
+			wctx.reasonCode = "signature_rejected"
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature_rejected"})
 			return
 		}
@@ -341,6 +424,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 				slog.Debug("daily plan limit exceeded", "client", clientAddr, "license", parsed.LicenseID)
 			}
 			recordRejection("plan_limit_exceeded")
+			wctx.reasonCode = "plan_limit_exceeded"
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "plan_limit_exceeded"})
 			return
 		}
@@ -358,6 +442,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 			}
 			recordRejection("exposure_limit_exceeded")
 			h.publishRejection(parsed.LicenseID, "exposure_limit_exceeded", body)
+			wctx.reasonCode = "exposure_limit_exceeded"
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "exposure_limit_exceeded", "reason": exposure.Reason})
 			return
 		}
@@ -365,8 +450,15 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 
 	traceID := traceIDFromRequest(r.Header)
 	if traceID == "" {
-		traceID = newTraceID()
+		// Prefer the middleware-assigned trace_id if the caller didn't bring
+		// one — keeps log lines and the published Signal in lockstep.
+		if ctxTrace := obs.TraceIDFromContext(r.Context()); ctxTrace != "" {
+			traceID = ctxTrace
+		} else {
+			traceID = newTraceID()
+		}
 	}
+	wctx.traceID = traceID
 	if h.debug {
 		slog.Debug("trace ID assigned", "trace_id", traceID, "license", parsed.LicenseID)
 	}
@@ -383,6 +475,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		if h.debug {
 			slog.Debug("protobuf encoding failed", "trace_id", traceID, "err", err)
 		}
+		wctx.reasonCode = "encode_failed"
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "encode_failed"})
 		return
 	}
@@ -398,6 +491,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		if h.debug {
 			slog.Debug("publish failed", "trace_id", traceID, "subject", subject, "err", err)
 		}
+		wctx.reasonCode = "publish_failed"
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "publish_failed"})
 		return
 	}
@@ -405,8 +499,73 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("signal published successfully", "trace_id", traceID, "license", parsed.LicenseID, "symbol", parsed.Symbol)
 	}
 
+	wctx.reasonCode = "accepted"
 	w.Header().Set("X-ExecRelay-Trace-ID", traceID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID, "ml_confidence": fmt.Sprintf("%.3f", mlConfidence)})
+}
+
+// webhookRecorder lets the deferred request-log publisher know the final
+// status code without each return path having to wire it explicitly.
+type webhookRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *webhookRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// recordRequestEvent publishes one events.ingress.request message per
+// webhook attempt (accept or reject). persist consumes the subject and
+// writes the row to request_log so `GET /requests/{request_id}` returns
+// full context for any past call.
+func (h *Handler) recordRequestEvent(r *http.Request, rec *webhookRecorder, wctx *webhookCtx, clientAddr string, start time.Time) {
+	if h.eventPublisher == nil {
+		return
+	}
+	outcome := "error"
+	switch {
+	case rec.status >= 200 && rec.status < 300:
+		outcome = "accepted"
+	case rec.status >= 400 && rec.status < 500:
+		outcome = "rejected"
+	}
+	if wctx.reasonCode == "" {
+		wctx.reasonCode = outcome
+	}
+	evt := map[string]any{
+		"service":     "ingress",
+		"request_id":  wctx.requestID,
+		"trace_id":    wctx.traceID,
+		"license_key": wctx.licenseKey,
+		"method":      r.Method,
+		"path":        r.URL.Path,
+		"client_ip":   clientAddr,
+		"status":      rec.status,
+		"outcome":     outcome,
+		"reason_code": wctx.reasonCode,
+		"latency_ms":  int(time.Since(start).Milliseconds()),
+		"body_sha256": wctx.bodySHA256,
+		"user_agent":  truncateStr(r.UserAgent(), 240),
+		"region":      h.region,
+		"received_at": start.UTC().Format(time.RFC3339Nano),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		slog.Warn("marshal request event", "err", err)
+		return
+	}
+	if err := h.eventPublisher.Publish(context.Background(), "events.ingress.request", data); err != nil {
+		slog.Warn("publish request event", "err", err)
+	}
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
 
 func (h *Handler) publishRejection(licenseID, reason string, body []byte) {
