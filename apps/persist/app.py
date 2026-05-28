@@ -495,7 +495,11 @@ async def _persist_request_log(pool: asyncpg.Pool, evt: dict[str, Any]) -> None:
     """Insert a row in request_log for every webhook attempt (accept + reject).
     Powers `GET /requests/{request_id}` in portal-api so an operator can answer
     'what happened to this call' for any past request."""
-    received_at = evt.get("received_at")
+    # received_at arrives as an ISO-8601 string from the ingress event. Pass
+    # it as None when absent; the SQL casts text->timestamptz (asyncpg won't
+    # bind a str directly to a timestamptz param, so the ::text::timestamptz
+    # double-cast is required).
+    received_at = evt.get("received_at") or None
     detail_keys = (
         "request_id",
         "trace_id",
@@ -522,7 +526,7 @@ async def _persist_request_log(pool: asyncpg.Pool, evt: dict[str, Any]) -> None:
                  client_ip, license_key, status_code, outcome, reason_code,
                  latency_ms, body_sha256, user_agent, detail)
             VALUES (
-                COALESCE($1::timestamptz, now()), $2, $3, $4, $5, $6,
+                COALESCE($1::text::timestamptz, now()), $2, $3, $4, $5, $6,
                 NULLIF($7, '')::inet, $8, $9, $10, $11, $12, $13, $14, $15::jsonb
             )
             """,

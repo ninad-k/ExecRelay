@@ -199,9 +199,9 @@ func TestHotReloadLicenseStore_LookupAndReload(t *testing.T) {
 
 func TestAuditLicenses_ReportsExpectedIssues(t *testing.T) {
 	got := AuditLicenses([]LicenseRecord{
-		{LicenseID: "open"},                                            // no_auth
-		{LicenseID: "hmac-only", HMACSecret: "h"},                      // no_secret
-		{LicenseID: "secret-only", Secret: "s"},                        // no_hmac
+		{LicenseID: "open"},                       // no_auth
+		{LicenseID: "hmac-only", HMACSecret: "h"}, // no_secret
+		{LicenseID: "secret-only", Secret: "s"},   // no_hmac
 		{LicenseID: "rotating", HMACSecret: "h", Secret: "s", PendingHMACSecret: "p"},
 	})
 	if len(got) != 4 {

@@ -104,9 +104,9 @@ func TestStatusRecorder_FlushNoOpWhenUnsupported(t *testing.T) {
 
 type noFlushWriter struct{}
 
-func (noFlushWriter) Header() http.Header        { return http.Header{} }
-func (noFlushWriter) Write([]byte) (int, error)  { return 0, nil }
-func (noFlushWriter) WriteHeader(int)            {}
+func (noFlushWriter) Header() http.Header       { return http.Header{} }
+func (noFlushWriter) Write([]byte) (int, error) { return 0, nil }
+func (noFlushWriter) WriteHeader(int)           {}
 
 func TestStatusRecorder_WriteAccumulatesBytes(t *testing.T) {
 	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), status: http.StatusOK}
@@ -134,7 +134,7 @@ func TestTraceFromW3C_MalformedHeaders(t *testing.T) {
 		"",
 		"too-short",
 		"00xINVALID-DASHES-HERE", // length too short
-		strings.Repeat("a", 60),   // length OK but no dashes at positions 2 and 35
+		strings.Repeat("a", 60),  // length OK but no dashes at positions 2 and 35
 		"00-shorter",
 	}
 	for _, c := range cases {
