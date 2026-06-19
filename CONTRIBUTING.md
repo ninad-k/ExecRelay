@@ -244,17 +244,10 @@ Authors are expected to:
 
 ## Releases
 
-<!-- TODO: confirm the release cadence and tagging convention you want to follow.
-
-  Common patterns:
-    - Tagged semver releases (v1.2.3) on every merge to main → CI builds + pushes
-      Docker images to ECR
-    - Calendar-versioned monthly releases (2026.05.0)
-    - Continuous deployment off main with no formal releases
-
-  Whichever you pick, document the tag command, the changelog process
-  (Keep-A-Changelog format is recommended), and how the ECR push workflow
-  is triggered. -->
+ExecRelay follows Semantic Versioning (`vX.Y.Z`) for tags.
+- **CI on every push/PR:** the per-service workflows (`.github/workflows/app-*.yml`) and `ci.yml` build and test each service on every change to `main` and on PRs.
+- **Docker Images → ECR:** image publishing is **manual today** — the `ecr-push.yml` workflow is `workflow_dispatch` only and tags images with the commit SHA (`github.sha`), not a semver tag. Automating an ECR push on tag creation is not yet wired up.
+- **Changelog:** All changes are documented in `CHANGELOG.md` following the Keep-A-Changelog format.
 
 ---
 
@@ -264,4 +257,4 @@ Be respectful, assume good intent, focus on the work. Disagreements about
 design are normal and healthy; personal attacks are not.
 
 For anything you'd rather not raise in public, email
-`conduct@reycapitalsfo.com`. <!-- TODO: confirm address -->
+`conduct@reycapitalsfo.com`.

@@ -249,6 +249,112 @@ MQ:
 - MemoryUsage
 - ActiveMessageQueue
 
+## 7. Compliance Infrastructure
+
+These three controls back the claims in [`docs/compliance.md`](../../docs/compliance.md)
+and [`docs/disaster-recovery.md`](../../docs/disaster-recovery.md). They are
+external cloud configuration (no in-repo Terraform yet — that's Phase 6, see
+[`infra/terraform/README.md`](../terraform/README.md)), so they're given here
+as runnable CLI recipes. Run each once per environment.
+
+### 7a. WORM audit archive (S3 Object Lock)
+
+A Write-Once-Read-Many bucket for the immutable audit archive (exports of
+`admin_audit_log` / `system_events`). Object Lock **must** be enabled at bucket
+creation — it cannot be turned on later.
+
+```bash
+REGION=us-east-1
+AUDIT_BUCKET=execrelay-audit-archive   # must be globally unique
+
+# Object Lock requires versioning; --object-lock-enabled-for-bucket sets both.
+aws s3api create-bucket \
+  --bucket "$AUDIT_BUCKET" \
+  --region "$REGION" \
+  --object-lock-enabled-for-bucket \
+  $( [ "$REGION" != us-east-1 ] && echo --create-bucket-configuration LocationConstraint="$REGION" )
+
+# Default retention: COMPLIANCE mode means not even the root account can delete
+# or shorten the lock before it expires. 7 years (2557 days) for financial audit.
+aws s3api put-object-lock-configuration \
+  --bucket "$AUDIT_BUCKET" \
+  --object-lock-configuration \
+  'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=COMPLIANCE,Days=2557}}'
+
+# Encrypt at rest + block all public access.
+aws s3api put-bucket-encryption --bucket "$AUDIT_BUCKET" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
+aws s3api put-public-access-block --bucket "$AUDIT_BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+Minimal IAM policy for the writer principal (put-only; no delete, no lock
+bypass — COMPLIANCE mode enforces this regardless, but least-privilege still
+applies):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:PutObject"],
+    "Resource": "arn:aws:s3:::execrelay-audit-archive/*"
+  }]
+}
+```
+
+### 7b. Cold-archive lifecycle (Glacier transition)
+
+Transition the **backup** bucket (`BACKUP_S3_BUCKET`, the off-host Postgres
+dumps from `scripts/backup.sh`) to Glacier Flexible Retrieval after 90 days to
+cut storage cost. Do **not** apply this to the Object Lock audit bucket if you
+need fast retrieval of recent audit records.
+
+```bash
+BACKUP_BUCKET=execrelay-backups   # same value as BACKUP_S3_BUCKET
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$BACKUP_BUCKET" \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "cold-archive-after-90d",
+      "Status": "Enabled",
+      "Filter": {"Prefix": ""},
+      "Transitions": [{"Days": 90, "StorageClass": "GLACIER"}],
+      "NoncurrentVersionTransitions": [{"NoncurrentDays": 90, "StorageClass": "GLACIER"}]
+    }]
+  }'
+```
+
+### 7c. Edge geofence (Cloudflare WAF country block)
+
+Application-layer registration screening (`BLOCKED_REGISTRATION_COUNTRIES` in
+`apps/portal-api/app.py`) only sees the registrant's *declared* country and
+cannot express region-level sanctions (Crimea/Donetsk/Luhansk have no ISO
+country code). A Cloudflare WAF custom rule blocks at the edge by geo-IP,
+catching omitted/misstated countries and the sub-country regions.
+
+```bash
+# Requires CF_API_TOKEN (Zone WAF edit) and CF_ZONE_ID.
+curl -sS -X POST \
+  "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/firewall/rules" \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '[{
+    "action": "block",
+    "description": "OFAC sanctioned jurisdictions",
+    "filter": {
+      "expression": "(ip.geoip.country in {\"CU\" \"IR\" \"KP\" \"SY\"}) or (ip.geoip.subdivision_1_iso_code in {\"UA-43\" \"UA-14\" \"UA-09\"})"
+    }
+  }]'
+```
+
+`UA-43` is Crimea; `UA-14` Donetsk; `UA-09` Luhansk. Review the country list
+against the current OFAC SDN/sanctions program before enabling, and keep it in
+sync with `BLOCKED_REGISTRATION_COUNTRIES`.
+
 ## Cost Optimization
 
 ### Recommended for Production

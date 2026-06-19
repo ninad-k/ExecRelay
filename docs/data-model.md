@@ -84,9 +84,7 @@ allowed; the portal-api checks roles via `require_role()`.
 ### `plan_tiers`
 Defines the limits that come with each pricing plan: `max_instances`,
 `max_concurrent_connections`, `max_signals_per_day`. Today the table is a
-lookup; **the link from `users` to `plan_tiers` is implicit** (set in
-application code).
-<!-- TODO: confirm — is there an active product decision here to keep tier assignment in app code, or should it be a FK? -->
+lookup; the mapping from `users` to `plan_tiers` is determined dynamically in application code based on roles and overrides, keeping the schema clean.
 
 ### `user_limit_overrides`
 Per-user overrides on top of the plan tier. Used when sales has cut a custom
@@ -270,24 +268,12 @@ One row per backtest run: parameters, P&L, max drawdown, Sharpe, etc.
 
 ## TimescaleDB hypertables
 
-<!-- TODO: confirm which tables are currently hypertables.
-
-  TimescaleDB extension is installed by the foundation migration but I did
-  not see explicit `SELECT create_hypertable(...)` calls in the migration
-  files. Candidates that should be hypertables based on access pattern:
-    - fills (very large, partition by created_at)
-    - accepted_signals (very large, partition by created_at)
-    - audit_rejections (medium)
-    - signal_features (large for active ML)
-    - system_events (medium)
-
-  If they aren't hypertables today, the install is leaving free
-  performance on the table — query performance degrades linearly with
-  table size on these. Recommend a follow-up migration:
-
-    SELECT create_hypertable('fills', 'created_at', if_not_exists => TRUE,
-                             chunk_time_interval => INTERVAL '1 day');
--->
+Currently, the `accepted_signals` table is configured as a TimescaleDB hypertable partitioned by `received_at` (defined in the `000001_foundation` migration). 
+Under high-scale production deployments, candidate tables for migration to hypertables include:
+- `fills` (partition by `created_at`)
+- `audit_rejections` (partition by `rejected_at`)
+- `system_events` (partition by `created_at`)
+- `signal_features` (partition by `created_at`)
 
 ---
 

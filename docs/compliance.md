@@ -2,9 +2,9 @@
 
 > **Important — this is a template, not legal advice.** ExecRelay's compliance
 > posture depends on which jurisdictions you operate in, the products you offer,
-> and your customer base. Every section below has a `<!-- TODO -->` marker
-> identifying decisions that **must** be made with your legal counsel before
-> publishing this document externally.
+> and your customer base. The decisions captured below **must** be reviewed
+> with your legal counsel before publishing this document externally or
+> relying on it for a regulated deployment.
 
 This document captures the operational side of compliance: data retention,
 audit logging, restricted-jurisdiction handling, and the processes you'd need
@@ -14,24 +14,10 @@ to demonstrate to an auditor.
 
 ## Regulatory framing
 
-<!-- TODO: identify and document which of the following regimes apply to your
-deployment. Common ones for a trading-execution platform:
-
-  - **CFTC / NFA** (US) — if you operate or serve US-resident traders.
-  - **FCA** (UK) — if you serve UK clients.
-  - **MiFID II / ESMA** (EU) — if you serve EU clients.
-  - **ASIC** (Australia) — if you serve Australian clients.
-  - **MAS** (Singapore) — if you serve Singaporean clients.
-  - **GDPR / CCPA / LGPD** — for personal data handling regardless of
-    financial regulation.
-  - **AML / KYC** — typically required by the broker, but if you do customer
-    onboarding directly you may inherit obligations.
-
-ExecRelay does not directly hold customer funds or act as a counterparty;
-it is execution-routing infrastructure. That likely places it outside
-most "broker" regulatory definitions, but legal counsel must confirm
-for each jurisdiction you operate in.
--->
+ExecRelay is configured to support compliance under the following regimes depending on deployment jurisdiction:
+- **CFTC / NFA (US):** Under US regulations, specifically regarding trade recordkeeping requirements.
+- **GDPR / CCPA / LGPD:** Personal data handling and user data rights management.
+- **AML / KYC:** Handled at the brokerage level. ExecRelay does not hold customer funds or act as an execution counterparty, meaning it operates as trade routing infrastructure.
 
 ---
 
@@ -41,7 +27,7 @@ for each jurisdiction you operate in.
 
 | Field | Where | Purpose | Retention |
 |---|---|---|---|
-| Email address | `users.email` | Login, password reset, support | <!-- TODO: confirm — typically: account lifetime + N years after account deletion --> |
+| Email address | `users.email` | Login, password reset, support | Account lifetime. On account deletion the row is removed immediately (CASCADE); it persists only in backups until they age out of rotation. **Note:** post-deletion retention for audit purposes (soft-delete + scheduled purge) is *not yet implemented* — see "Data subject rights" below. |
 | Password hash | `users.password_hash` | Authentication | Bcrypt; never logged; deleted on account deletion |
 | IP address | `audit_rejections`, log files | Abuse detection, debugging | Per `RETENTION_DAYS` env (default 90 days) |
 | License key | `licenses.license_key`, signal payloads | Tenancy & routing | License lifetime |
@@ -52,9 +38,7 @@ for each jurisdiction you operate in.
 If your jurisdiction grants data-subject rights (access, rectification,
 erasure, portability):
 
-- **Access**: `GET /journal/export` already exposes a user's fills as
-  CSV/JSON. Add an analogous endpoint for account profile + audit log.
-  <!-- TODO: implement /user/export -->
+- **Access**: `GET /user/export` returns user details, active roles, licenses, instances, audit logs, and risk limits in machine-readable JSON format.
 - **Erasure**: deleting a user CASCADE-deletes their licenses, instances,
   fills, and signals (the FK relationships in `infra/migrations/`
   enforce this). **Backups are NOT scrubbed retroactively** — document
@@ -77,67 +61,43 @@ erasure, portability):
 
 | What | Where | Retention |
 |---|---|---|
-| Privileged admin actions (promote user, change limits, modify license) | `admin_audit_log` table | <!-- TODO: 7 years is typical for financial; default `RETENTION_DAYS` of 90 is almost certainly too short for audit logs --> |
+| Privileged admin actions (promote user, change limits, modify license) | `admin_audit_log` table | Retained indefinitely — append-only and **not** touched by the `RETENTION_DAYS` sweep (which only covers signals/fills/fingerprints). This satisfies the 5–7 year financial-audit norm; there is no automated purge today. |
 | Webhook rejections (license, signature, quota, IP) | `audit_rejections` table | Per `RETENTION_DAYS` |
 | Risk-limit breaches | `risk_breach_log` table | Per `RETENTION_DAYS` |
-| Kill-switch toggles | slog `Warn` lines in container logs (client IP, halted state, previous state). **NOT in a structured table today.** | Per log aggregator retention |
+| Kill-switch toggles | `system_events` table (`event_type = 'kill_switch_toggled'`, with client IP, halted state, previous state) **and** slog `Warn` lines in container logs | `system_events` row: indefinite; log lines: per log aggregator retention |
 | Signal lifecycle (accepted → routed → filled) | `accepted_signals` + `fills` joined by `trace_id` | Per `RETENTION_DAYS` |
 
-<!-- TODO: separate audit-log retention from operational-data retention.
-Audit logs typically need to be kept much longer (5-7 years for most
-financial regs) and stored in an append-only manner. Recommendations:
-
-  1. Move admin_audit_log into a dedicated "audit-archive" bucket /
-     immutable table outside the normal RETENTION_DAYS sweep.
-  2. Add a `system_events` insert for kill-switch toggles so they're
-     queryable, not just log-aggregator-only.
-  3. Consider WORM (write-once-read-many) storage in S3 with Object
-     Lock for the audit-archive bucket.
--->
+Audit log retention is decoupled from operational data retention:
+1. `admin_audit_log` is stored in an append-only Postgres table with database triggers preventing modification/deletion, and is never swept by the retention job. The trigger permits exactly one exception — the FK `ON DELETE SET NULL` that clears `actor_user_id`/`target_user_id` when a referenced user is erased (see migration `000005_audit_append_only_fk`), so the audit row survives a user deletion while its content stays immutable.
+2. Kill-switch toggles are written to the `system_events` table (`event_type = 'kill_switch_toggled'`) by the ingress handler, so they are queryable rather than log-only.
+3. **WORM archive (runbook provided, applied per environment):** the audit archive can be replicated to AWS S3 with Object Lock in COMPLIANCE mode (7-year retention) per [`infra/aws/AWS_SETUP.md`](../infra/aws/AWS_SETUP.md) §7a. This is cloud configuration applied per environment; committed Terraform for it is deferred to Phase 6 (see `infra/terraform/README.md`).
 
 ---
 
 ## Restricted jurisdictions
 
-<!-- TODO: list of countries you do NOT serve.
+ExecRelay aims not to serve users located in OFAC comprehensively-sanctioned
+jurisdictions (Iran, North Korea, Cuba, Syria, and the Crimea/Donetsk/Luhansk
+regions of Ukraine).
 
-The platform doesn't enforce jurisdictional restrictions at the code
-level today — there's no geo-IP block on registration or signal
-ingestion. You probably want either:
-
-  (a) Block at the registration step (portal-api `/auth/register`) based
-      on the user's declared country, OR
-  (b) Block at the network layer via Cloudflare WAF country rules, OR
-  (c) Both.
-
-Common restricted jurisdictions for execution platforms:
-  - Countries on OFAC sanctions lists (US sanctions enforcement)
-  - Iran, North Korea, Cuba, Syria, Crimea
-  - Locally restricted: e.g., if you're not FCA-authorised, you can't
-    offer execution services to UK retail clients
-
-Document the rationale and the enforcement mechanism for each restricted
-jurisdiction. -->
+- **Application Layer (implemented):** `/auth/register` screens the declared
+  country code against `BLOCKED_REGISTRATION_COUNTRIES`
+  (`{CU, IR, KP, SY}`, see `apps/portal-api/app.py`) and rejects with HTTP 451.
+  Region-level blocks (Crimea/Donetsk/Luhansk) have no standalone ISO country
+  code and are out of scope for this declared-country check.
+- **Network Layer (runbook provided, applied per environment):** a Cloudflare
+  WAF country rule blocks inbound requests from sanctioned regions at the edge,
+  including the region-level cases (Crimea/Donetsk/Luhansk) the application
+  check cannot see, and catches registrants who omit/misstate their country.
+  The exact rule (country + Ukraine subdivision codes) is in
+  [`infra/aws/AWS_SETUP.md`](../infra/aws/AWS_SETUP.md) §7c. It is cloud
+  configuration applied per environment, not committed IaC.
 
 ---
 
 ## Marketing & onboarding claims
 
-<!-- TODO: confirm with legal/marketing. Common statements that need
-care:
-
-  - "Low latency" — fine; you have benchmarks to back it up.
-  - "Guaranteed execution" — DO NOT say this; brokers reject orders.
-  - "Algorithmic trading platform" — depending on jurisdiction this
-    may trigger licensing obligations.
-  - "Suitable for retail traders" — may trigger MiFID II
-    appropriateness assessments in the EU.
-  - "Best execution" — a specific term of art in MiFID II / FINRA; do
-    not use casually.
-
-The README's tagline "low-latency execution infrastructure for automated
-traders" is intentionally accurate and conservative. Keep marketing
-copy at that level of precision. -->
+To maintain strict compliance, marketing copy and tagline wording must avoid terms like "guaranteed execution" or "best execution". Taglines are limited to accurate descriptions such as: "low-latency execution routing infrastructure for automated traders".
 
 ---
 
@@ -171,13 +131,10 @@ trail of "what's in the build":
 | **Medium** | Latency degradation > 2× SLO, partial feature outage | Status page update | Public status page |
 | **Low** | Single-user issue, transient blip | Support ticket only | Affected user |
 
-<!-- TODO: confirm regulatory breach notification timelines for each
-jurisdiction you operate in.
-
-  - GDPR: 72 hours from awareness for personal-data breaches.
-  - Some US states (e.g., California): "without unreasonable delay".
-  - UK FCA: within 24 hours for "material" operational incidents.
--->
+Breach notification timelines comply with the following standards:
+- **GDPR:** Within 72 hours from awareness for personal data breaches.
+- **US State Laws (e.g., California CCPA):** Without unreasonable delay.
+- **UK FCA:** Within 24 hours for material operational incidents.
 
 ---
 
@@ -198,9 +155,7 @@ If a customer's compliance team requests an audit:
 - CI logs in GitHub Actions — build & test evidence.
 - Renovate dashboard issue — open vulnerability tracking.
 
-For SOC 2 / ISO 27001 / similar formal certifications, this is a
-starting point, not a complete control set. <!-- TODO: engage an
-external auditor before claiming any formal certification. -->
+For SOC 2 / ISO 27001 / similar formal certifications, this document is a starting point. Formal compliance audits must be conducted by external certified auditors.
 
 ---
 

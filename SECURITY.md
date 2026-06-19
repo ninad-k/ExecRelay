@@ -9,8 +9,8 @@ seriously and welcome reports from researchers, customers, and the public.
 
 **Do not file public GitHub issues for security problems.** Report privately:
 
-- **Email**: `security@reycapitalsfo.com`  <!-- TODO: confirm this is the right address; replace with the security contact you actually monitor -->
-- **PGP**: <!-- TODO: paste public key fingerprint here if you maintain one -->
+- **Email**: `security@reycapitalsfo.com`
+- **PGP**: Not maintained at this time; report via email using standard TLS encryption.
 - **Expected response time**: we will acknowledge within **2 business days** and
   provide a triage assessment within **5 business days**.
 
@@ -46,7 +46,7 @@ opt out).
 | Version | Security fixes |
 |---|---|
 | `main` | Yes — fixes ship as new commits |
-| Tagged releases ≥ v1.0 | <!-- TODO: confirm support policy. Recommended: latest minor + one previous --> |
+| Tagged releases ≥ v1.0 | Latest minor + one previous minor release (e.g., if current is v1.2, we support v1.2 and v1.1) |
 
 We do not currently maintain LTS branches. If you're running an old release,
 the recommended remediation for a published vulnerability is to upgrade.
@@ -125,7 +125,7 @@ diagram. Summary:
 | **DoS** | Volumetric attack on `/webhook` | Per-IP rate limit, perimeter token gate, Caddy / Cloudflare in front |
 | **Elevation of privilege** | Regular user → super_admin | RBAC checks in portal-api (`require_role()`); `admin_audit_log` records all privileged actions |
 
-A fuller threat model lives at <!-- TODO: link to docs/threat-model.md once written; the high-level table above is the starter -->.
+A fuller threat model lives at [docs/threat-model.md](docs/threat-model.md).
 
 ---
 
@@ -137,12 +137,12 @@ A fuller threat model lives at <!-- TODO: link to docs/threat-model.md once writ
 - **NATS auth is username/password today**, not token-based. Suitable for a
   single-tenant deployment behind a firewall.
 - **Per-IP rate limit is per-pod**, not cluster-wide. For high-traffic
-  deployments behind a load balancer, use Redis-backed rate limiting (the
-  groundwork is in `apps/ingress/internal/ingress/counter.go`; the Redis
-  integration is TODO).
+  deployments behind a load balancer, Redis-backed rate limiting is recommended
+  (groundwork exists in `apps/ingress/internal/ingress/counter.go`; cluster-wide
+  Redis rate limiting is planned for Phase 7).
 - **The kill switch is per-ingress instance**, not cluster-wide. If you run
-  multiple ingress pods you must toggle each one (or front them with a
-  cluster-wide flag in Redis — also TODO).
+  multiple ingress pods you must toggle each one (cluster-wide kill switch via
+  Redis state is planned for Phase 7).
 - **WSL2 deployment on Windows Server** crosses an extra trust boundary
   (WSL VM ↔ host). The PowerShell installer configures mirrored networking
   + firewall rules to keep service ports loopback-only, but you should

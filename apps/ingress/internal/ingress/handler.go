@@ -207,6 +207,7 @@ func (h *Handler) killSwitch(w http.ResponseWriter, r *http.Request) {
 		reportTradingHalted(halted)
 		if previous != halted {
 			slog.Warn("kill switch toggled", "client", clientAddr, "halted", halted, "previous", previous)
+			h.recordKillSwitchEvent(r.Context(), clientAddr, halted, previous)
 		}
 		writeJSON(w, http.StatusOK, map[string]string{
 			"halted":   strconv.FormatBool(halted),
@@ -215,6 +216,37 @@ func (h *Handler) killSwitch(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+	}
+}
+
+// recordKillSwitchEvent persists a structured audit record of a kill-switch
+// state change to the system_events table. Best-effort: a logging failure must
+// never block the toggle itself, so errors are logged and swallowed. The
+// perimeter token is deliberately never included in the payload.
+func (h *Handler) recordKillSwitchEvent(ctx context.Context, clientAddr string, halted, previous bool) {
+	if h.db == nil {
+		return
+	}
+	severity := "warning"
+	if halted {
+		severity = "critical"
+	}
+	payload, err := json.Marshal(map[string]any{
+		"client":   clientAddr,
+		"halted":   halted,
+		"previous": previous,
+	})
+	if err != nil {
+		slog.Error("kill switch audit: marshal payload", "err", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := h.db.ExecContext(ctx,
+		`INSERT INTO system_events (event_type, severity, payload) VALUES ($1, $2, $3::jsonb)`,
+		"kill_switch_toggled", severity, string(payload),
+	); err != nil {
+		slog.Error("kill switch audit: insert system_events", "err", err)
 	}
 }
 

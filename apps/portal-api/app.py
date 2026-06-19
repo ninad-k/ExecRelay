@@ -327,6 +327,11 @@ async def current_user(
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
+    # ISO 3166-1 alpha-2 country code declared by the registrant. Optional for
+    # backward compatibility (empty = not declared), but when supplied it is
+    # screened against OFAC-sanctioned jurisdictions
+    # (see BLOCKED_REGISTRATION_COUNTRIES).
+    country: str = ""
 
 
 class LoginIn(BaseModel):
@@ -610,6 +615,13 @@ async def readyz() -> JSONResponse:
     )
 
 
+# OFAC comprehensively-sanctioned jurisdictions, by ISO 3166-1 alpha-2 code.
+# This is the application-layer screen at registration time; region-level
+# blocks (e.g. Crimea, Donetsk, Luhansk) and IP-based geofencing are handled
+# at the network edge, not here, since they have no standalone country code.
+BLOCKED_REGISTRATION_COUNTRIES = frozenset({"CU", "IR", "KP", "SY"})
+
+
 @app.post(
     "/auth/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED
 )
@@ -621,6 +633,11 @@ async def register(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "password must be at least 12 characters",
+        )
+    if body.country and body.country.strip().upper() in BLOCKED_REGISTRATION_COUNTRIES:
+        raise HTTPException(
+            status.HTTP_451_UNAVAILABLE_FOR_LEGAL_REASONS,
+            "registration is not available in your jurisdiction",
         )
     existing = await pool.fetchrow("SELECT id FROM users WHERE email = $1", body.email)
     if existing:
@@ -1736,6 +1753,143 @@ def _csv_escape(s: str) -> str:
     if any(c in s for c in (",", '"', "\n", "\r")):
         return '"' + s.replace('"', '""') + '"'
     return s
+
+
+@app.get("/user/export")
+async def export_user_data(
+    user: dict = Depends(current_user),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    user_id = user["id"]
+
+    # Fetch user profile details
+    user_row = await pool.fetchrow(
+        "SELECT id, email, created_at FROM users WHERE id = $1", user_id
+    )
+    profile = {
+        "id": str(user_row["id"]),
+        "email": user_row["email"],
+        "created_at": user_row["created_at"].isoformat() if user_row["created_at"] else None
+    }
+
+    # Fetch roles
+    role_rows = await pool.fetch(
+        "SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $1",
+        user_id
+    )
+    roles = [r["name"] for r in role_rows]
+
+    # Fetch licenses
+    license_rows = await pool.fetch(
+        "SELECT id, license_key, active, created_at FROM licenses WHERE user_id = $1",
+        user_id
+    )
+    licenses = [
+        {
+            "id": str(r["id"]),
+            "license_key": r["license_key"],
+            "active": r["active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+        }
+        for r in license_rows
+    ]
+
+    # Fetch instances
+    instance_rows = await pool.fetch(
+        """
+        SELECT i.id, i.license_id, i.instance_key, i.platform, i.active, i.created_at
+        FROM instances i
+        JOIN licenses l ON l.id = i.license_id
+        WHERE l.user_id = $1
+        """,
+        user_id
+    )
+    instances = [
+        {
+            "id": str(r["id"]),
+            "license_id": str(r["license_id"]),
+            "instance_key": r["instance_key"],
+            "platform": r["platform"],
+            "active": r["active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+        }
+        for r in instance_rows
+    ]
+
+    # Fetch audit logs where user is actor
+    audit_rows = await pool.fetch(
+        "SELECT id, action, reason, before_state, after_state, created_at FROM admin_audit_log WHERE actor_user_id = $1",
+        user_id
+    )
+    audit_logs = []
+    for r in audit_rows:
+        before = r["before_state"]
+        if isinstance(before, str):
+            try:
+                before = json.loads(before)
+            except Exception:
+                pass
+        after = r["after_state"]
+        if isinstance(after, str):
+            try:
+                after = json.loads(after)
+            except Exception:
+                pass
+        audit_logs.append({
+            "id": str(r["id"]),
+            "action": r["action"],
+            "reason": r["reason"],
+            "before_state": before,
+            "after_state": after,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+        })
+
+    # Fetch report subscriptions
+    sub_rows = await pool.fetch(
+        "SELECT id, report_type, schedule, active, created_at FROM report_subscriptions WHERE user_id = $1",
+        user_id
+    )
+    subscriptions = [
+        {
+            "id": str(r["id"]),
+            "report_type": r["report_type"],
+            "schedule": r["schedule"],
+            "active": r["active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+        }
+        for r in sub_rows
+    ]
+
+    # Fetch portfolio exposure limits
+    limit_rows = await pool.fetch(
+        """
+        SELECT id, account_id, max_notional_usd, max_position_size_pct, max_loss_pct, created_at
+        FROM portfolio_exposure_limits
+        WHERE license_id IN (SELECT id FROM licenses WHERE user_id = $1)
+        """,
+        user_id
+    )
+    limits = [
+        {
+            "id": str(r["id"]),
+            "account_id": r["account_id"],
+            "max_notional_usd": float(r["max_notional_usd"]) if r["max_notional_usd"] is not None else None,
+            "max_position_size_pct": float(r["max_position_size_pct"]) if r["max_position_size_pct"] is not None else None,
+            "max_loss_pct": float(r["max_loss_pct"]) if r["max_loss_pct"] is not None else None,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+        }
+        for r in limit_rows
+    ]
+
+    return {
+        "profile": profile,
+        "roles": roles,
+        "licenses": licenses,
+        "instances": instances,
+        "audit_logs": audit_logs,
+        "report_subscriptions": subscriptions,
+        "portfolio_exposure_limits": limits
+    }
 
 
 # Local imports to avoid disturbing the top of the file. Aliased with leading

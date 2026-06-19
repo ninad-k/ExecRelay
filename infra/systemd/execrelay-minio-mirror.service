@@ -1,0 +1,15 @@
+[Unit]
+Description=ExecRelay MinIO → S3 mirror (DR for backtest artifacts + MLflow models)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={{REPO_ROOT}}
+ExecStart=/usr/bin/bash {{REPO_ROOT}}/scripts/minio-mirror.sh
+# Requires MIRROR_S3_BUCKET + MinIO creds. These are read from {{REPO_ROOT}}/.env
+# by the script, or supply them via a drop-in:
+#   /etc/systemd/system/execrelay-minio-mirror.service.d/mirror.conf
+# Logs go to journald — view with: journalctl -u execrelay-minio-mirror
+StandardOutput=journal
+StandardError=journal

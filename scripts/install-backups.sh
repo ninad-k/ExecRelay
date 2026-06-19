@@ -27,11 +27,32 @@ install -m 0644 "$REPO_ROOT/infra/systemd/execrelay-backup.timer" \
 mkdir -p /var/backups/execrelay/daily /var/backups/execrelay/weekly
 chmod 700 /var/backups/execrelay
 
+# MinIO → S3 mirror units (DR for backtest artifacts + MLflow models). The
+# units are always installed; the timer is only enabled when MIRROR_S3_BUCKET
+# is configured, since the mirror is useless without a destination bucket.
+log "installing execrelay-minio-mirror.{service,timer} from $REPO_ROOT/infra/systemd"
+sed "s|{{REPO_ROOT}}|$REPO_ROOT|g" "$REPO_ROOT/infra/systemd/execrelay-minio-mirror.service" \
+  > /etc/systemd/system/execrelay-minio-mirror.service
+install -m 0644 "$REPO_ROOT/infra/systemd/execrelay-minio-mirror.timer" \
+  /etc/systemd/system/execrelay-minio-mirror.timer
+
 systemctl daemon-reload
 systemctl enable --now execrelay-backup.timer
 
-ok "backup timer enabled. Next run:"
-systemctl list-timers execrelay-backup.timer --no-pager | head -3
+mirror_bucket="${MIRROR_S3_BUCKET:-}"
+if [ -z "$mirror_bucket" ] && [ -f "$REPO_ROOT/.env" ]; then
+  mirror_bucket="$(grep -E '^MIRROR_S3_BUCKET=' "$REPO_ROOT/.env" | tail -1 | cut -d= -f2-)"
+fi
+if [ -n "$mirror_bucket" ]; then
+  systemctl enable --now execrelay-minio-mirror.timer
+  ok "minio-mirror timer enabled (MIRROR_S3_BUCKET=$mirror_bucket)"
+else
+  warn "minio-mirror units installed but timer NOT enabled — set MIRROR_S3_BUCKET"
+  warn "  (in .env or a service drop-in), then: sudo systemctl enable --now execrelay-minio-mirror.timer"
+fi
+
+ok "backup timer enabled. Next runs:"
+systemctl list-timers execrelay-backup.timer execrelay-minio-mirror.timer --no-pager | head -4
 
 cat <<NEXT
 

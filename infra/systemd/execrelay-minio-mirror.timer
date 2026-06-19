@@ -1,0 +1,14 @@
+[Unit]
+Description=Run ExecRelay MinIO → S3 mirror nightly at 04:15 UTC
+Requires=execrelay-minio-mirror.service
+
+[Timer]
+# 04:15 UTC — an hour after the Postgres backup (03:15) so the two DR jobs
+# don't contend for the host's upload bandwidth.
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=10min
+Unit=execrelay-minio-mirror.service
+
+[Install]
+WantedBy=timers.target

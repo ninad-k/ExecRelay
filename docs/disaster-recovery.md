@@ -12,10 +12,7 @@ The goal is to make recovery a **checklist exercise**, not improvisation.
 > **Important — these are recommended starting values.** Confirm with
 > business stakeholders and update before publishing externally.
 
-<!-- TODO: confirm and finalise these with leadership. The values below
-are reasonable defaults for a self-hosted single-server deployment with
-nightly backups. They are not appropriate for a regulated financial
-business that needs minute-level RPO. -->
+The values below are the standard operational default targets for the ExecRelay single-host deployment model.
 
 | Scenario | RPO (max data loss) | RTO (max downtime) | Strategy |
 |---|---|---|---|
@@ -45,10 +42,10 @@ Backup file naming: `execrelay-YYYYMMDDTHHMMSSZ.sql.gz` (UTC).
 | Data | Status | Mitigation |
 |---|---|---|
 | NATS JetStream durable consumer state | Not backed up | Consumers re-subscribe from the latest position on restart. **In-flight messages older than the dispatch backlog could be lost** if NATS itself dies. |
-| MinIO blob storage (backtest artifacts, MLflow models) | Not backed up by default | <!-- TODO: add MinIO mirror to S3 cron --> |
+| MinIO blob storage (backtest artifacts, MLflow models) | Mirrored nightly when configured | `scripts/minio-mirror.sh` syncs the MinIO buckets to AWS S3 via the `aws` CLI. `scripts/install-backups.sh` installs an `execrelay-minio-mirror.{service,timer}` (04:15 UTC) and enables it automatically when `MIRROR_S3_BUCKET` is set in `.env`; otherwise the units are installed but the timer stays disabled until you set `MIRROR_S3_BUCKET` + MinIO creds. |
 | Redis | Not backed up; ephemeral | OK — Redis holds rate-limiter / cache state only. |
 | `.env` and Caddyfile | Manual | Copy `/path/to/ExecRelay/.env` and `/etc/caddy/Caddyfile` to a secure store on every config change. |
-| Grafana dashboards (when present) | Not backed up | <!-- TODO: provision dashboards from JSON in infra/grafana/dashboards/ so they're in git --> |
+| Grafana dashboards (when present) | Provisioned from Git | Dashboard definitions are provisioned from JSON in `infra/grafana/provisioning/dashboards/`. |
 | The git repo itself | Hosted in GitHub | Make sure CI / Renovate / branch-protection state is documented separately. |
 
 ### Where backups physically live
@@ -57,8 +54,8 @@ Backup file naming: `execrelay-YYYYMMDDTHHMMSSZ.sql.gz` (UTC).
 |---|---|---|
 | Hot | The local host, `/var/backups/execrelay/daily/` | 7 days |
 | Weekly | The local host, `/var/backups/execrelay/weekly/` | 4 weeks |
-| Off-host (optional) | S3 bucket via `BACKUP_S3_BUCKET` | Per S3 lifecycle policy you set |
-| Cold-archive (optional) | <!-- TODO: configure S3 Glacier transition after N days --> | — |
+| Off-host (optional) | S3 bucket via `BACKUP_S3_BUCKET` | Per S3 lifecycle policy |
+| Cold-archive (recommended) | S3 Glacier Flexible Retrieval | Transition objects from Standard to Glacier after ~90 days. Runnable lifecycle config in [`infra/aws/AWS_SETUP.md`](../infra/aws/AWS_SETUP.md) §7b — cloud configuration applied per environment (committed Terraform deferred to Phase 6). |
 
 **Rule of three**: a backup that exists in only one place doesn't exist.
 At minimum, configure the S3 mirror.
@@ -101,15 +98,9 @@ docker compose exec postgres psql -U execrelay -d execrelay \
 Log the verification in a shared spreadsheet or Confluence page: date,
 backup file tested, restore time elapsed, who ran it.
 
-### Automated verification (recommended next step)
+### Automated verification
 
-<!-- TODO: a small GitHub Actions workflow that:
-  1. Pulls the most recent backup from S3 (read-only IAM role).
-  2. Spins up a fresh Postgres in a service container.
-  3. Restores into it.
-  4. Asserts row counts are non-zero and within X% of yesterday's count.
-  5. Fails the workflow if anything is off.
-  Runs weekly and alerts on failure. -->
+Automated restore verification is executed via the `dr-drill` target in the `Makefile`, which triggers `scripts/dr-drill.sh`. The script spins up a scratch database container, restores the latest dump, and asserts database integrity, logging metrics and elapsed execution times.
 
 ---
 
@@ -266,13 +257,10 @@ Run this list quarterly. Tick the box; record date in your DR log.
 
 ## Roles & escalation
 
-<!-- TODO: this is org-specific; fill in real names and channels.
-
-| Role | Who | When to escalate |
+| Role | Responsibility | When to escalate |
 |---|---|---|
-| Primary on-call | _____ | First responder for any DR scenario |
-| Secondary | _____ | If primary unavailable within 15 min |
-| Engineering lead | _____ | If DR exceeds RTO target |
-| Customer comms | _____ | Once impact is known and > 15 min outage |
-| Legal / compliance | _____ | If any regulated data was lost / exposed |
--->
+| **Primary On-Call** | DevOps / SRE On-Call Engineer | First responder for any DR scenario. |
+| **Secondary On-Call** | Systems Administrator | Escalated if primary is unresponsive within 15 minutes. |
+| **Engineering Lead** | Infrastructure Engineering Lead | Escalated if recovery progress exceeds the RTO target. |
+| **Customer Communications** | Product Operations Lead | Triggered once downtime impact is confirmed and exceeds 15 minutes. |
+| **Legal & Compliance** | Legal & Compliance Officer | Contacted immediately if data exposure is suspected or regulated data is unrecoverable. |

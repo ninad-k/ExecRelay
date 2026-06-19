@@ -1,0 +1,8 @@
+# Shell scripts, systemd units, and SQL must use LF — a CRLF shebang breaks
+# `#!/usr/bin/env bash` on Linux, and these files only ever run on Linux hosts.
+# (The repo is developed on Windows with core.autocrlf=true, which would
+# otherwise commit CRLF blobs for newly-added files.)
+*.sh        text eol=lf
+*.sql       text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
