@@ -84,14 +84,24 @@ hour_utc dow month minute_of_day session
 [TradingView: Combo_Webhook_Pine.pine]   computes features on the signal bar
         │  alert JSON (above)
         ▼
-[ingress]        parses the alert, carries `features` through to the signal
+[ingress: POST /webhook/ml]   JSON path; authenticates, scores via predictor,
+        │                     maps the decision to an ExecRelay command
         ▼
 [ml-predictor]   injects direction, scores the 36-feature vector,
                  returns OPEN / FLIP / CLOSE_ONLY / NOTHING (Option-1 logic)
 ```
 
-The ingress-side passthrough of the `features` object is what wires this path
-end-to-end. See [`apps/ml-predictor`](../apps/ml-predictor) for the scoring side.
+ExecRelay's primary `/webhook` ingress format is **not JSON** — it's a flat,
+allowlisted `key=value` command tuned for the hot path — so the `features`
+object is carried over a **separate opt-in JSON route, `POST /webhook/ml`**.
+That route uses ExecRelay's native auth fields (`license_id` + `secret`/HMAC)
+rather than the legacy `x_account` shown above, so a TradingView-side adapter
+(or an updated Pine template) supplies them. The decision is mapped to an
+existing ExecRelay command (`buy`/`sell`/`closelongopenshort`/`closelong`/…).
+
+See **[ADR 0008](../docs/adr/0008-opt-in-json-ml-webhook-path.md)** for the full
+request contract, the decision→command table, and the design rationale, and
+[`apps/ml-predictor`](../apps/ml-predictor) for the scoring side.
 
 ## Setting up the alert on TradingView
 
