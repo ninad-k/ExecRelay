@@ -1,0 +1,232 @@
+// AlgoAlpha + EMA50 + MACD + DMI — Sends use_xgb + features to your MT5 webhook
+//@version=5
+indicator("Combo Strategy → XGB Webhook", overlay=true, max_lines_count=500)
+
+// =====================================================
+// 🔹 USER INPUTS
+// =====================================================
+xAccount    = input.string("default", "x_account (MT5 account name)", group="Webhook")
+strategyTag = input.string("AlgoCombo", "Comment / strategy tag", group="Webhook")
+tradeVolume = input.float(0.1, "Volume (lots)", step=0.01, group="Webhook")
+useXgb      = input.bool(true, "Send use_xgb=true (enable filter on server)", group="Webhook")
+
+adxLen   = input.int(14,  "ADX Length",       group="Strategy")
+atrLen   = input.int(7,   "AlgoAlpha ATR",    group="Strategy")
+stFactor = input.float(2.0,"AlgoAlpha Factor",group="Strategy")
+
+// =====================================================
+// 🔹 INDICATORS (your originals)
+// =====================================================
+ema50 = ta.ema(close, 50)
+plot(ema50, "EMA 50", color=color.orange)
+
+[macdLine, signalLine, _macdHist] = ta.macd(close, 12, 26, 9)
+macdDiff = macdLine - signalLine
+
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+pine_supertrend(factor, atr) =>
+    src = hl2
+    upperBand = src + factor * atr
+    lowerBand = src - factor * atr
+    prevLowerBand = nz(lowerBand[1])
+    prevUpperBand = nz(upperBand[1])
+    lowerBand := lowerBand > prevLowerBand or close[1] < prevLowerBand ? lowerBand : prevLowerBand
+    upperBand := upperBand < prevUpperBand or close[1] > prevUpperBand ? upperBand : prevUpperBand
+    int _dir = na
+    float st = na
+    prevST = st[1]
+    if na(atr[1])
+        _dir := 1
+    else if prevST == prevUpperBand
+        _dir := close > upperBand ? -1 : 1
+    else
+        _dir := close < lowerBand ? 1 : -1
+    st := _dir == -1 ? lowerBand : upperBand
+    [st, _dir]
+
+[ST, dirST] = pine_supertrend(stFactor, ta.atr(atrLen))
+
+var int algoState = 0
+if ta.crossunder(dirST, 0)
+    algoState := 1
+else if ta.crossover(dirST, 0)
+    algoState := -1
+algoBuy  = algoState ==  1
+algoSell = algoState == -1
+
+// =====================================================
+// 🔹 ORIGINAL ENTRY LOGIC
+// =====================================================
+var int tradeState = 0
+buyEntry  = algoBuy  and close > ema50 and macdDiff >  1 and adx > 25 and plusDI > minusDI and ta.rsi(close,14) > 50 and tradeState <= 0
+sellEntry = algoSell and close < ema50 and macdDiff < -1 and adx > 25 and plusDI < minusDI and ta.rsi(close,14) < 50 and tradeState >= 0
+
+if buyEntry
+    tradeState := 1
+if sellEntry
+    tradeState := -1
+
+// =====================================================
+// 🔹 XGB FEATURES (all 36)
+// =====================================================
+f_ret_1   = (close - close[1])   / close[1]
+f_ret_3   = (close - close[3])   / close[3]
+f_ret_12  = (close - close[12])  / close[12]
+f_ret_36  = (close - close[36])  / close[36]
+f_ret_72  = (close - close[72])  / close[72]
+f_ret_288 = (close - close[288]) / close[288]
+
+f_range_pct  = (high - low) / close
+f_body_pct   = (close - open) / close
+f_upper_wick = (high - math.max(open, close)) / close
+f_lower_wick = (math.min(open, close) - low)  / close
+
+atr14    = ta.atr(14)
+f_atr_pct = atr14 / close
+ret1_series = ta.change(close) / close[1]
+f_vol_72  = ta.stdev(ret1_series, 72)
+f_vol_288 = ta.stdev(ret1_series, 288)
+
+ema9   = ta.ema(close,   9)
+ema21  = ta.ema(close,  21)
+ema200 = ta.ema(close, 200)
+f_dist_ema_9    = (close - ema9)   / close
+f_dist_ema_21   = (close - ema21)  / close
+f_dist_ema_50   = (close - ema50)  / close
+f_dist_ema_200  = (close - ema200) / close
+
+f_ema_50_slope  = (ema50  - ema50[12])  / ema50
+f_ema_200_slope = (ema200 - ema200[48]) / ema200
+
+f_rsi_14   = ta.rsi(close, 14)
+f_plus_di  = plusDI
+f_minus_di = minusDI
+f_adx_14   = adx
+
+bb_basis = ta.sma(close, 20)
+bb_sd    = ta.stdev(close, 20)
+f_bb_z     = (close - bb_basis) / bb_sd
+f_bb_width = (4 * bb_sd) / bb_basis
+
+h1_close = request.security(syminfo.tickerid, "60", close,             barmerge.gaps_off, barmerge.lookahead_off)
+h1_ema50 = request.security(syminfo.tickerid, "60", ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+h1_24    = request.security(syminfo.tickerid, "60", close[24],         barmerge.gaps_off, barmerge.lookahead_off)
+f_h1_dist_ema50 = (h1_close - h1_ema50) / h1_close
+f_h1_ret_24     = (h1_close - h1_24) / h1_24
+
+h4_close = request.security(syminfo.tickerid, "240", close,             barmerge.gaps_off, barmerge.lookahead_off)
+h4_ema50 = request.security(syminfo.tickerid, "240", ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+f_h4_dist_ema50 = (h4_close - h4_ema50) / h4_close
+
+f_hour_utc      = hour(time, "UTC")
+_dow_pine       = dayofweek(time, "UTC") - 1
+f_dow_python    = _dow_pine == 0 ? 6 : _dow_pine - 1
+f_month         = month(time, "UTC")
+f_minute_of_day = f_hour_utc * 60 + minute(time, "UTC")
+f_session       = f_hour_utc < 7 ? 0 : f_hour_utc < 13 ? 1 : f_hour_utc < 20 ? 2 : 3
+
+f_active_bar      = high != low ? 1 : 0
+f_active_rate_288 = ta.sma(f_active_bar, 288)
+
+// =====================================================
+// 🔹 PLOTS
+// =====================================================
+plotshape(buyEntry,  title="BUY",  style=shape.labelup,   location=location.belowbar, color=color.green, text="BUY")
+plotshape(sellEntry, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.red,   text="SELL")
+
+// =====================================================
+// 🔹 WEBHOOK ALERT MESSAGE — matches your MT5 server fields
+// =====================================================
+useXgbStr = useXgb ? "true" : "false"
+
+buyMsg = "{\"x_account\":\"" + xAccount +
+         "\",\"action\":\"buy\"" +
+         ",\"symbol\":\"" + syminfo.ticker + "\"" +
+         ",\"comment\":\"" + strategyTag + "\"" +
+         ",\"volume\":" + str.tostring(tradeVolume) +
+         ",\"use_xgb\":" + useXgbStr +
+         ",\"features\":{" +
+         "\"ret_1\":"          + str.tostring(f_ret_1,"#.########") +
+         ",\"ret_3\":"         + str.tostring(f_ret_3,"#.########") +
+         ",\"ret_12\":"        + str.tostring(f_ret_12,"#.########") +
+         ",\"ret_36\":"        + str.tostring(f_ret_36,"#.########") +
+         ",\"ret_72\":"        + str.tostring(f_ret_72,"#.########") +
+         ",\"ret_288\":"       + str.tostring(f_ret_288,"#.########") +
+         ",\"range_pct\":"     + str.tostring(f_range_pct,"#.########") +
+         ",\"body_pct\":"      + str.tostring(f_body_pct,"#.########") +
+         ",\"upper_wick\":"    + str.tostring(f_upper_wick,"#.########") +
+         ",\"lower_wick\":"    + str.tostring(f_lower_wick,"#.########") +
+         ",\"atr_pct\":"       + str.tostring(f_atr_pct,"#.########") +
+         ",\"dist_ema_9\":"    + str.tostring(f_dist_ema_9,"#.########") +
+         ",\"dist_ema_21\":"   + str.tostring(f_dist_ema_21,"#.########") +
+         ",\"dist_ema_50\":"   + str.tostring(f_dist_ema_50,"#.########") +
+         ",\"dist_ema_200\":"  + str.tostring(f_dist_ema_200,"#.########") +
+         ",\"ema_50_slope\":"  + str.tostring(f_ema_50_slope,"#.########") +
+         ",\"ema_200_slope\":" + str.tostring(f_ema_200_slope,"#.########") +
+         ",\"rsi_14\":"        + str.tostring(f_rsi_14,"#.####") +
+         ",\"plus_di\":"       + str.tostring(f_plus_di,"#.####") +
+         ",\"minus_di\":"      + str.tostring(f_minus_di,"#.####") +
+         ",\"adx_14\":"        + str.tostring(f_adx_14,"#.####") +
+         ",\"bb_z\":"          + str.tostring(f_bb_z,"#.######") +
+         ",\"bb_width\":"      + str.tostring(f_bb_width,"#.########") +
+         ",\"vol_72\":"        + str.tostring(f_vol_72,"#.########") +
+         ",\"vol_288\":"       + str.tostring(f_vol_288,"#.########") +
+         ",\"active_bar\":"    + str.tostring(f_active_bar) +
+         ",\"active_rate_288\":"+ str.tostring(f_active_rate_288,"#.####") +
+         ",\"h1_dist_ema50\":" + str.tostring(f_h1_dist_ema50,"#.########") +
+         ",\"h1_ret_24\":"     + str.tostring(f_h1_ret_24,"#.########") +
+         ",\"h4_dist_ema50\":" + str.tostring(f_h4_dist_ema50,"#.########") +
+         ",\"hour_utc\":"      + str.tostring(f_hour_utc) +
+         ",\"dow\":"           + str.tostring(f_dow_python) +
+         ",\"month\":"         + str.tostring(f_month) +
+         ",\"minute_of_day\":" + str.tostring(f_minute_of_day) +
+         ",\"session\":"       + str.tostring(f_session) +
+         "}}"
+
+sellMsg = "{\"x_account\":\"" + xAccount +
+          "\",\"action\":\"sell\"" +
+          ",\"symbol\":\"" + syminfo.ticker + "\"" +
+          ",\"comment\":\"" + strategyTag + "\"" +
+          ",\"volume\":" + str.tostring(tradeVolume) +
+          ",\"use_xgb\":" + useXgbStr +
+          ",\"features\":{" +
+          "\"ret_1\":"          + str.tostring(f_ret_1,"#.########") +
+          ",\"ret_3\":"         + str.tostring(f_ret_3,"#.########") +
+          ",\"ret_12\":"        + str.tostring(f_ret_12,"#.########") +
+          ",\"ret_36\":"        + str.tostring(f_ret_36,"#.########") +
+          ",\"ret_72\":"        + str.tostring(f_ret_72,"#.########") +
+          ",\"ret_288\":"       + str.tostring(f_ret_288,"#.########") +
+          ",\"range_pct\":"     + str.tostring(f_range_pct,"#.########") +
+          ",\"body_pct\":"      + str.tostring(f_body_pct,"#.########") +
+          ",\"upper_wick\":"    + str.tostring(f_upper_wick,"#.########") +
+          ",\"lower_wick\":"    + str.tostring(f_lower_wick,"#.########") +
+          ",\"atr_pct\":"       + str.tostring(f_atr_pct,"#.########") +
+          ",\"dist_ema_9\":"    + str.tostring(f_dist_ema_9,"#.########") +
+          ",\"dist_ema_21\":"   + str.tostring(f_dist_ema_21,"#.########") +
+          ",\"dist_ema_50\":"   + str.tostring(f_dist_ema_50,"#.########") +
+          ",\"dist_ema_200\":"  + str.tostring(f_dist_ema_200,"#.########") +
+          ",\"ema_50_slope\":"  + str.tostring(f_ema_50_slope,"#.########") +
+          ",\"ema_200_slope\":" + str.tostring(f_ema_200_slope,"#.########") +
+          ",\"rsi_14\":"        + str.tostring(f_rsi_14,"#.####") +
+          ",\"plus_di\":"       + str.tostring(f_plus_di,"#.####") +
+          ",\"minus_di\":"      + str.tostring(f_minus_di,"#.####") +
+          ",\"adx_14\":"        + str.tostring(f_adx_14,"#.####") +
+          ",\"bb_z\":"          + str.tostring(f_bb_z,"#.######") +
+          ",\"bb_width\":"      + str.tostring(f_bb_width,"#.########") +
+          ",\"vol_72\":"        + str.tostring(f_vol_72,"#.########") +
+          ",\"vol_288\":"       + str.tostring(f_vol_288,"#.########") +
+          ",\"active_bar\":"    + str.tostring(f_active_bar) +
+          ",\"active_rate_288\":"+ str.tostring(f_active_rate_288,"#.####") +
+          ",\"h1_dist_ema50\":" + str.tostring(f_h1_dist_ema50,"#.########") +
+          ",\"h1_ret_24\":"     + str.tostring(f_h1_ret_24,"#.########") +
+          ",\"h4_dist_ema50\":" + str.tostring(f_h4_dist_ema50,"#.########") +
+          ",\"hour_utc\":"      + str.tostring(f_hour_utc) +
+          ",\"dow\":"           + str.tostring(f_dow_python) +
+          ",\"month\":"         + str.tostring(f_month) +
+          ",\"minute_of_day\":" + str.tostring(f_minute_of_day) +
+          ",\"session\":"       + str.tostring(f_session) +
+          "}}"
+
+alertcondition(buyEntry,  title="BUY → MT5 webhook",  message=buyMsg)
+alertcondition(sellEntry, title="SELL → MT5 webhook", message=sellMsg)
