@@ -1769,27 +1769,29 @@ async def export_user_data(
     profile = {
         "id": str(user_row["id"]),
         "email": user_row["email"],
-        "created_at": user_row["created_at"].isoformat() if user_row["created_at"] else None
+        "created_at": user_row["created_at"].isoformat()
+        if user_row["created_at"]
+        else None,
     }
 
     # Fetch roles
     role_rows = await pool.fetch(
         "SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $1",
-        user_id
+        user_id,
     )
     roles = [r["name"] for r in role_rows]
 
     # Fetch licenses
     license_rows = await pool.fetch(
         "SELECT id, license_key, active, created_at FROM licenses WHERE user_id = $1",
-        user_id
+        user_id,
     )
     licenses = [
         {
             "id": str(r["id"]),
             "license_key": r["license_key"],
             "active": r["active"],
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in license_rows
     ]
@@ -1802,7 +1804,7 @@ async def export_user_data(
         JOIN licenses l ON l.id = i.license_id
         WHERE l.user_id = $1
         """,
-        user_id
+        user_id,
     )
     instances = [
         {
@@ -1811,7 +1813,7 @@ async def export_user_data(
             "instance_key": r["instance_key"],
             "platform": r["platform"],
             "active": r["active"],
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in instance_rows
     ]
@@ -1819,7 +1821,7 @@ async def export_user_data(
     # Fetch audit logs where user is actor
     audit_rows = await pool.fetch(
         "SELECT id, action, reason, before_state, after_state, created_at FROM admin_audit_log WHERE actor_user_id = $1",
-        user_id
+        user_id,
     )
     audit_logs = []
     for r in audit_rows:
@@ -1835,19 +1837,21 @@ async def export_user_data(
                 after = json.loads(after)
             except Exception:
                 pass
-        audit_logs.append({
-            "id": str(r["id"]),
-            "action": r["action"],
-            "reason": r["reason"],
-            "before_state": before,
-            "after_state": after,
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None
-        })
+        audit_logs.append(
+            {
+                "id": str(r["id"]),
+                "action": r["action"],
+                "reason": r["reason"],
+                "before_state": before,
+                "after_state": after,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+        )
 
     # Fetch report subscriptions
     sub_rows = await pool.fetch(
         "SELECT id, report_type, schedule, active, created_at FROM report_subscriptions WHERE user_id = $1",
-        user_id
+        user_id,
     )
     subscriptions = [
         {
@@ -1855,7 +1859,7 @@ async def export_user_data(
             "report_type": r["report_type"],
             "schedule": r["schedule"],
             "active": r["active"],
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in sub_rows
     ]
@@ -1867,16 +1871,22 @@ async def export_user_data(
         FROM portfolio_exposure_limits
         WHERE license_id IN (SELECT id FROM licenses WHERE user_id = $1)
         """,
-        user_id
+        user_id,
     )
     limits = [
         {
             "id": str(r["id"]),
             "account_id": r["account_id"],
-            "max_notional_usd": float(r["max_notional_usd"]) if r["max_notional_usd"] is not None else None,
-            "max_position_size_pct": float(r["max_position_size_pct"]) if r["max_position_size_pct"] is not None else None,
-            "max_loss_pct": float(r["max_loss_pct"]) if r["max_loss_pct"] is not None else None,
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            "max_notional_usd": float(r["max_notional_usd"])
+            if r["max_notional_usd"] is not None
+            else None,
+            "max_position_size_pct": float(r["max_position_size_pct"])
+            if r["max_position_size_pct"] is not None
+            else None,
+            "max_loss_pct": float(r["max_loss_pct"])
+            if r["max_loss_pct"] is not None
+            else None,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in limit_rows
     ]
@@ -1888,7 +1898,7 @@ async def export_user_data(
         "instances": instances,
         "audit_logs": audit_logs,
         "report_subscriptions": subscriptions,
-        "portfolio_exposure_limits": limits
+        "portfolio_exposure_limits": limits,
     }
 
 

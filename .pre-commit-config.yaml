@@ -17,6 +17,9 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=512]
+        # The trained XGBoost artifact ships with the image (~900 KB, see
+        # apps/ml-predictor/Dockerfile) and is intentionally tracked.
+        exclude: '^apps/ml-predictor/model/xgb_production\.json$'
       - id: mixed-line-ending
         args: [--fix=lf]
 

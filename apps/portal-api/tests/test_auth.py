@@ -97,9 +97,9 @@ def test_register_rejects_sanctioned_country(client):
                 "country": country,
             },
         )
-        assert r.status_code == 451, (
-            f"country {country!r} should be blocked: {r.status_code} {r.text}"
-        )
+        assert (
+            r.status_code == 451
+        ), f"country {country!r} should be blocked: {r.status_code} {r.text}"
 
 
 def test_protected_route_requires_bearer_token(client):
@@ -116,11 +116,11 @@ def test_protected_route_rejects_invalid_token(client):
 def test_user_export_success(app_module, client):
     # Retrieve user token
     token = app_module.make_token("00000000-0000-0000-0000-000000000001")
-    
+
     # Mock pool.fetchrow and pool.fetch
     import uuid
     from datetime import datetime, timezone
-    
+
     class MockPool(_StubPool):
         async def fetchrow(self, query, *args):
             if "users WHERE id =" in query:
@@ -137,36 +137,42 @@ def test_user_export_success(app_module, client):
             elif "portfolio_exposure_limits" in query:
                 return []
             elif "licenses WHERE user_id =" in query:
-                return [{
-                    "id": uuid.UUID("11111111-1111-1111-1111-111111111111"),
-                    "license_key": "LIC123",
-                    "active": True,
-                    "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
-                }]
+                return [
+                    {
+                        "id": uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                        "license_key": "LIC123",
+                        "active": True,
+                        "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    }
+                ]
             elif "instances" in query:
-                return [{
-                    "id": uuid.UUID("22222222-2222-2222-2222-222222222222"),
-                    "license_id": uuid.UUID("11111111-1111-1111-1111-111111111111"),
-                    "instance_key": "INST1",
-                    "platform": "mt5",
-                    "active": True,
-                    "created_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
-                }]
+                return [
+                    {
+                        "id": uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                        "license_id": uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                        "instance_key": "INST1",
+                        "platform": "mt5",
+                        "active": True,
+                        "created_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
+                    }
+                ]
             elif "admin_audit_log" in query:
-                return [{
-                    "id": uuid.UUID("33333333-3333-3333-3333-333333333333"),
-                    "action": "create_license",
-                    "reason": "initial",
-                    "before_state": None,
-                    "after_state": '{"active": true}',
-                    "created_at": datetime(2026, 1, 4, tzinfo=timezone.utc),
-                }]
+                return [
+                    {
+                        "id": uuid.UUID("33333333-3333-3333-3333-333333333333"),
+                        "action": "create_license",
+                        "reason": "initial",
+                        "before_state": None,
+                        "after_state": '{"active": true}',
+                        "created_at": datetime(2026, 1, 4, tzinfo=timezone.utc),
+                    }
+                ]
             elif "report_subscriptions" in query:
                 return []
             return []
 
     app_module.app.dependency_overrides[app_module.get_pool] = lambda: MockPool()
-    
+
     try:
         r = client.get("/user/export", headers={"Authorization": f"Bearer {token}"})
         assert r.status_code == 200
@@ -182,4 +188,3 @@ def test_user_export_success(app_module, client):
         assert data["audit_logs"][0]["after_state"] == {"active": True}
     finally:
         app_module.app.dependency_overrides.clear()
-
