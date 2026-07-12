@@ -28,20 +28,23 @@ import (
 )
 
 type Handler struct {
-	store           LicenseStore
-	publisher       Publisher
-	eventPublisher  Publisher
-	region          string
-	maxBodyBytes    int64
-	now             func() time.Time
-	timestampWindow time.Duration
-	rateLimiter     *ipRateLimiter
-	allowedCIDRs    []*net.IPNet
-	dailyCounter    *dailyCounter
-	db              *sql.DB
-	perimeterToken  []byte // empty = gate disabled
-	tradingHalted   atomic.Bool
-	debug           bool
+	store            LicenseStore
+	publisher        Publisher
+	eventPublisher   Publisher
+	region           string
+	maxBodyBytes     int64
+	now              func() time.Time
+	timestampWindow  time.Duration
+	rateLimiter      *ipRateLimiter
+	allowedCIDRs     []*net.IPNet
+	dailyCounter     *dailyCounter
+	db               *sql.DB
+	perimeterToken   []byte // empty = gate disabled
+	tradingHalted    atomic.Bool
+	debug            bool
+	mlPredictor      MLPredictor
+	mlEnforce        bool // false (default) = shadow mode: score + audit, but always publish the caller's action
+	mlPredictTimeout time.Duration
 }
 
 type Options struct {
@@ -58,6 +61,14 @@ type Options struct {
 	PerimeterToken  string // optional shared secret required as ?token=<value>; empty = disabled
 	TradingHalted   bool   // initial state of the kill switch; can be toggled later via /admin/halt
 	Debug           bool
+
+	// MLPredictor overrides the default HTTP client used to call ml-predictor.
+	// Tests inject a fake here; production leaves it nil and NewHandler builds
+	// one from MLPredictorURL/MLPredictTimeout.
+	MLPredictor      MLPredictor
+	MLPredictorURL   string        // base URL of ml-predictor; default http://ml-predictor:8080
+	MLPredictTimeout time.Duration // /predict call timeout; default 2s
+	MLEnforce        bool          // false (default) = shadow mode; see ADR 0008
 }
 
 func NewHandler(opts Options) *Handler {
@@ -84,20 +95,34 @@ func NewHandler(opts Options) *Handler {
 	if opts.PerimeterToken != "" {
 		perimeter = []byte(opts.PerimeterToken)
 	}
+	if opts.MLPredictTimeout <= 0 {
+		opts.MLPredictTimeout = defaultMLPredictTimeout
+	}
+	predictor := opts.MLPredictor
+	if predictor == nil {
+		url := opts.MLPredictorURL
+		if url == "" {
+			url = defaultMLPredictorURL
+		}
+		predictor = newHTTPMLPredictor(url, opts.MLPredictTimeout)
+	}
 	h := &Handler{
-		store:           opts.Store,
-		publisher:       opts.Publisher,
-		eventPublisher:  opts.EventPublisher,
-		region:          opts.Region,
-		maxBodyBytes:    opts.MaxBodyBytes,
-		now:             opts.Now,
-		timestampWindow: opts.TimestampWindow,
-		rateLimiter:     rl,
-		allowedCIDRs:    opts.AllowedCIDRs,
-		dailyCounter:    newDailyCounter(),
-		db:              opts.DB,
-		perimeterToken:  perimeter,
-		debug:           opts.Debug,
+		store:            opts.Store,
+		publisher:        opts.Publisher,
+		eventPublisher:   opts.EventPublisher,
+		region:           opts.Region,
+		maxBodyBytes:     opts.MaxBodyBytes,
+		now:              opts.Now,
+		timestampWindow:  opts.TimestampWindow,
+		rateLimiter:      rl,
+		allowedCIDRs:     opts.AllowedCIDRs,
+		dailyCounter:     newDailyCounter(),
+		db:               opts.DB,
+		perimeterToken:   perimeter,
+		debug:            opts.Debug,
+		mlPredictor:      predictor,
+		mlEnforce:        opts.MLEnforce,
+		mlPredictTimeout: opts.MLPredictTimeout,
 	}
 	h.tradingHalted.Store(opts.TradingHalted)
 	reportTradingHalted(opts.TradingHalted)
@@ -110,6 +135,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/healthz", h.health)
 	mux.HandleFunc("/readyz", h.readyz)
 	mux.HandleFunc("/webhook", h.webhook)
+	mux.HandleFunc("/webhook/ml", h.webhookML)
 	mux.HandleFunc("/admin/kill-switch", h.killSwitch)
 	mux.Handle("/metrics", promhttp.Handler())
 	return obs.Middleware("ingress")(metricsMiddleware(mux))
@@ -276,104 +302,11 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("webhook request received", "request_id", reqID, "client", clientAddr, "method", r.Method)
 	}
 
-	if r.Method != http.MethodPost {
-		if h.debug {
-			slog.Debug("rejecting non-POST request", "client", clientAddr, "method", r.Method)
-		}
-		w.Header().Set("Allow", http.MethodPost)
-		wctx.reasonCode = "method_not_allowed"
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
-		return
-	}
-
-	if len(h.perimeterToken) > 0 {
-		// Constant-time check; never log the supplied token value.
-		got := r.URL.Query().Get("token")
-		if !hmac.Equal([]byte(got), h.perimeterToken) {
-			if h.debug {
-				slog.Debug("perimeter token rejected", "client", clientAddr)
-			}
-			recordRejection("perimeter_rejected")
-			wctx.reasonCode = "perimeter_rejected"
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "perimeter_rejected"})
-			return
-		}
-	}
-
-	if h.tradingHalted.Load() {
-		recordRejection("trading_halted")
-		wctx.reasonCode = "trading_halted"
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "trading_halted"})
-		return
-	}
-
-	if h.rateLimiter != nil && !h.rateLimiter.allow(clientAddr) {
-		if h.debug {
-			slog.Debug("rate limit exceeded", "client", clientAddr)
-		}
-		recordRejection("rate_limit_exceeded")
-		wctx.reasonCode = "rate_limit_exceeded"
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limit_exceeded"})
-		return
-	}
-
-	if len(h.allowedCIDRs) > 0 {
-		ip := net.ParseIP(clientAddr)
-		allowed := false
-		if ip != nil {
-			for _, cidr := range h.allowedCIDRs {
-				if cidr.Contains(ip) {
-					allowed = true
-					break
-				}
-			}
-		}
-		if !allowed {
-			if h.debug {
-				slog.Debug("IP not in allowed CIDRs", "client", clientAddr)
-			}
-			recordRejection("ip_not_allowed")
-			wctx.reasonCode = "ip_not_allowed"
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "ip_not_allowed"})
-			return
-		}
-		if h.debug {
-			slog.Debug("IP allowed by CIDR", "client", clientAddr)
-		}
-	}
-
-	if h.timestampWindow > 0 {
-		if err := checkTimestamp(r.Header, h.now(), h.timestampWindow); err != nil {
-			if h.debug {
-				slog.Debug("timestamp validation failed", "client", clientAddr, "err", err)
-			}
-			recordRejection("timestamp_rejected")
-			wctx.reasonCode = "timestamp_rejected"
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "timestamp_rejected", "reason": err.Error()})
-			return
-		}
-		if h.debug {
-			slog.Debug("timestamp valid", "client", clientAddr)
-		}
-	}
-
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
-	if err != nil {
-		if h.debug {
-			slog.Debug("failed to read body", "client", clientAddr, "err", err)
-		}
-		wctx.reasonCode = "body_too_large"
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
+	body, ok := h.gatingPreamble(w, r, wctx, clientAddr)
+	if !ok {
 		return
 	}
 	raw := string(body)
-	if len(body) > 0 {
-		hash := sha256.Sum256(body)
-		wctx.bodySHA256 = hex.EncodeToString(hash[:])
-	}
-	if h.debug {
-		slog.Debug("body received", "client", clientAddr, "size", len(body))
-	}
 
 	parsed, err := parser.Parse(raw)
 	if err != nil {
@@ -389,94 +322,13 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("signal parsed", "client", clientAddr, "license", parsed.LicenseID, "symbol", parsed.Symbol, "command", parsed.RawCommand)
 	}
 
-	record, err := h.store.Lookup(r.Context(), parsed.LicenseID)
-	if err != nil {
-		if h.debug {
-			slog.Debug("license lookup failed", "client", clientAddr, "license", parsed.LicenseID, "err", err)
-		}
-		status := http.StatusUnauthorized
-		if errors.Is(err, ErrLicenseInactive) {
-			status = http.StatusForbidden
-		}
-		h.publishRejection(parsed.LicenseID, "license_rejected", body)
-		wctx.reasonCode = "license_rejected"
-		writeJSON(w, status, map[string]string{"error": "license_rejected"})
+	secretValue := ""
+	if param, ok := parsed.Param(parser.ParamSecret); ok {
+		secretValue = param.Value
+	}
+	record, ok := h.authenticate(r, w, wctx, clientAddr, body, parsed.LicenseID, secretValue)
+	if !ok {
 		return
-	}
-	if h.debug {
-		slog.Debug("license found", "client", clientAddr, "license", parsed.LicenseID, "instance", record.InstanceID)
-	}
-
-	if !validSubjectToken(parsed.LicenseID) || !validSubjectToken(record.InstanceID) {
-		if h.debug {
-			slog.Debug("invalid subject tokens", "client", clientAddr, "license", parsed.LicenseID)
-		}
-		wctx.reasonCode = "invalid_route_token"
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_route_token"})
-		return
-	}
-	if record.Secret != "" && !validSecret(parsed, record.Secret) {
-		if h.debug {
-			slog.Debug("secret validation failed", "client", clientAddr, "license", parsed.LicenseID)
-		}
-		h.publishRejection(parsed.LicenseID, "secret_rejected", body)
-		wctx.reasonCode = "secret_rejected"
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "secret_rejected"})
-		return
-	}
-	if h.debug && record.Secret != "" {
-		slog.Debug("secret validated", "client", clientAddr, "license", parsed.LicenseID)
-	}
-
-	if record.HMACSecret != "" {
-		primaryOK := validSignature(body, record.HMACSecret, r.Header)
-		pendingOK := record.PendingHMACSecret != "" && validSignature(body, record.PendingHMACSecret, r.Header)
-		if !primaryOK && !pendingOK {
-			if h.debug {
-				slog.Debug("signature validation failed", "client", clientAddr, "license", parsed.LicenseID)
-			}
-			h.publishRejection(parsed.LicenseID, "signature_rejected", body)
-			wctx.reasonCode = "signature_rejected"
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature_rejected"})
-			return
-		}
-		if h.debug {
-			slog.Debug("signature validated", "client", clientAddr, "license", parsed.LicenseID, "primary", primaryOK)
-		}
-	}
-
-	if record.MaxSignalsPerDay > 0 {
-		count := h.dailyCounter.Increment(parsed.LicenseID, h.now())
-		if h.debug {
-			slog.Debug("daily signal count", "license", parsed.LicenseID, "count", count, "limit", record.MaxSignalsPerDay)
-		}
-		if count > record.MaxSignalsPerDay {
-			if h.debug {
-				slog.Debug("daily plan limit exceeded", "client", clientAddr, "license", parsed.LicenseID)
-			}
-			recordRejection("plan_limit_exceeded")
-			wctx.reasonCode = "plan_limit_exceeded"
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "plan_limit_exceeded"})
-			return
-		}
-	}
-
-	// Check exposure limits (Phase 7)
-	if h.db != nil && record.InstanceID != "" {
-		exposure := h.checkExposureLimits(r.Context(), parsed.LicenseID, record.InstanceID, h.db)
-		if h.debug {
-			slog.Debug("exposure check", "license", parsed.LicenseID, "account", record.InstanceID, "current", exposure.CurrentExposure, "limit", exposure.ExposureLimit)
-		}
-		if !exposure.AllowedToProceed {
-			if h.debug {
-				slog.Debug("exposure limit exceeded", "client", clientAddr, "license", parsed.LicenseID, "reason", exposure.Reason)
-			}
-			recordRejection("exposure_limit_exceeded")
-			h.publishRejection(parsed.LicenseID, "exposure_limit_exceeded", body)
-			wctx.reasonCode = "exposure_limit_exceeded"
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "exposure_limit_exceeded", "reason": exposure.Reason})
-			return
-		}
 	}
 
 	traceID := traceIDFromRequest(r.Header)
@@ -527,6 +379,213 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 	wctx.reasonCode = "accepted"
 	w.Header().Set("X-ExecRelay-Trace-ID", traceID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID})
+}
+
+// gatingPreamble runs the perimeter checks shared by every ingress webhook
+// route, in the order the ADR 0008 spec requires: method, perimeter token,
+// kill-switch, per-IP rate limit, CIDR allowlist, timestamp window, then the
+// raw body read (bounded by maxBodyBytes). It writes the appropriate error
+// response and sets wctx.reasonCode itself on rejection. Callers (webhook,
+// webhookML) parse the returned body in their own wire format afterwards.
+func (h *Handler) gatingPreamble(w http.ResponseWriter, r *http.Request, wctx *webhookCtx, clientAddr string) ([]byte, bool) {
+	if r.Method != http.MethodPost {
+		if h.debug {
+			slog.Debug("rejecting non-POST request", "client", clientAddr, "method", r.Method)
+		}
+		w.Header().Set("Allow", http.MethodPost)
+		wctx.reasonCode = "method_not_allowed"
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return nil, false
+	}
+
+	if len(h.perimeterToken) > 0 {
+		// Constant-time check; never log the supplied token value.
+		got := r.URL.Query().Get("token")
+		if !hmac.Equal([]byte(got), h.perimeterToken) {
+			if h.debug {
+				slog.Debug("perimeter token rejected", "client", clientAddr)
+			}
+			recordRejection("perimeter_rejected")
+			wctx.reasonCode = "perimeter_rejected"
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "perimeter_rejected"})
+			return nil, false
+		}
+	}
+
+	if h.tradingHalted.Load() {
+		recordRejection("trading_halted")
+		wctx.reasonCode = "trading_halted"
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "trading_halted"})
+		return nil, false
+	}
+
+	if h.rateLimiter != nil && !h.rateLimiter.allow(clientAddr) {
+		if h.debug {
+			slog.Debug("rate limit exceeded", "client", clientAddr)
+		}
+		recordRejection("rate_limit_exceeded")
+		wctx.reasonCode = "rate_limit_exceeded"
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limit_exceeded"})
+		return nil, false
+	}
+
+	if len(h.allowedCIDRs) > 0 {
+		ip := net.ParseIP(clientAddr)
+		allowed := false
+		if ip != nil {
+			for _, cidr := range h.allowedCIDRs {
+				if cidr.Contains(ip) {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			if h.debug {
+				slog.Debug("IP not in allowed CIDRs", "client", clientAddr)
+			}
+			recordRejection("ip_not_allowed")
+			wctx.reasonCode = "ip_not_allowed"
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "ip_not_allowed"})
+			return nil, false
+		}
+		if h.debug {
+			slog.Debug("IP allowed by CIDR", "client", clientAddr)
+		}
+	}
+
+	if h.timestampWindow > 0 {
+		if err := checkTimestamp(r.Header, h.now(), h.timestampWindow); err != nil {
+			if h.debug {
+				slog.Debug("timestamp validation failed", "client", clientAddr, "err", err)
+			}
+			recordRejection("timestamp_rejected")
+			wctx.reasonCode = "timestamp_rejected"
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "timestamp_rejected", "reason": err.Error()})
+			return nil, false
+		}
+		if h.debug {
+			slog.Debug("timestamp valid", "client", clientAddr)
+		}
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
+	if err != nil {
+		if h.debug {
+			slog.Debug("failed to read body", "client", clientAddr, "err", err)
+		}
+		wctx.reasonCode = "body_too_large"
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
+		return nil, false
+	}
+	if len(body) > 0 {
+		hash := sha256.Sum256(body)
+		wctx.bodySHA256 = hex.EncodeToString(hash[:])
+	}
+	if h.debug {
+		slog.Debug("body received", "client", clientAddr, "size", len(body))
+	}
+
+	return body, true
+}
+
+// authenticate runs the per-license gating chain shared by every ingress
+// webhook route: license lookup, subject-token validation, secret check,
+// HMAC-over-raw-body verification, daily quota, and exposure-limit checks.
+// It writes the appropriate error response and sets wctx.reasonCode itself
+// on rejection, mirroring gatingPreamble's contract.
+func (h *Handler) authenticate(r *http.Request, w http.ResponseWriter, wctx *webhookCtx, clientAddr string, body []byte, licenseID, secretValue string) (LicenseRecord, bool) {
+	record, err := h.store.Lookup(r.Context(), licenseID)
+	if err != nil {
+		if h.debug {
+			slog.Debug("license lookup failed", "client", clientAddr, "license", licenseID, "err", err)
+		}
+		status := http.StatusUnauthorized
+		if errors.Is(err, ErrLicenseInactive) {
+			status = http.StatusForbidden
+		}
+		h.publishRejection(licenseID, "license_rejected", body)
+		wctx.reasonCode = "license_rejected"
+		writeJSON(w, status, map[string]string{"error": "license_rejected"})
+		return LicenseRecord{}, false
+	}
+	if h.debug {
+		slog.Debug("license found", "client", clientAddr, "license", licenseID, "instance", record.InstanceID)
+	}
+
+	if !validSubjectToken(licenseID) || !validSubjectToken(record.InstanceID) {
+		if h.debug {
+			slog.Debug("invalid subject tokens", "client", clientAddr, "license", licenseID)
+		}
+		wctx.reasonCode = "invalid_route_token"
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_route_token"})
+		return LicenseRecord{}, false
+	}
+	if record.Secret != "" && !constantStringEqual(secretValue, record.Secret) {
+		if h.debug {
+			slog.Debug("secret validation failed", "client", clientAddr, "license", licenseID)
+		}
+		h.publishRejection(licenseID, "secret_rejected", body)
+		wctx.reasonCode = "secret_rejected"
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "secret_rejected"})
+		return LicenseRecord{}, false
+	}
+	if h.debug && record.Secret != "" {
+		slog.Debug("secret validated", "client", clientAddr, "license", licenseID)
+	}
+
+	if record.HMACSecret != "" {
+		primaryOK := validSignature(body, record.HMACSecret, r.Header)
+		pendingOK := record.PendingHMACSecret != "" && validSignature(body, record.PendingHMACSecret, r.Header)
+		if !primaryOK && !pendingOK {
+			if h.debug {
+				slog.Debug("signature validation failed", "client", clientAddr, "license", licenseID)
+			}
+			h.publishRejection(licenseID, "signature_rejected", body)
+			wctx.reasonCode = "signature_rejected"
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature_rejected"})
+			return LicenseRecord{}, false
+		}
+		if h.debug {
+			slog.Debug("signature validated", "client", clientAddr, "license", licenseID, "primary", primaryOK)
+		}
+	}
+
+	if record.MaxSignalsPerDay > 0 {
+		count := h.dailyCounter.Increment(licenseID, h.now())
+		if h.debug {
+			slog.Debug("daily signal count", "license", licenseID, "count", count, "limit", record.MaxSignalsPerDay)
+		}
+		if count > record.MaxSignalsPerDay {
+			if h.debug {
+				slog.Debug("daily plan limit exceeded", "client", clientAddr, "license", licenseID)
+			}
+			recordRejection("plan_limit_exceeded")
+			wctx.reasonCode = "plan_limit_exceeded"
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "plan_limit_exceeded"})
+			return LicenseRecord{}, false
+		}
+	}
+
+	// Check exposure limits (Phase 7)
+	if h.db != nil && record.InstanceID != "" {
+		exposure := h.checkExposureLimits(r.Context(), licenseID, record.InstanceID, h.db)
+		if h.debug {
+			slog.Debug("exposure check", "license", licenseID, "account", record.InstanceID, "current", exposure.CurrentExposure, "limit", exposure.ExposureLimit)
+		}
+		if !exposure.AllowedToProceed {
+			if h.debug {
+				slog.Debug("exposure limit exceeded", "client", clientAddr, "license", licenseID, "reason", exposure.Reason)
+			}
+			recordRejection("exposure_limit_exceeded")
+			h.publishRejection(licenseID, "exposure_limit_exceeded", body)
+			wctx.reasonCode = "exposure_limit_exceeded"
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "exposure_limit_exceeded", "reason": exposure.Reason})
+			return LicenseRecord{}, false
+		}
+	}
+
+	return record, true
 }
 
 // webhookRecorder lets the deferred request-log publisher know the final
@@ -652,11 +711,6 @@ func signalProto(signal parser.Signal, record LicenseRecord, region, traceID str
 	return wire
 }
 
-func validSecret(signal parser.Signal, want string) bool {
-	param, ok := signal.Param(parser.ParamSecret)
-	return ok && constantStringEqual(param.Value, want)
-}
-
 func validSignature(body []byte, secret string, header http.Header) bool {
 	signature := header.Get("X-ExecRelay-Signature")
 	if signature == "" {
@@ -751,6 +805,15 @@ func reject(code string, err error) map[string]string {
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload map[string]string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// writeJSONAny is writeJSON's counterpart for handlers (like webhookML) whose
+// response body has nested/typed fields (e.g. "ml": {"prob_win": 0.63, ...})
+// that don't fit the flat map[string]string shape.
+func writeJSONAny(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)

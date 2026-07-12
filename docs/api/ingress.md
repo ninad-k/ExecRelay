@@ -17,6 +17,7 @@ alert?") see [`docs/customer/webhook-integration.md`](../customer/webhook-integr
 | Method | Path | Purpose | Auth |
 |---|---|---|---|
 | `POST` | `/webhook` | Receive a trade signal | Per-license (HMAC + secret) + optional perimeter token |
+| `POST` | `/webhook/ml` | Receive an ML-filtered trade signal (opt-in, JSON) | Same as `/webhook` |
 | `GET` | `/health` | Liveness | None |
 | `GET` | `/metrics` | Prometheus metrics | None (firewall this in prod) |
 | `GET` | `/admin/kill-switch` | Read current kill-switch state | Perimeter token |
@@ -98,6 +99,137 @@ import hmac, hashlib
 sig = hmac.new(hmac_secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 headers["X-ExecRelay-Signature"] = f"sha256={sig}"
 ```
+
+---
+
+## `POST /webhook/ml`
+
+**ADR:** [`docs/adr/0008-opt-in-json-ml-webhook-path.md`](../adr/0008-opt-in-json-ml-webhook-path.md).
+
+Opt-in JSON path that scores the request through `ml-predictor` before
+publishing. Reuses the *exact* gating + per-license auth chain as `/webhook`
+(perimeter token, kill-switch, per-IP rate limit, CIDR allowlist, timestamp
+window, license lookup, secret, HMAC-over-raw-body, daily quota, exposure
+limits) via a shared internal helper — anything that rejects `/webhook`
+rejects `/webhook/ml` identically. The flat `/webhook` path and its 95 ms
+latency budget are untouched; this route makes a **synchronous** call to
+`ml-predictor`, so its latency profile is deliberately looser.
+
+### Request
+
+Same auth requirements as `/webhook` (`?token=`, `X-ExecRelay-Timestamp`,
+`X-ExecRelay-Signature`), but the body is JSON, not the flat wire format:
+
+```json
+{
+  "license_id": "60123456789",
+  "secret": "alert-secret",
+  "action": "buy",
+  "symbol": "EURUSD",
+  "volume": 0.1,
+  "sl": 0,
+  "tp": 0,
+  "comment": "AlgoCombo",
+  "current_position": "LONG",
+  "features": { "rsi_14": 55.5, "adx_14": 21.3, "...": "...35 features total, per apps/ml-predictor/model/feature_order.txt minus direction" }
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `license_id` | yes | Must match a `licenses.id` |
+| `secret` | iff license has `secret` configured | Body-embedded password, same check as `/webhook` |
+| `action` | yes | `"buy"` or `"sell"` — anything else is `400 invalid_action` |
+| `symbol` | yes | |
+| `volume`, `sl`, `tp`, `comment` | optional | Carried onto the published `Signal` exactly like the flat path's `vol_lots`/`sl`/`tp`/`comment` |
+| `current_position` | optional | `"LONG"` \| `"SHORT"` \| `null`. Caller value always wins; if omitted, ingress falls back to a snapshot read of `account_positions` (license + symbol); if that's unavailable or has no row, position is treated as unknown/flat |
+| `features` | yes (for scoring) | Passed through verbatim to `ml-predictor`. Missing/incomplete features cause the predictor call to error, which **fails open** (see below) rather than rejecting the webhook |
+
+### Scoring and shadow mode
+
+`direction` is derived from `action` (`buy`→`1`, `sell`→`-1`) and POSTed to
+`ml-predictor`'s `/predict` with `features` and the resolved
+`current_position`. The predictor's `action_summary` maps to an ExecRelay
+command:
+
+| `action_summary` | Command | Published? |
+|---|---|---|
+| `OPEN_LONG` | `buy` | yes |
+| `OPEN_SHORT` | `sell` | yes |
+| `FLIP_LONG` | `closeshortopenlong` | yes |
+| `FLIP_SHORT` | `closelongopenshort` | yes |
+| `CLOSE_ONLY` (position was LONG) | `closelong` | yes |
+| `CLOSE_ONLY` (position was SHORT) | `closeshort` | yes |
+| `NOTHING` | — | no → `200 {"status":"skipped"}` |
+
+**`ML_ENFORCE`** (env, default `false`) controls whether that mapped command
+is actually what gets published:
+
+- **Shadow mode (`ML_ENFORCE=false`, the default).** Every request is still
+  authenticated, scored, and audited, but ingress **always publishes the
+  caller's original `action`** (`buy`→`buy`, `sell`→`sell`), regardless of
+  what the model recommends. The response reports what the model *would*
+  have done.
+- **Enforce mode (`ML_ENFORCE=true`).** Ingress publishes the mapped command
+  from the table above. `NOTHING` publishes nothing and responds
+  `200 {"status":"skipped"}`.
+
+**Predictor unreachable, erroring, or timing out always fails open**: the
+original `action` is published (as in shadow mode), the response's `ml.error`
+field is set, and the `ingress_ml_predictor_errors_total` counter increments.
+`/webhook/ml` never rejects a trade because the ML filter is down.
+
+### Response
+
+```json
+{
+  "status": "accepted",
+  "trace_id": "...",
+  "ml": {
+    "action_summary": "OPEN_LONG",
+    "prob_win": 0.63,
+    "threshold": 0.5,
+    "model_version": "xgb-v3",
+    "enforced": false
+  }
+}
+```
+
+| Field | Notes |
+|---|---|
+| `status` | `"accepted"` (published) or `"skipped"` (enforce mode, `NOTHING`) |
+| `ml.action_summary` | Raw predictor decision |
+| `ml.prob_win`, `ml.threshold` | Model win probability and the pass/fail threshold |
+| `ml.model_version` | Omitted/empty if the predictor doesn't send it |
+| `ml.enforced` | Reflects `ML_ENFORCE` at request time |
+| `ml.error` | Present only on the fail-open path (predictor down/erroring) |
+
+All the same rejection codes as `/webhook` apply for auth failures (see the
+table above), plus:
+
+| HTTP | JSON | Meaning |
+|---|---|---|
+| `400` | `{"error":"parse_error","reason":"..."}` | Body wasn't valid JSON |
+| `400` | `{"error":"invalid_action","reason":"..."}` | `action` wasn't `"buy"`/`"sell"` |
+| `400` | `{"error":"missing_field","reason":"..."}` | `license_id` or `symbol` missing |
+
+### Audit trail
+
+Every `/webhook/ml` request writes one row to `ml_decisions`
+(`infra/migrations/000006_ml_decisions.up.sql`): trace id, license, symbol,
+action, `prob_win`/`threshold`/`action_summary`, the published command (if
+any), `enforced`, `model_version`, `position_source` (`caller`/`db`/`unknown`),
+and any predictor error. The insert is best-effort and non-blocking — it never
+slows down or fails the webhook response, and is skipped entirely when no DB
+is configured.
+
+### New metrics
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `ingress_ml_webhook_requests_total` | counter | `outcome` (`accepted`\|`skipped`\|`fail_open`\|`rejected`) | `/webhook/ml` requests by outcome |
+| `ingress_ml_webhook_duration_seconds` | histogram | — | `/webhook/ml` latency, including the synchronous predictor call |
+| `ingress_ml_predictor_errors_total` | counter | — | Errors calling `ml-predictor` `/predict` (timeout, connection refused, non-2xx, malformed response) |
 
 ---
 
@@ -187,6 +319,16 @@ don't want a single network blip to fire the same trade twice.
 For higher per-IP throughput, raise `WEBHOOK_RATE_LIMIT`. The bucket is
 **per-pod**, not cluster-wide — if you horizontally scale ingress, the
 effective limit is `WEBHOOK_RATE_LIMIT × pod_count`.
+
+---
+
+## `/webhook/ml` configuration
+
+| Env var | Default | Notes |
+|---|---|---|
+| `ML_PREDICTOR_URL` | `http://ml-predictor:8080` | Base URL; ingress POSTs to `<url>/predict` |
+| `ML_PREDICT_TIMEOUT_MS` | `2000` | Timeout for the synchronous predictor call |
+| `ML_ENFORCE` | `false` | `false` = shadow mode (always publish the caller's original action); `true` = publish the model's mapped command |
 
 ---
 

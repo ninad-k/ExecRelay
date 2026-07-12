@@ -11,10 +11,12 @@ import (
 )
 
 const (
-	defaultHTTPAddr     = ":8080"
-	defaultNATSURL      = "nats://nats:4222"
-	defaultRegion       = "local"
-	defaultMaxBodyBytes = 4096
+	defaultHTTPAddr         = ":8080"
+	defaultNATSURL          = "nats://nats:4222"
+	defaultRegion           = "local"
+	defaultMaxBodyBytes     = 4096
+	defaultMLPredictorURL   = "http://ml-predictor:8080"
+	defaultMLPredictTimeout = 2 * time.Second
 )
 
 type Config struct {
@@ -31,6 +33,11 @@ type Config struct {
 	PerimeterToken  string
 	TradingHalted   bool
 	Debug           bool
+
+	// ML-filtered signal path (ADR 0008).
+	MLPredictorURL   string
+	MLPredictTimeout time.Duration
+	MLEnforce        bool
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -87,6 +94,19 @@ func ConfigFromEnv() (Config, error) {
 
 	cfg.PerimeterToken = strings.TrimSpace(os.Getenv("INGRESS_PERIMETER_TOKEN"))
 	cfg.TradingHalted = getenvBool("INGRESS_TRADING_HALTED", false)
+
+	cfg.MLPredictorURL = getenv("ML_PREDICTOR_URL", defaultMLPredictorURL)
+	cfg.MLPredictTimeout = defaultMLPredictTimeout
+	if raw := os.Getenv("ML_PREDICT_TIMEOUT_MS"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			return Config{}, errors.New("ML_PREDICT_TIMEOUT_MS must be a positive integer")
+		}
+		cfg.MLPredictTimeout = time.Duration(value) * time.Millisecond
+	}
+	// Shadow mode by default: score + audit every /webhook/ml request, but
+	// always publish the caller's original action until ML_ENFORCE=true.
+	cfg.MLEnforce = getenvBool("ML_ENFORCE", false)
 
 	licenses, err := LoadLicenses()
 	if err != nil {
