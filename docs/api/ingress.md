@@ -65,7 +65,7 @@ Example:
 
 | HTTP | JSON | Meaning |
 |---|---|---|
-| `200` | `{"status":"accepted","trace_id":"...","ml_confidence":"..."}` | Published to NATS; trace_id is your audit handle |
+| `200` | `{"status":"accepted","trace_id":"..."}` | Published to NATS; trace_id is your audit handle |
 | `400` | `{"error":"parse_error","reason":"...","field":"..."}` | Body didn't parse |
 | `400` | `{"error":"invalid_route_token"}` | License/instance ID has non-allowed characters |
 | `401` | `{"error":"license_rejected"}` | Unknown license |

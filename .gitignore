@@ -54,3 +54,8 @@ node_modules/
 # pytest-cov data files
 .coverage
 **/.coverage
+
+# Generated binary renders of docs authored in Markdown (the .md is the
+# source of truth and is tracked; these binaries are build output).
+docs/ARCHITECTURE_AND_COMPARISON.docx
+docs/ARCHITECTURE_AND_COMPARISON.pdf

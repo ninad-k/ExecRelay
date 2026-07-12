@@ -522,20 +522,6 @@ func TestIPRateLimiter_NoPanicOnConcurrentAllow(t *testing.T) {
 	}
 }
 
-// ---- scoreSignalWithML: exercise the predictor-down fallback path ---------
-
-func TestScoreSignalWithML_FallbackWhenPredictorDown(t *testing.T) {
-	// No ml-predictor server running — http.Post returns error → 0.5 fallback.
-	h := &Handler{now: time.Now}
-	got, err := h.scoreSignalWithML(context.Background(), "EURUSD", time.Now().Unix())
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if got != 0.5 {
-		t.Fatalf("expected fallback 0.5, got %f", got)
-	}
-}
-
 // ---- checkExposureLimits: nil db path is the cheap one --------------------
 
 func TestCheckExposureLimits_NilDBAllowsThrough(t *testing.T) {
