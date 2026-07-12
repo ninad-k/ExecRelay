@@ -7,9 +7,10 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: '\.md$|^apps/portal-web/package-lock\.json$'
+        exclude: '\.md$|^apps/portal-web/package-lock\.json$|^apps/ml-predictor/model/'
       - id: end-of-file-fixer
-        exclude: '^apps/portal-web/package-lock\.json$'
+        # ml-predictor/model holds generated training artifacts — don't mutate them.
+        exclude: '^apps/portal-web/package-lock\.json$|^apps/ml-predictor/model/'
       - id: check-yaml
         args: [--unsafe]   # allow GitHub Actions tags
         exclude: '^infra/helm/.*/templates/.*\.yaml$'   # Helm templates use {{- }} which isn't valid YAML
@@ -19,7 +20,7 @@ repos:
         args: [--maxkb=512]
         # The trained XGBoost artifact ships with the image (~900 KB, see
         # apps/ml-predictor/Dockerfile) and is intentionally tracked.
-        exclude: '^apps/ml-predictor/model/xgb_production\.json$'
+        exclude: '^apps/ml-predictor/model/'
       - id: mixed-line-ending
         args: [--fix=lf]
 
