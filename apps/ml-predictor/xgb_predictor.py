@@ -15,6 +15,7 @@ connection — inference is a pure function of the request payload.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,13 +37,23 @@ class XGBPredictor:
         self, model_path: str, feature_order_path: str, threshold: float = 0.50
     ):
         self.threshold = threshold
+
+        # model_version identifies exactly which trained artifact is loaded,
+        # independent of the filename -- it's the sha256 of the raw model
+        # bytes (first 12 hex chars), so a silent artifact swap that keeps
+        # the same path/filename still shows up as a different version in
+        # responses, logs, and the ml_model_info metric.
+        with open(model_path, "rb") as f:
+            model_bytes = f.read()
+        self.model_version = hashlib.sha256(model_bytes).hexdigest()[:12]
+
         # xgb.Booster + DMatrix instead of the sklearn XGBClassifier wrapper:
         # Booster.load_model() reads the exact same JSON that XGBClassifier
         # saved, and for a binary:logistic objective, Booster.predict()
         # already returns the positive-class probability directly -- no
         # scikit-learn dependency needed.
         self.model = xgb.Booster()
-        self.model.load_model(model_path)
+        self.model.load_model(bytearray(model_bytes))
 
         with open(feature_order_path) as f:
             self.feature_order = [line.strip() for line in f if line.strip()]
@@ -53,8 +64,9 @@ class XGBPredictor:
             )
 
         logger.info(
-            "XGBPredictor loaded: model=%s features=%d threshold=%.2f",
+            "XGBPredictor loaded: model=%s model_version=%s features=%d threshold=%.2f",
             Path(model_path).name,
+            self.model_version,
             len(self.feature_order),
             threshold,
         )
@@ -91,7 +103,8 @@ class XGBPredictor:
             dict with: signal_direction, prob_win, threshold, should_close,
             should_open, open_direction, action_summary
             (OPEN_LONG / OPEN_SHORT / FLIP_LONG / FLIP_SHORT / CLOSE_ONLY /
-            NOTHING), reason, timestamp, and error (None unless something broke).
+            NOTHING), reason, timestamp, model_version (sha256[:12] of the
+            loaded model artifact), and error (None unless something broke).
         """
         result = {
             "signal_direction": None,
@@ -103,6 +116,7 @@ class XGBPredictor:
             "action_summary": "NOTHING",
             "reason": "",
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model_version": self.model_version,
             "error": None,
         }
 

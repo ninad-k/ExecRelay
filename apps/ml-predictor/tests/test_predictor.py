@@ -41,6 +41,15 @@ def test_model_loads_with_expected_feature_count(predictor):
     assert predictor.feature_order[0] == "direction"
 
 
+def test_model_version_is_sha256_prefix_of_artifact_bytes(predictor):
+    import hashlib
+
+    with open(MODEL_PATH, "rb") as f:
+        expected = hashlib.sha256(f.read()).hexdigest()[:12]
+    assert predictor.model_version == expected
+    assert len(predictor.model_version) == 12
+
+
 def test_open_long_when_flat_and_filter_passes(predictor, monkeypatch):
     _pin_prob(predictor, 0.80, monkeypatch)
     out = predictor.predict(
@@ -51,6 +60,7 @@ def test_open_long_when_flat_and_filter_passes(predictor, monkeypatch):
     assert out["should_close"] is False
     assert out["open_direction"] == "LONG"
     assert out["error"] is None
+    assert out["model_version"] == predictor.model_version
 
 
 def test_skip_when_flat_and_filter_fails(predictor, monkeypatch):
@@ -98,9 +108,11 @@ def test_invalid_direction_returns_error(predictor):
     )
     assert out["error"] is not None
     assert out["action_summary"] == "NOTHING"
+    assert out["model_version"] == predictor.model_version
 
 
 def test_missing_features_returns_error(predictor):
     out = predictor.predict({"direction": 1, "features": {"ret_1": 0.0}})
     assert out["error"] is not None
     assert "Missing features" in out["error"]
+    assert out["model_version"] == predictor.model_version
