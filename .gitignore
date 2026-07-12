@@ -59,3 +59,7 @@ node_modules/
 # source of truth and is tracked; these binaries are build output).
 docs/ARCHITECTURE_AND_COMPARISON.docx
 docs/ARCHITECTURE_AND_COMPARISON.pdf
+
+# scripts/local-stack.sh working directory (downloaded nats-server, built
+# binaries, logs, pid files)
+.local-stack/
