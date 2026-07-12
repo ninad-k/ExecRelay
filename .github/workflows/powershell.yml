@@ -19,7 +19,7 @@ jobs:
     name: PSScriptAnalyzer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: |
@@ -54,7 +54,7 @@ jobs:
     name: Parse syntax
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Parse all .ps1 files
         shell: pwsh
         run: |

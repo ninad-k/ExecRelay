@@ -278,7 +278,7 @@ async def main():
         js = nc.jetstream()
 
         await setup_signals_stream(js)
-        sub = await subscribe_signals(js, pool)
+        await subscribe_signals(js, pool)
 
         # Start HTTP server
         server = await asyncio.start_server(http_handler, "0.0.0.0", HTTP_PORT)
