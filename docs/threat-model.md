@@ -47,6 +47,51 @@ This document outlines the detailed threat model for ExecRelay, utilizing the ST
 
 ---
 
+## `ml-predictor` Trust Boundary
+
+* **Boundary:** `ml-predictor`'s `/predict` endpoint is **intentionally
+  unauthenticated** — it does not check a token, HMAC, or license. It is
+  meant to be reachable only over the cluster-internal network (Kubernetes:
+  `ClusterIP` service, no `Ingress` host is ever registered for it; see
+  `infra/helm/execrelay/values.yaml`), with `ingress` (`apps/ingress`) as the
+  **sole intended caller**, via `httpMLPredictor` in
+  [`apps/ingress/internal/ingress/ml.go`](../apps/ingress/internal/ingress/ml.go).
+* **Threats:**
+  * **Feature poisoning if the network boundary fails.** Anything that can
+    reach `/predict` on the internal network can submit an arbitrary
+    `features` vector and get a decision back — there is no way for
+    `ml-predictor` itself to tell a poisoned/crafted feature vector from a
+    legitimate one relayed by `ingress`. The model's integrity depends
+    entirely on the network boundary holding.
+  * **Denial of service via large payloads.** An oversized or malformed
+    `Content-Length`/body sent to `/predict` could otherwise force the
+    server to block reading an unbounded request.
+* **Mitigations:**
+  * `/predict` request bodies are capped at 1 MiB (`MAX_BODY_BYTES` in
+    `apps/ml-predictor/app.py`); an oversized `Content-Length` is rejected
+    with `413 Payload Too Large` before any `readexactly()` call, so a
+    huge/attacker-controlled length can never make the server block on an
+    unbounded read.
+  * A Kubernetes `NetworkPolicy` (`infra/helm/execrelay/templates/networkpolicy.yaml`,
+    gated behind `networkPolicy.enabled`) restricts ingress traffic to the
+    `ml-predictor` pods to only the `ingress` pods (plus, optionally,
+    a Prometheus scraper), so the network boundary above is enforced rather
+    than assumed.
+  * No PII is ever included in the feature vector — features are derived
+    market/technical indicators (see `pine/` and `feature_order.txt`), not
+    account or user identifiers.
+* **`/webhook/ml` is a different boundary.** Unlike `/predict`, the
+  ExecRelay-facing `POST /webhook/ml` endpoint (ADR 0008) is **not**
+  unauthenticated: it reuses the full flat-webhook auth chain (perimeter
+  token, kill-switch, per-IP rate limit, CIDR allowlist, timestamp window,
+  license lookup, `secret`, HMAC-over-raw-body, daily quota, exposure
+  limits) before it ever calls `ml-predictor`. See
+  [ADR 0008](adr/0008-opt-in-json-ml-webhook-path.md) and
+  [`docs/observability.md`](observability.md) for the corresponding
+  `ingress_ml_webhook_*` metrics.
+
+---
+
 ## Secrets Management
 
 * **No Plaintext Secrets in Code:** Configuration and sensitive credentials (DB passwords, JWT secrets, NATS passwords) are exclusively managed via environment variables.
