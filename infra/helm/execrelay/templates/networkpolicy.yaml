@@ -1,0 +1,49 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{/*
+ml-predictor's /predict endpoint is intentionally unauthenticated (see
+docs/threat-model.md) -- it relies entirely on the network boundary below,
+not application-level auth, to keep it reachable only by ingress (its sole
+intended caller). This is gated behind networkPolicy.enabled (default false)
+so existing deploys that haven't reviewed their CNI's NetworkPolicy support
+aren't affected by upgrading the chart.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "execrelay.fullname" . }}-ml-predictor
+  labels:
+    {{- include "execrelay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ml-predictor
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "execrelay.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ml-predictor
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the ingress service is allowed to reach ml-predictor's /predict.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "execrelay.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: ingress
+      ports:
+        - protocol: TCP
+          port: {{ (index .Values.services "ml-predictor").port }}
+    {{- if .Values.networkPolicy.mlPredictor.allowPrometheusScrape }}
+    # Allow a Prometheus instance (typically in its own monitoring namespace)
+    # to scrape /metrics. Adjust the selectors below to match your
+    # Prometheus Operator / kube-prometheus-stack install.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.mlPredictor.prometheusNamespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.mlPredictor.prometheusPodSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ (index .Values.services "ml-predictor").port }}
+    {{- end }}
+{{- end }}
