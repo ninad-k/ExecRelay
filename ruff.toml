@@ -1,0 +1,14 @@
+# Ruff configuration for the Python apps under apps/*.
+#
+# Kept at the repo root (no pyproject.toml exists here) so both the
+# pre-commit hook and ad-hoc `ruff check` invocations pick it up.
+
+[lint.per-file-ignores]
+# These test files deliberately do `sys.path.insert(...)` followed by an
+# import of the app-under-test before any other module import, so the
+# flat (non-package) app modules can be imported the same way app.py
+# imports its siblings. That import ordering is the point of the pattern,
+# not an oversight -- ignore E402 (module import not at top of file) only
+# for these specific files rather than restructuring the test layout.
+"apps/ml-predictor/tests/test_contract.py" = ["E402"]
+"apps/ml-predictor/tests/test_predictor.py" = ["E402"]

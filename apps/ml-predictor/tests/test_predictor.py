@@ -15,7 +15,7 @@ import sys
 APP_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_DIR))
 
-from xgb_predictor import XGBPredictor  # noqa: E402
+from xgb_predictor import XGBPredictor
 
 MODEL_DIR = APP_DIR / "model"
 MODEL_PATH = str(MODEL_DIR / "xgb_production.json")

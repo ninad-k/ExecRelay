@@ -160,7 +160,10 @@ async def run_backtest(
                     if day not in daily_returns:
                         daily_returns[day] = 0
                     daily_returns[day] += pnl
-                except:
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    # Skip a single malformed fill payload (bad JSON, missing
+                    # or wrong-typed field) rather than aborting the whole
+                    # aggregate report.
                     pass
 
             sharpe_ratio = 0.0

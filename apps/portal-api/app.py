@@ -19,7 +19,7 @@ import jwt
 import nats
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -1161,9 +1161,6 @@ async def get_trace(
     return payload
 
 
-import time as _time
-
-
 @app.post("/signals/{signal_id}/replay", status_code=status.HTTP_202_ACCEPTED)
 async def replay_signal(
     signal_id: str,
@@ -1205,7 +1202,7 @@ async def replay_signal(
     original = decode_signal_proto(bytes(row["raw_payload"]))
     new_trace_id = original.get("trace_id", "") + "-r"
     original["trace_id"] = new_trace_id
-    original["received_unix_nano"] = _time.time_ns()
+    original["received_unix_nano"] = time.time_ns()
     new_payload = encode_signal_proto(original)
 
     platform = row["platform"] or "mt5"
@@ -1605,8 +1602,6 @@ async def _own_license(pool: asyncpg.Pool, license_id: str, user_id: Any) -> Any
 # from/to are ISO dates (date-only); the range is inclusive on `from` and
 # exclusive on `to`. Default `to` is today; default `from` is 30 days ago.
 
-from fastapi.responses import StreamingResponse  # noqa: E402
-
 JOURNAL_MAX_ROWS = 200_000
 
 
@@ -1625,17 +1620,17 @@ async def journal_export(
     if fmt not in ("csv", "json"):
         raise HTTPException(status_code=400, detail="format must be csv or json")
 
-    now = _time.time()
+    now = time.time()
     try:
         end_ts = (
-            _datetime.fromisoformat(to).replace(tzinfo=_timezone.utc)
+            datetime.fromisoformat(to).replace(tzinfo=timezone.utc)
             if to
-            else _datetime.fromtimestamp(now, _timezone.utc)
+            else datetime.fromtimestamp(now, timezone.utc)
         )
         start_ts = (
-            _datetime.fromisoformat(from_value).replace(tzinfo=_timezone.utc)
+            datetime.fromisoformat(from_value).replace(tzinfo=timezone.utc)
             if from_value
-            else end_ts - _timedelta(days=30)
+            else end_ts - timedelta(days=30)
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"invalid date: {exc}") from exc
@@ -1678,9 +1673,9 @@ async def _stream_csv(
     pool: asyncpg.Pool,
     sql: str,
     user_id: str,
-    start_ts: "_datetime",
-    end_ts: "_datetime",
-) -> "_AsyncIterator[str]":
+    start_ts: "datetime",
+    end_ts: "datetime",
+) -> "AsyncIterator[str]":
     yield (
         "fill_id,trace_id,broker_order_id,status,error_code,"
         "error_message,license_key,instance_key,created_at,payload_json\n"
@@ -1697,9 +1692,9 @@ async def _stream_json(
     pool: asyncpg.Pool,
     sql: str,
     user_id: str,
-    start_ts: "_datetime",
-    end_ts: "_datetime",
-) -> "_AsyncIterator[str]":
+    start_ts: "datetime",
+    end_ts: "datetime",
+) -> "AsyncIterator[str]":
     yield '{"fills":['
     first = True
     async with pool.acquire() as conn:
@@ -1725,13 +1720,13 @@ def _csv_row(row: "asyncpg.Record") -> str:
         row["license_key"],
         row["instance_key"] or "",
         row["created_at"].isoformat(),
-        _json.dumps(row["payload"]) if row["payload"] is not None else "",
+        json.dumps(row["payload"]) if row["payload"] is not None else "",
     ]
     return ",".join(_csv_escape(str(f)) for f in fields) + "\n"
 
 
 def _json_row(row: "asyncpg.Record") -> str:
-    return _json.dumps(
+    return json.dumps(
         {
             "fill_id": row["fill_id"],
             "trace_id": row["trace_id"],
@@ -1898,16 +1893,6 @@ async def export_user_data(
         "report_subscriptions": subscriptions,
         "portfolio_exposure_limits": limits,
     }
-
-
-# Local imports to avoid disturbing the top of the file. Aliased with leading
-# underscores so they're not part of the module's public surface.
-import json as _json  # noqa: E402
-import time as _time  # noqa: E402
-from datetime import datetime as _datetime  # noqa: E402
-from datetime import timedelta as _timedelta  # noqa: E402
-from datetime import timezone as _timezone  # noqa: E402
-from typing import AsyncIterator as _AsyncIterator  # noqa: E402, F401
 
 
 # ---------------------------------------------------------------------------

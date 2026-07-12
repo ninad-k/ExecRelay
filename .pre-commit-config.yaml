@@ -32,10 +32,12 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.8.4
     hooks:
-      # ruff-format runs on every commit. The lint hook (`ruff`) is intentionally
-      # disabled until the existing E702/F841/E722/E402 findings are triaged
-      # and fixed — see `ruff check apps/` for the list. To enable: add an
-      # `- id: ruff` hook above ruff-format with `args: [--fix]`.
+      # Lint findings (E702/F841/E722/E402) were triaged and fixed; deliberate
+      # sys.path-insertion import patterns in ml-predictor's tests are
+      # allow-listed via per-file-ignores in ruff.toml instead of inline
+      # noqa comments. See ruff.toml at the repo root for the ruff config.
+      - id: ruff
+        args: [--fix]
       - id: ruff-format
 
   - repo: local
