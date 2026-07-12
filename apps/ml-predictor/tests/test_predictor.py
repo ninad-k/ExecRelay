@@ -33,11 +33,7 @@ def _features(pred: XGBPredictor) -> dict:
 
 
 def _pin_prob(pred: XGBPredictor, value: float, monkeypatch) -> None:
-    import numpy as np
-
-    monkeypatch.setattr(
-        pred.model, "predict_proba", lambda x: np.array([[1.0 - value, value]])
-    )
+    monkeypatch.setattr(pred, "_score", lambda x: value)
 
 
 def test_model_loads_with_expected_feature_count(predictor):

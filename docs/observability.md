@@ -81,13 +81,23 @@ to scrape every app service plus:
 |---|---|---|---|
 | `backtester_errors_total` | counter | `kind` | Errors during backtest runs. |
 
-### `ml-predictor` / `ml-feature-extractor`
+### `ml-predictor`
 
 | Metric | Type | Labels | What it measures |
 |---|---|---|---|
-| `ml_predictions_total` | counter | `model` | Predictions made, per model name. |
-| `ml_model_accuracy` | gauge | `model` | Last computed accuracy on the test set. |
-| `ml_training_runs_total` | counter | — | Training-job invocations. |
+| `ml_predictions_total` | counter | `action` | Predictions made, by `action_summary` (`OPEN_LONG`, `OPEN_SHORT`, `FLIP_LONG`, `FLIP_SHORT`, `CLOSE_ONLY`, `NOTHING`). |
+| `ml_prediction_errors_total` | counter | — | `/predict` requests that failed (bad JSON, oversized/invalid body, missing/unloaded model, or a prediction error). |
+| `ml_prediction_latency_seconds` | histogram | — | Time spent scoring a single `/predict` request (off the event loop; see `apps/ml-predictor/app.py`). |
+| `ml_prob_win` | histogram | — | Model win-probability output per prediction. |
+| `ml_model_loaded` | gauge | — | `1` if the XGBoost model loaded successfully at startup, else `0`. Drives `/readyz`. |
+
+### `ml-feature-extractor`
+
+| Metric | Type | Labels | What it measures |
+|---|---|---|---|
+| `ml_signals_processed_total` | counter | — | Signal messages consumed off the `signals.>` NATS subject. |
+| `ml_features_extracted_total` | counter | — | Feature rows successfully written to `signal_features`. |
+| `ml_extraction_errors_total` | counter | — | Errors during feature extraction or DB write. |
 
 ---
 

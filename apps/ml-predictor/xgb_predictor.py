@@ -36,7 +36,12 @@ class XGBPredictor:
         self, model_path: str, feature_order_path: str, threshold: float = 0.50
     ):
         self.threshold = threshold
-        self.model = xgb.XGBClassifier()
+        # xgb.Booster + DMatrix instead of the sklearn XGBClassifier wrapper:
+        # Booster.load_model() reads the exact same JSON that XGBClassifier
+        # saved, and for a binary:logistic objective, Booster.predict()
+        # already returns the positive-class probability directly -- no
+        # scikit-learn dependency needed.
+        self.model = xgb.Booster()
         self.model.load_model(model_path)
 
         with open(feature_order_path) as f:
@@ -63,6 +68,16 @@ class XGBPredictor:
             [[float(merged[name]) for name in self.feature_order]],
             dtype=np.float32,
         )
+
+    def _score(self, x: np.ndarray) -> float:
+        """Run the Booster on a single feature row and return P(win).
+
+        Small wrapper kept separate from predict() so tests can monkeypatch
+        just the scoring step (e.g. to pin a probability) without needing to
+        construct a real DMatrix or touch the Booster.
+        """
+        dmatrix = xgb.DMatrix(x, feature_names=self.feature_order)
+        return float(self.model.predict(dmatrix)[0])
 
     def predict(self, payload: dict, current_position: str | None = None) -> dict:
         """Run inference and return a trade decision.
@@ -103,7 +118,7 @@ class XGBPredictor:
                 raise ValueError("payload must include 'features' dict")
 
             x = self._build_feature_vector(features, direction)
-            prob = float(self.model.predict_proba(x)[0, 1])
+            prob = self._score(x)
             result["prob_win"] = round(prob, 4)
             filter_pass = prob > self.threshold
 

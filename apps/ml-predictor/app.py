@@ -32,8 +32,12 @@ FEATURE_ORDER_PATH = os.environ.get(
 )
 THRESHOLD = float(os.environ.get("ML_THRESHOLD", "0.50"))
 
+# /predict request bodies are capped at 1 MiB. A bad/huge Content-Length must
+# never make the server block on an unbounded readexactly().
+MAX_BODY_BYTES = 1024 * 1024
+
 logger = logging.getLogger(SERVICE)
-DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes", "on")
+DEBUG = os.environ.get("DEBUG", "false").lower() in ("true", "1", "yes", "on")
 log_level = logging.DEBUG if DEBUG else logging.INFO
 logging.basicConfig(
     level=log_level,
@@ -85,7 +89,36 @@ async def handle_predict(reader) -> bytes:
         if ":" in line:
             key, val = line.split(":", 1)
             if key.lower() == "content-length":
-                content_length = int(val.strip())
+                try:
+                    content_length = int(val.strip())
+                except ValueError:
+                    prediction_errors.inc()
+                    return _json_response(
+                        b"HTTP/1.1 400 Bad Request\r\n",
+                        {
+                            "error": "invalid Content-Length",
+                            "action_summary": "NOTHING",
+                        },
+                    )
+                if content_length < 0:
+                    prediction_errors.inc()
+                    return _json_response(
+                        b"HTTP/1.1 400 Bad Request\r\n",
+                        {
+                            "error": "invalid Content-Length",
+                            "action_summary": "NOTHING",
+                        },
+                    )
+
+    if content_length > MAX_BODY_BYTES:
+        prediction_errors.inc()
+        # Do NOT readexactly() an attacker-controlled/oversized length -- the
+        # response below signals the client to stop, and the connection is
+        # closed by the caller right after; no need to drain first.
+        return _json_response(
+            b"HTTP/1.1 413 Payload Too Large\r\n",
+            {"error": "request body too large", "action_summary": "NOTHING"},
+        )
 
     body = await reader.readexactly(content_length) if content_length > 0 else b""
 
@@ -108,7 +141,10 @@ async def handle_predict(reader) -> bytes:
     current_position = payload.get("current_position")
 
     start = time.perf_counter()
-    decision = predictor.predict(payload, current_position=current_position)
+    loop = asyncio.get_event_loop()
+    decision = await loop.run_in_executor(
+        None, lambda: predictor.predict(payload, current_position=current_position)
+    )
     prediction_latency.observe(time.perf_counter() - start)
 
     if decision.get("error"):
@@ -146,6 +182,21 @@ async def http_handler(reader, writer):
             response = _json_response(
                 status,
                 {"status": "ok" if predictor is not None else "model not loaded"},
+            )
+        elif path == "/healthz" and method == "GET":
+            # Liveness: the HTTP server is up and serving. Always 200 -- does
+            # not depend on the model having loaded (that's /readyz).
+            response = _json_response(b"HTTP/1.1 200 OK\r\n", {"status": "ok"})
+        elif path == "/readyz" and method == "GET":
+            # Readiness: 200 only once the predictor has loaded successfully.
+            status = (
+                b"HTTP/1.1 200 OK\r\n"
+                if predictor is not None
+                else b"HTTP/1.1 503 Service Unavailable\r\n"
+            )
+            response = _json_response(
+                status,
+                {"status": "ready" if predictor is not None else "not ready"},
             )
         elif path == "/metrics" and method == "GET":
             metrics_data = generate_latest()
