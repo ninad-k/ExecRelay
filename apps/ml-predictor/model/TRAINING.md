@@ -11,7 +11,7 @@ below for the gaps.
 | File | SHA-256 | Size |
 |---|---|---|
 | `xgb_production.json` | `6bd309cb2fe090300c54c6e97c5731bfb03275edaf45960b60cac4d080cd7ed5` | 924,329 bytes |
-| `feature_order.txt` | `a31875fe26f1b95ccf0be02168f6340f278348b31fa8490fc1a181ee6695593f` | 375 bytes |
+| `feature_order.txt` | `ab80461fb7b92dcfd5abc2f0692ea164ed23fa64ac1283ca374503ad3e619640` | 340 bytes |
 
 Both checksums are pinned in [`SHA256SUMS`](SHA256SUMS) (standard `sha256sum`
 format). The Dockerfile verifies them at image-build time
