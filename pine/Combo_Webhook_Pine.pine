@@ -1,14 +1,16 @@
-// AlgoAlpha + EMA50 + MACD + DMI — Sends use_xgb + features to your MT5 webhook
+// AlgoAlpha + EMA50 + MACD + DMI — sends ExecRelay-native alerts (license_id +
+// secret + 35 model features) to POST /webhook/ml. See ADR 0008.
 //@version=5
 indicator("Combo Strategy → XGB Webhook", overlay=true, max_lines_count=500)
 
 // =====================================================
 // 🔹 USER INPUTS
 // =====================================================
-xAccount    = input.string("default", "x_account (MT5 account name)", group="Webhook")
+licenseId   = input.string("60000000001", "ExecRelay license ID", group="Webhook")
+alertSecret = input.string("test-secret", "ExecRelay alert secret", group="Webhook")
 strategyTag = input.string("AlgoCombo", "Comment / strategy tag", group="Webhook")
 tradeVolume = input.float(0.1, "Volume (lots)", step=0.01, group="Webhook")
-useXgb      = input.bool(true, "Send use_xgb=true (enable filter on server)", group="Webhook")
+testMode    = input.bool(false, "TEST MODE: alternate buy/sell every bar close", group="Webhook")
 
 adxLen   = input.int(14,  "ADX Length",       group="Strategy")
 atrLen   = input.int(7,   "AlgoAlpha ATR",    group="Strategy")
@@ -136,16 +138,15 @@ plotshape(buyEntry,  title="BUY",  style=shape.labelup,   location=location.belo
 plotshape(sellEntry, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.red,   text="SELL")
 
 // =====================================================
-// 🔹 WEBHOOK ALERT MESSAGE — matches your MT5 server fields
+// 🔹 WEBHOOK ALERT MESSAGE — ExecRelay POST /webhook/ml body (ADR 0008)
 // =====================================================
-useXgbStr = useXgb ? "true" : "false"
-
-buyMsg = "{\"x_account\":\"" + xAccount +
-         "\",\"action\":\"buy\"" +
+buyMsg = "{\"license_id\":\"" + licenseId +
+         "\",\"secret\":\"" + alertSecret + "\"" +
+         ",\"action\":\"buy\"" +
          ",\"symbol\":\"" + syminfo.ticker + "\"" +
-         ",\"comment\":\"" + strategyTag + "\"" +
          ",\"volume\":" + str.tostring(tradeVolume) +
-         ",\"use_xgb\":" + useXgbStr +
+         ",\"sl\":0,\"tp\":0" +
+         ",\"comment\":\"" + strategyTag + "\"" +
          ",\"features\":{" +
          "\"ret_1\":"          + str.tostring(f_ret_1,"#.########") +
          ",\"ret_3\":"         + str.tostring(f_ret_3,"#.########") +
@@ -184,12 +185,13 @@ buyMsg = "{\"x_account\":\"" + xAccount +
          ",\"session\":"       + str.tostring(f_session) +
          "}}"
 
-sellMsg = "{\"x_account\":\"" + xAccount +
-          "\",\"action\":\"sell\"" +
+sellMsg = "{\"license_id\":\"" + licenseId +
+          "\",\"secret\":\"" + alertSecret + "\"" +
+          ",\"action\":\"sell\"" +
           ",\"symbol\":\"" + syminfo.ticker + "\"" +
-          ",\"comment\":\"" + strategyTag + "\"" +
           ",\"volume\":" + str.tostring(tradeVolume) +
-          ",\"use_xgb\":" + useXgbStr +
+          ",\"sl\":0,\"tp\":0" +
+          ",\"comment\":\"" + strategyTag + "\"" +
           ",\"features\":{" +
           "\"ret_1\":"          + str.tostring(f_ret_1,"#.########") +
           ",\"ret_3\":"         + str.tostring(f_ret_3,"#.########") +
@@ -236,7 +238,13 @@ sellMsg = "{\"x_account\":\"" + xAccount +
 // otherwise the predictor receives invalid JSON server-side.
 featuresOk = not (na(f_ret_288) or na(f_vol_288) or na(f_active_rate_288) or na(f_ema_200_slope) or na(f_bb_z) or na(f_h1_dist_ema50) or na(f_h1_ret_24) or na(f_h4_dist_ema50))
 
-if buyEntry and featuresOk
+// TEST MODE fires an alternating buy/sell every closed bar so the full
+// TradingView → ingress → EA pipeline can be exercised without waiting for
+// a real combo entry. Never enable it on a live (enforced) license.
+testBuy  = testMode and bar_index % 2 == 0
+testSell = testMode and bar_index % 2 == 1
+
+if (buyEntry or testBuy) and featuresOk
     alert(buyMsg, alert.freq_once_per_bar_close)
-if sellEntry and featuresOk
+if (sellEntry or testSell) and featuresOk
     alert(sellMsg, alert.freq_once_per_bar_close)

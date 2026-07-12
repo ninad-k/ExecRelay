@@ -23,12 +23,14 @@ A BUY entry produces (a SELL entry is identical with `action:"sell"`):
 
 ```json
 {
-  "x_account": "default",
+  "license_id": "60123456789",
+  "secret": "alert-secret",
   "action": "buy",
   "symbol": "BTCUSD",
-  "comment": "AlgoCombo",
   "volume": 0.1,
-  "use_xgb": true,
+  "sl": 0,
+  "tp": 0,
+  "comment": "AlgoCombo",
   "features": {
     "ret_1": 0.00012, "ret_3": 0.0003, "ret_12": 0.0009, "ret_36": 0.001,
     "ret_72": 0.002, "ret_288": 0.004, "range_pct": 0.001, "body_pct": 0.0004,
@@ -48,13 +50,18 @@ A BUY entry produces (a SELL entry is identical with `action:"sell"`):
 
 | Field | Type | Notes |
 |---|---|---|
-| `x_account` | string | Account / instance identifier |
+| `license_id` | string | ExecRelay license (script input) |
+| `secret` | string | Per-license alert secret (script input) — TradingView's only auth mechanism, so the license used for TV alerts must not require HMAC |
 | `action` | `"buy"` \| `"sell"` | Maps to predictor `direction`: buy → `1`, sell → `-1` |
 | `symbol` | string | TradingView ticker (server applies broker symbol mapping) |
-| `comment` | string | Strategy tag — isolates strategies sharing a symbol/account |
 | `volume` | number | Lots |
-| `use_xgb` | bool | If `false`, the signal bypasses the ML filter entirely |
+| `sl` / `tp` | number | Stop loss / take profit (0 = none) |
+| `comment` | string | Strategy tag — isolates strategies sharing a symbol/account |
 | `features` | object | The 35 model features below |
+
+The script also has a **TEST MODE** input that fires an alternating buy/sell
+alert every closed bar — for exercising the pipeline end-to-end without
+waiting for a real combo entry. Never enable it on a live (enforced) license.
 
 ### The 35 features
 
