@@ -36,6 +36,17 @@ to scrape every app service plus:
 | `ingress_rejections_total` | counter | `reason` | Why webhooks were rejected. Values: `perimeter_rejected`, `rate_limit_exceeded`, `ip_not_allowed`, `timestamp_rejected`, `license_rejected`, `secret_rejected`, `signature_rejected`, `plan_limit_exceeded`, `exposure_limit_exceeded`, `trading_halted`. |
 | `ingress_license_config_warnings` | gauge | `license_id`, `issue` | Set by `AuditLicenses()` at startup + SIGHUP. `issue` is `no_auth`, `no_hmac`, `no_secret`, or `rotation_active`. **`no_auth` is the high-priority one — license accepts unauthenticated webhooks.** |
 | `ingress_trading_halted` | gauge | — | Kill-switch state. `1` = halted, `0` = normal. |
+| `ingress_ml_webhook_requests_total` | counter | `outcome` (`accepted`, `skipped`, `fail_open`, `rejected`) | `POST /webhook/ml` (ADR 0008) requests by outcome. `fail_open` means the predictor call errored/timed out and the caller's original action was published unfiltered — never a rejection. `skipped` is an enforced `NOTHING` decision (nothing published). |
+| `ingress_ml_webhook_duration_seconds` | histogram | — | `/webhook/ml` request latency, including the synchronous `ml-predictor` call. Deliberately looser than the flat path's 95 ms SLO — callers opt into this. |
+| `ingress_ml_predictor_errors_total` | counter | — | Errors calling `ml-predictor`'s `/predict` (timeout, connection refused, non-2xx, malformed response). Every one of these fails open (see `outcome="fail_open"` above). |
+
+`/webhook/ml` is an opt-in JSON path that scores requests through `ml-predictor`
+before publishing a command (see [ADR 0008](adr/0008-opt-in-json-ml-webhook-path.md)
+and [`apps/ingress/internal/ingress/ml.go`](../apps/ingress/internal/ingress/ml.go)).
+It defaults to **shadow mode** (`ML_ENFORCE=false`): the model is scored and
+audited on every request, but the caller's original `buy`/`sell` action is
+always published until an operator flips `ML_ENFORCE=true`. It shares the
+same auth/gating chain as the flat `/webhook` path.
 
 ### `bridge`
 
@@ -90,6 +101,7 @@ to scrape every app service plus:
 | `ml_prediction_latency_seconds` | histogram | — | Time spent scoring a single `/predict` request (off the event loop; see `apps/ml-predictor/app.py`). |
 | `ml_prob_win` | histogram | — | Model win-probability output per prediction. |
 | `ml_model_loaded` | gauge | — | `1` if the XGBoost model loaded successfully at startup, else `0`. Drives `/readyz`. |
+| `ml_model_info` | gauge | `version` | Info-style gauge, always `1`, one series per currently-loaded model version (`XGBPredictor.model_version`). Join on `version` in dashboards/alerts to see which artifact is live, or to catch an unexpected version after a deploy. |
 
 ### `ml-feature-extractor`
 
@@ -119,6 +131,7 @@ Wire these in `infra/prometheus/alert_rules.yml` (and route them in
 | **BridgeLagGrowing** | `delta(bridge_consumer_lag_pending[10m]) > 1000` | Bridge is falling behind ingress; queue is growing. |
 | **DXTradeCircuitOpen** | `increase(dxtrade_circuit_breaker_trips_total[5m]) > 0` | Broker is upstream-broken; trades will fail. |
 | **PostgresDown** | `pg_up == 0` | All cold-path services break shortly after. |
+| **MLModelNotLoaded** | `ml_model_loaded == 0` for 5m | The filter service is up (scrapeable) but scoring nothing — every `/predict` call 503s and every `/webhook/ml` call fails open. |
 
 ### Warning — Slack / email
 
@@ -128,6 +141,10 @@ Wire these in `infra/prometheus/alert_rules.yml` (and route them in
 | **PendingHmacRotation** | `ingress_license_config_warnings{issue="rotation_active"} == 1` for 24h | Customer started HMAC rotation but didn't finish it. |
 | **PostgresHighConnections** | `pg_stat_database_numbackends > 80` | Connection pool exhaustion incoming. |
 | **PersistFallingBehind** | (NATS pending grows over 10m) | persist hasn't kept up; fills aren't being recorded. |
+| **MLPredictorErrorRate** | error share of `ml_prediction_errors_total` vs. total `/predict` attempts `> 5%` for 10m | The model is up but a rising share of requests are failing (bad payload, feature-contract drift, inference errors). |
+| **MLIngressFailOpen** | `sum(rate(ingress_ml_webhook_requests_total{outcome="fail_open"}[5m])) > 0` for 10m | Trades are bypassing the filter because `ml-predictor` is unreachable/erroring — the ML gate is silently a no-op. |
+| **MLModelVersionChanged** | new `version` label appears on `ml_model_info` vs. 15m ago | A model swap should be a known, deliberate event, not a surprise found by dashboard. Informational — confirm it was an intended deploy. |
+| **MLProbWinDistributionShift** | median (`histogram_quantile(0.5, ...)`) of `ml_prob_win` over 1h `< 0.1` or `> 0.9` | Feature-contract drift symptom — the model's output has collapsed to one extreme, most likely a mismatched or missing feature vector rather than a genuine regime shift. |
 
 ### Informational — no page, dashboard only
 
