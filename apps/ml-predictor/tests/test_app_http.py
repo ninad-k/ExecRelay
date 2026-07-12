@@ -23,8 +23,12 @@ class _StubPredictor:
     """Stands in for XGBPredictor so /predict tests don't need real model
     inference -- the decision returned by .predict() is pinned per test."""
 
-    def __init__(self, decision: dict):
+    def __init__(self, decision: dict, model_version: str = "stub00000000"):
         self._decision = decision
+        # Real XGBPredictor always exposes model_version; app.py reads it
+        # off the global `predictor` for request-parsing errors that never
+        # reach .predict(), so the stub needs it too.
+        self.model_version = model_version
 
     def predict(self, payload, current_position=None):
         return dict(self._decision)
@@ -145,6 +149,7 @@ def test_predict_happy_path_with_monkeypatched_decision(app_module):
         "action_summary": "OPEN_LONG",
         "reason": "ok",
         "timestamp": "2026-01-01T00:00:00+00:00",
+        "model_version": "abc123def456",
         "error": None,
     }
     app_module.predictor = _StubPredictor(decision)
@@ -154,18 +159,21 @@ def test_predict_happy_path_with_monkeypatched_decision(app_module):
     parsed = _body(resp)
     assert parsed["action_summary"] == "OPEN_LONG"
     assert parsed["prob_win"] == 0.8123
+    assert parsed["model_version"] == "abc123def456"
 
 
 def test_predict_decision_error_returns_400(app_module):
     decision = {
         "error": "direction must be 1 or -1, got 0",
         "action_summary": "NOTHING",
+        "model_version": "abc123def456",
     }
     app_module.predictor = _StubPredictor(decision)
     body = json.dumps({"direction": 0, "features": {}}).encode()
     resp = _run(_request(app_module, _predict_request(body)))
     assert "400" in _status(resp)
     assert _body(resp)["error"]
+    assert _body(resp)["model_version"] == "abc123def456"
 
 
 def test_predict_invalid_json_returns_400(app_module):
@@ -173,6 +181,7 @@ def test_predict_invalid_json_returns_400(app_module):
     resp = _run(_request(app_module, _predict_request(b"{not valid json")))
     assert "400" in _status(resp)
     assert "invalid JSON" in _body(resp)["error"]
+    assert _body(resp)["model_version"] == "stub00000000"
 
 
 def test_predict_oversized_body_returns_413(app_module):
@@ -185,6 +194,7 @@ def test_predict_oversized_body_returns_413(app_module):
     resp = _run(_request(app_module, raw))
     assert "413" in _status(resp)
     assert "too large" in _body(resp)["error"]
+    assert _body(resp)["model_version"] == "stub00000000"
 
 
 def test_predict_bad_content_length_returns_400(app_module):
@@ -193,6 +203,7 @@ def test_predict_bad_content_length_returns_400(app_module):
     resp = _run(_request(app_module, raw))
     assert "400" in _status(resp)
     assert "Content-Length" in _body(resp)["error"]
+    assert _body(resp)["model_version"] == "stub00000000"
 
 
 def test_predict_negative_content_length_returns_400(app_module):
@@ -201,6 +212,7 @@ def test_predict_negative_content_length_returns_400(app_module):
     resp = _run(_request(app_module, raw))
     assert "400" in _status(resp)
     assert "Content-Length" in _body(resp)["error"]
+    assert _body(resp)["model_version"] == "stub00000000"
 
 
 def test_predict_when_predictor_not_loaded_returns_503(app_module):
@@ -209,6 +221,19 @@ def test_predict_when_predictor_not_loaded_returns_503(app_module):
     resp = _run(_request(app_module, _predict_request(body)))
     assert "503" in _status(resp)
     assert "model not loaded" in _body(resp)["error"]
+    # No predictor is loaded, so there's no model_version to attach.
+    assert "model_version" not in _body(resp)
+
+
+def test_metrics_endpoint_exposes_model_info_gauge(app_module):
+    # ml_model_info has a `version` label, so prometheus_client only emits a
+    # sample once a child series has been created -- simulate what main()
+    # does at startup.
+    app_module.ml_model_info.labels(version="stub00000000").set(1)
+    resp = _run(_request(app_module, b"GET /metrics HTTP/1.1\r\n\r\n"))
+    assert "200" in _status(resp)
+    assert b"ml_model_info" in resp
+    assert b'version="stub00000000"' in resp
 
 
 # ---- misc ------------------------------------------------------------------

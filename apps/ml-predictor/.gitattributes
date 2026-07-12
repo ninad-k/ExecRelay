@@ -1,0 +1,10 @@
+# feature_order.txt and its checksum manifest are hashed byte-for-byte by
+# model/SHA256SUMS (verified in the Dockerfile via `sha256sum -c` and by
+# tests/test_checksums.py). Without a fixed eol, this repo's
+# core.autocrlf=true on Windows checkouts would give these files CRLF line
+# endings while Linux CI (ubuntu-latest, no autocrlf conversion) checks out
+# the LF blob -- making the recorded checksums platform-dependent instead of
+# a stable fact about the artifact. Pin both to LF, matching the repo-root
+# convention for other platform-sensitive text files.
+model/feature_order.txt text eol=lf
+model/SHA256SUMS        text eol=lf

@@ -62,6 +62,12 @@ prob_win = Histogram(
     buckets=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
 )
 model_loaded = Gauge("ml_model_loaded", "1 if the model loaded successfully else 0")
+# Info-style gauge: one time series per loaded model_version, always set to 1.
+# Lets dashboards/alerts join on `version` to see which artifact is live
+# (and catch an unexpected version showing up after a deploy).
+ml_model_info = Gauge(
+    "ml_model_info", "Metadata about the loaded model (always 1)", ["version"]
+)
 
 # Global model state
 predictor: XGBPredictor | None = None
@@ -79,6 +85,17 @@ def _json_response(status_line: bytes, obj: dict) -> bytes:
     )
 
 
+def _predict_error_response(status_line: bytes, obj: dict) -> bytes:
+    """Build a /predict error response, tagging it with model_version when a
+    predictor is loaded. Covers request-parsing failures (bad Content-Length,
+    oversized body, invalid JSON) that never reach predictor.predict() --
+    that method already stamps model_version on its own result dict for
+    every path (success or error) it returns."""
+    if predictor is not None:
+        obj = {**obj, "model_version": predictor.model_version}
+    return _json_response(status_line, obj)
+
+
 async def handle_predict(reader) -> bytes:
     """Read the POST body and return an HTTP response with the decision."""
     content_length = 0
@@ -93,7 +110,7 @@ async def handle_predict(reader) -> bytes:
                     content_length = int(val.strip())
                 except ValueError:
                     prediction_errors.inc()
-                    return _json_response(
+                    return _predict_error_response(
                         b"HTTP/1.1 400 Bad Request\r\n",
                         {
                             "error": "invalid Content-Length",
@@ -102,7 +119,7 @@ async def handle_predict(reader) -> bytes:
                     )
                 if content_length < 0:
                     prediction_errors.inc()
-                    return _json_response(
+                    return _predict_error_response(
                         b"HTTP/1.1 400 Bad Request\r\n",
                         {
                             "error": "invalid Content-Length",
@@ -115,7 +132,7 @@ async def handle_predict(reader) -> bytes:
         # Do NOT readexactly() an attacker-controlled/oversized length -- the
         # response below signals the client to stop, and the connection is
         # closed by the caller right after; no need to drain first.
-        return _json_response(
+        return _predict_error_response(
             b"HTTP/1.1 413 Payload Too Large\r\n",
             {"error": "request body too large", "action_summary": "NOTHING"},
         )
@@ -126,7 +143,7 @@ async def handle_predict(reader) -> bytes:
         payload = json.loads(body.decode())
     except json.JSONDecodeError as exc:
         prediction_errors.inc()
-        return _json_response(
+        return _predict_error_response(
             b"HTTP/1.1 400 Bad Request\r\n",
             {"error": f"invalid JSON: {exc}", "action_summary": "NOTHING"},
         )
@@ -226,6 +243,7 @@ async def main():
     try:
         predictor = XGBPredictor(MODEL_PATH, FEATURE_ORDER_PATH, threshold=THRESHOLD)
         model_loaded.set(1)
+        ml_model_info.labels(version=predictor.model_version).set(1)
     except Exception as exc:  # noqa: BLE001
         # Stay up and serve /metrics + a 503 /health so the failure is observable
         # rather than crash-looping silently.
