@@ -30,10 +30,8 @@ RESPONSE=$(curl -s -X POST \
 
 if echo "$RESPONSE" | grep -q "accepted"; then
   TRACE_ID=$(echo "$RESPONSE" | grep -o '"trace_id":"[^"]*"' | head -1 | cut -d'"' -f4)
-  ML_CONF=$(echo "$RESPONSE" | grep -o '"ml_confidence":"[^"]*"' | head -1 | cut -d'"' -f4)
   echo "  ✓ Signal accepted"
   echo "  ✓ Trace ID: $TRACE_ID"
-  echo "  ✓ ML Confidence: $ML_CONF"
 else
   echo "  ✗ Signal rejected"
   echo "$RESPONSE"

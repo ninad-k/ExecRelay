@@ -27,13 +27,16 @@ non-trivial:
    35-key object has no representation in that scheme, and JSON commas would
    break field-splitting.
 
-2. **A vestigial ML call already exists on the hot path.** `scoreSignalWithML`
-   ([`risk.go`](../../apps/ingress/internal/ingress/risk.go)) POSTs 7 hardcoded
-   placeholder features to `ml-predictor:8080/predict`, expects `{confidence}`,
-   and **never uses the result for gating** — it is only logged and echoed as
-   `ml_confidence` in the response. The XGBoost transplant changed `/predict`'s
-   contract, so this call now mismatches (it degrades gracefully to a default;
-   nothing is gated on it).
+2. **A vestigial ML call used to exist on the hot path.** `scoreSignalWithML`
+   ([`risk.go`](../../apps/ingress/internal/ingress/risk.go)) POSTed 7
+   hardcoded placeholder features to `ml-predictor:8080/predict`, expected
+   `{confidence}`, and **never used the result for gating** — it was only
+   logged and echoed as `ml_confidence` in the response. The XGBoost
+   transplant changed `/predict`'s contract (7-field payload now 400s, and
+   the response has no `confidence` field), so this call mismatched and was
+   polluting `ml_prediction_errors_total` on every flat webhook. **This has
+   already been removed** (ahead of `/webhook/ml` below landing) — see
+   Decision.
 
 ### Options considered for carrying features
 
@@ -97,11 +100,13 @@ ExecRelay holds that the EA is the execution authority, so server-side sourcing
 of position state (from bridge/EA reports or `account_positions`) is deferred to
 a follow-up — see Notes.
 
-**Retire the vestigial `scoreSignalWithML`.** Remove the placeholder 7-feature
-call, the `MLPredictRequest`/`MLPredictResponse` types, and the `ml_confidence`
-response field from the flat path. It never gated anything and now mismatches the
-predictor contract; removing it also drops a blocking HTTP call from the hot
-path, consistent with the 95 ms / no-DB-on-hot-path posture.
+**Retire the vestigial `scoreSignalWithML`.** *(Already landed, ahead of
+`/webhook/ml` itself — see Status.)* The placeholder 7-feature call, the
+`MLPredictRequest`/`MLPredictResponse` types, and the `ml_confidence` response
+field have been removed from the flat path. It never gated anything and had
+started mismatching the predictor contract; removing it also drops a blocking
+HTTP call from the hot path, consistent with the 95 ms / no-DB-on-hot-path
+posture.
 
 ## Consequences
 
@@ -119,8 +124,8 @@ path, consistent with the 95 ms / no-DB-on-hot-path posture.
   sharing the preamble helper).
 - `/webhook/ml` makes a **synchronous** predictor call, so its latency profile is
   deliberately looser than the flat path's 95 ms target. Callers opt into that.
-- Removing `ml_confidence` from the flat response is a (minor) response-shape
-  change for any client reading it.
+- Removing `ml_confidence` from the flat response (already done) was a
+  (minor) response-shape change for any client reading it.
 - The TradingView side must send `license_id`/`secret` (adapter or updated Pine),
   rather than the legacy `x_account` shape.
 

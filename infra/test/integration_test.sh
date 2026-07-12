@@ -49,9 +49,7 @@ RESPONSE_BODY=$(echo "$RESPONSE" | head -1)
 
 if [ "$HTTP_CODE" = "200" ]; then
   TRACE_ID=$(echo "$RESPONSE_BODY" | grep -o '"trace_id":"[^"]*"' | cut -d'"' -f4)
-  ML_CONFIDENCE=$(echo "$RESPONSE_BODY" | grep -o '"ml_confidence":"[^"]*"' | cut -d'"' -f4)
   echo "  ✓ Signal accepted with trace_id: $TRACE_ID"
-  echo "  ✓ ML confidence score: $ML_CONFIDENCE"
 else
   echo "  ✗ Signal rejected (HTTP $HTTP_CODE)"
 fi
@@ -96,7 +94,7 @@ echo "[6/6] Testing Prometheus metrics..."
 echo "  ✓ Ingress metrics: signals_accepted_total, rejections_total"
 echo "  ✓ Bridge metrics: commands_processed_total, circuit_breaker_trips_total"
 echo "  ✓ Risk metrics: fills_processed_total, breaches_detected_total"
-echo "  ✓ ML metrics: predictions_made_total, model_accuracy"
+echo "  ✓ ML metrics: ml_predictions_total, ml_prediction_errors_total, ml_prob_win"
 echo "  ✓ Backtester metrics: backtests_completed_total"
 echo ""
 

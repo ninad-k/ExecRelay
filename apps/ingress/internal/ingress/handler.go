@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -495,12 +494,6 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("trace ID assigned", "trace_id", traceID, "license", parsed.LicenseID)
 	}
 
-	// Score signal with ML model (Phase 8)
-	mlConfidence, _ := h.scoreSignalWithML(r.Context(), parsed.Symbol, h.now().Unix())
-	if h.debug {
-		slog.Debug("ML scoring completed", "trace_id", traceID, "symbol", parsed.Symbol, "confidence", mlConfidence)
-	}
-
 	wire := signalProto(parsed, record, h.region, traceID, body, h.now())
 	payload, err := oldproto.Marshal(wire)
 	if err != nil {
@@ -533,7 +526,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 
 	wctx.reasonCode = "accepted"
 	w.Header().Set("X-ExecRelay-Trace-ID", traceID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID, "ml_confidence": fmt.Sprintf("%.3f", mlConfidence)})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "trace_id": traceID})
 }
 
 // webhookRecorder lets the deferred request-log publisher know the final
