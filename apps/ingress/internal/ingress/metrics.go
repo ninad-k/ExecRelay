@@ -35,6 +35,23 @@ var (
 		Name: "ingress_trading_halted",
 		Help: "Kill-switch state. 1 = all webhooks are rejected with trading_halted; 0 = normal operation.",
 	})
+
+	// ML webhook (ADR 0008) metrics.
+	mlWebhookRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ingress_ml_webhook_requests_total",
+		Help: "Total /webhook/ml requests by outcome: accepted, skipped (NOTHING in enforce mode), fail_open (predictor down/erroring), rejected (auth/parse failure).",
+	}, []string{"outcome"})
+
+	mlWebhookDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ingress_ml_webhook_duration_seconds",
+		Help:    "/webhook/ml request latency, including the synchronous ml-predictor call.",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	mlPredictorErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ingress_ml_predictor_errors_total",
+		Help: "Total errors calling ml-predictor's /predict endpoint (timeout, connection refused, non-2xx, malformed response). Each of these fails open.",
+	})
 )
 
 func reportTradingHalted(halted bool) {
@@ -67,18 +84,30 @@ func (r *statusRecorder) WriteHeader(code int) {
 
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/webhook" {
+		switch r.URL.Path {
+		case "/webhook":
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			start := time.Now()
+			next.ServeHTTP(rec, r)
+			webhookDuration.Observe(time.Since(start).Seconds())
+			webhookRequests.WithLabelValues(strconv.Itoa(rec.status)).Inc()
+		case "/webhook/ml":
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			start := time.Now()
+			next.ServeHTTP(rec, r)
+			mlWebhookDuration.Observe(time.Since(start).Seconds())
+		default:
 			next.ServeHTTP(w, r)
-			return
 		}
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		start := time.Now()
-		next.ServeHTTP(rec, r)
-		webhookDuration.Observe(time.Since(start).Seconds())
-		webhookRequests.WithLabelValues(strconv.Itoa(rec.status)).Inc()
 	})
 }
 
 func recordRejection(reason string) {
 	webhookRejections.WithLabelValues(reason).Inc()
+}
+
+// recordMLOutcome increments the /webhook/ml outcome counter. Outcome is one
+// of: accepted, skipped, fail_open, rejected.
+func recordMLOutcome(outcome string) {
+	mlWebhookRequests.WithLabelValues(outcome).Inc()
 }

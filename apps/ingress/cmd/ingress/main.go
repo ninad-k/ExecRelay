@@ -61,18 +61,26 @@ func main() {
 	logLicenseAudit(cfg.Licenses)
 
 	handler := ingress.NewHandler(ingress.Options{
-		Store:           licenseStore,
-		Publisher:       publisher,
-		EventPublisher:  publisher,
-		Region:          cfg.Region,
-		MaxBodyBytes:    cfg.MaxBodyBytes,
-		TimestampWindow: cfg.TimestampWindow,
-		RateLimit:       cfg.RateLimit,
-		AllowedCIDRs:    cfg.AllowedCIDRs,
-		PerimeterToken:  cfg.PerimeterToken,
-		TradingHalted:   cfg.TradingHalted,
-		Debug:           cfg.Debug,
+		Store:            licenseStore,
+		Publisher:        publisher,
+		EventPublisher:   publisher,
+		Region:           cfg.Region,
+		MaxBodyBytes:     cfg.MaxBodyBytes,
+		TimestampWindow:  cfg.TimestampWindow,
+		RateLimit:        cfg.RateLimit,
+		AllowedCIDRs:     cfg.AllowedCIDRs,
+		PerimeterToken:   cfg.PerimeterToken,
+		TradingHalted:    cfg.TradingHalted,
+		Debug:            cfg.Debug,
+		MLPredictorURL:   cfg.MLPredictorURL,
+		MLPredictTimeout: cfg.MLPredictTimeout,
+		MLEnforce:        cfg.MLEnforce,
 	})
+	if cfg.MLEnforce {
+		slog.Warn("ML_ENFORCE=true: /webhook/ml publishes the model's mapped command (not the caller's original action)")
+	} else {
+		slog.Info("ML_ENFORCE=false (default): /webhook/ml runs in shadow mode, always publishing the caller's original action")
+	}
 	if cfg.TradingHalted {
 		slog.Warn("kill switch ACTIVE at startup: all webhooks will be rejected with trading_halted until /admin/kill-switch?state=off is called")
 	}

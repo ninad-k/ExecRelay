@@ -1,7 +1,19 @@
 # 8. Opt-in JSON `/webhook/ml` path for ML-filtered signals
 
 Date: 2026-06-23
-Status: Proposed
+Status: Accepted (2026-07-12)
+
+> **v1 implementation note (2026-07-12).** `/webhook/ml` has landed in
+> `apps/ingress` per this ADR, with two additions beyond what's described
+> below: **shadow mode is the default** (`ML_ENFORCE=false`) — the handler
+> always authenticates, scores, and audits the request, but publishes the
+> caller's original `buy`/`sell` action until an operator explicitly flips
+> `ML_ENFORCE=true`; and **`current_position` falls back to a DB lookup**
+> against `account_positions` when the caller omits it (caller-supplied value
+> still always wins), rather than always being treated as unauthoritative.
+> See [`docs/api/ingress.md`](../api/ingress.md#post-webhookml) for the
+> request/response contract and the `ml_decisions` audit table
+> (`infra/migrations/000006_ml_decisions.up.sql`).
 
 ## Context
 
@@ -131,13 +143,18 @@ posture.
 
 ## Notes / follow-ups
 
-- **EA-sourced `current_position`.** Replace the caller-declared field by
-  resolving open position state from the EA/bridge fill stream or
-  `account_positions`, so the Option-1 close/flip logic is authoritative.
+- **EA-sourced `current_position`.** *(Partially landed.)* v1 resolves
+  `current_position` from `account_positions` when the caller omits it
+  (caller value still wins when present). This is a snapshot read of the
+  same table `checkExposureLimits` already queries, not yet the EA/bridge
+  fill-stream itself — a live fill stream remains a follow-up if the DB
+  snapshot proves too stale for the Option-1 close/flip logic in practice.
 - **Coverage.** New endpoint needs Go tests to hold the 80% gate on shared
   packages: auth-reuse paths, each `action_summary` → command branch, the
   `NOTHING` skip, malformed-JSON and missing-features rejections, and the
-  predictor-down fallback.
-- This ADR is **Proposed**; it flips to **Accepted** when `/webhook/ml` lands.
-  Implementation was designed but not built in the originating session because no
-  Go toolchain was available there to compile/test it.
+  predictor-down fallback. *(Landed — see `apps/ingress/internal/ingress/ml_test.go`;
+  the 80% gate itself is currently disabled for ingress/bridge/dxtrade in CI,
+  see `.github/workflows/reusable-go-app.yml`.)*
+- This ADR flipped to **Accepted** on 2026-07-12 when `/webhook/ml` landed
+  (shadow mode default-off enforcement + DB-based `current_position`
+  fallback, per the v1 implementation note above).
