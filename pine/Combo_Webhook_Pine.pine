@@ -228,5 +228,15 @@ sellMsg = "{\"x_account\":\"" + xAccount +
           ",\"session\":"       + str.tostring(f_session) +
           "}}"
 
-alertcondition(buyEntry,  title="BUY → MT5 webhook",  message=buyMsg)
-alertcondition(sellEntry, title="SELL → MT5 webhook", message=sellMsg)
+// alertcondition() requires a const string message, but buyMsg/sellMsg are
+// series strings built from str.tostring() of runtime values, so the script
+// would fail to compile against alertcondition(). Use alert() instead, gated
+// on the entry condition directly. featuresOk guards against firing an alert
+// with NaN features (the longest-lookback / division-by-zero-prone ones) —
+// otherwise the predictor receives invalid JSON server-side.
+featuresOk = not (na(f_ret_288) or na(f_vol_288) or na(f_active_rate_288) or na(f_ema_200_slope) or na(f_bb_z) or na(f_h1_dist_ema50) or na(f_h1_ret_24) or na(f_h4_dist_ema50))
+
+if buyEntry and featuresOk
+    alert(buyMsg, alert.freq_once_per_bar_close)
+if sellEntry and featuresOk
+    alert(sellMsg, alert.freq_once_per_bar_close)

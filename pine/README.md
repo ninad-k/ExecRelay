@@ -107,5 +107,19 @@ request contract, the decision→command table, and the design rationale, and
 
 1. Add the indicator to a chart on the timeframe the model was trained for.
 2. Set the **Webhook** inputs: `x_account`, strategy tag, volume, and `use_xgb`.
-3. Create an alert on the "BUY → webhook" / "SELL → webhook" conditions with the
-   ExecRelay ingress webhook URL as the alert's webhook target.
+3. Create the alert with condition **"Any alert() function call"** (not the
+   old per-condition `alertcondition()` entries) and set the ExecRelay ingress
+   webhook URL as the alert's webhook target. The script calls `alert()`
+   directly from the buy/sell entry logic rather than using
+   `alertcondition()`, because the message is a series string (built with
+   `str.tostring()` of runtime values) and `alertcondition()` only accepts a
+   const string.
+
+   Notes:
+   - Messages fire with `alert.freq_once_per_bar_close`, i.e. once per bar
+     close — no intrabar repaint.
+   - A built-in na-guard skips the alert (on both buy and sell) until enough
+     history exists for every feature, including the longest-lookback ones
+     (`ret_288`, `vol_288`, `active_rate_288`, `ema_200_slope`, `bb_z`,
+     `h1_dist_ema50`, `h1_ret_24`, `h4_dist_ema50`) — this avoids ever sending
+     NaN features, which the predictor would otherwise reject as invalid JSON.
