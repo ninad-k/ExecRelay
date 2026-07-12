@@ -20,9 +20,9 @@ jobs:
   test-and-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: ${{ inputs.has_requirements && 'pip' || '' }}
@@ -77,7 +77,7 @@ jobs:
       #     APP: ${{ inputs.app_name }}
       #   run: pytest "apps/${APP}" --cov="apps/${APP}" --cov-fail-under=80 -q
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Docker build
         env:
