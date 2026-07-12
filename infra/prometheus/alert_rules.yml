@@ -101,3 +101,64 @@ groups:
         annotations:
           summary: "Task timeout rate exceeds 2%"
           description: "Timeout rate is {{ $value | humanizePercentage }} (threshold: 2%)"
+
+  - name: exec_relay_ml_pipeline
+    interval: 30s
+    rules:
+      - alert: MLModelNotLoaded
+        expr: ml_model_loaded == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: ml-predictor
+        annotations:
+          summary: "ml-predictor has no model loaded"
+          description: "ml_model_loaded has been 0 for 5m on {{ $labels.instance }} -- /predict is 503ing and every /webhook/ml call is failing open. The filter service is up but scoring nothing."
+
+      - alert: MLPredictorErrorRate
+        expr: |
+          (
+            sum(rate(ml_prediction_errors_total[5m]))
+            /
+            clamp_min(sum(rate(ml_predictions_total[5m])) + sum(rate(ml_prediction_errors_total[5m])), 1e-9)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: ml-predictor
+        annotations:
+          summary: "ml-predictor /predict error rate exceeds 5%"
+          description: "{{ $value | humanizePercentage }} of /predict attempts are erroring over the last 5m (threshold: 5%). Check for bad payloads, feature-contract drift, or model load issues."
+
+      - alert: MLIngressFailOpen
+        expr: sum(rate(ingress_ml_webhook_requests_total{outcome="fail_open"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: ingress
+        annotations:
+          summary: "/webhook/ml is failing open"
+          description: "ingress_ml_webhook_requests_total{outcome=\"fail_open\"} has been firing for 10m -- ml-predictor is unreachable or erroring, so trades are bypassing the ML filter and publishing the caller's original action unfiltered."
+
+      - alert: MLModelVersionChanged
+        expr: count(ml_model_info unless ml_model_info offset 15m) > 0
+        for: 0m
+        labels:
+          severity: info
+          service: ml-predictor
+        annotations:
+          summary: "ml-predictor model version changed"
+          description: "A new ml_model_info{version=\"...\"} series appeared that wasn't present 15m ago -- a model swap happened. Confirm this was an intended deploy, not an unexpected artifact rollback/rollout."
+
+      - alert: MLProbWinDistributionShift
+        expr: |
+          histogram_quantile(0.5, sum(rate(ml_prob_win_bucket[1h])) by (le)) < 0.1
+          or
+          histogram_quantile(0.5, sum(rate(ml_prob_win_bucket[1h])) by (le)) > 0.9
+        for: 1h
+        labels:
+          severity: warning
+          service: ml-predictor
+        annotations:
+          summary: "ml_prob_win median has collapsed to an extreme"
+          description: "Median prob_win over the last hour is {{ $value | humanizePercentage }}, outside the healthy 0.1-0.9 band. Likely symptom of feature-contract drift (mismatched or missing features) rather than a genuine regime shift."

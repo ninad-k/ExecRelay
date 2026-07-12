@@ -323,3 +323,23 @@ externalSecrets:
   enabled: false
   backendType: aws-secrets-manager
   region: us-east-1
+
+networkPolicy:
+  # Restrict who can reach ml-predictor's intentionally-unauthenticated
+  # /predict endpoint (see docs/threat-model.md) to the ingress pods only.
+  # Default false so upgrading the chart never breaks an existing install
+  # whose CNI/cluster hasn't been reviewed for NetworkPolicy support --
+  # flip to true once you've confirmed your CNI enforces NetworkPolicy
+  # objects (e.g. Calico, Cilium; the AWS VPC CNI needs Calico or
+  # Cilium add-on installed to enforce these at all).
+  enabled: false
+  mlPredictor:
+    # Add a second ingress rule allowing a Prometheus instance outside this
+    # chart's namespace to scrape ml-predictor's /metrics. Only applied when
+    # networkPolicy.enabled is also true. The selector defaults below match
+    # a typical kube-prometheus-stack install; override to match yours.
+    allowPrometheusScrape: false
+    prometheusNamespaceSelector:
+      kubernetes.io/metadata.name: monitoring
+    prometheusPodSelector:
+      app.kubernetes.io/name: prometheus
