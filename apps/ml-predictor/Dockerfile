@@ -14,6 +14,10 @@ COPY apps/ml-predictor/app.py ./app.py
 COPY apps/ml-predictor/xgb_predictor.py ./xgb_predictor.py
 COPY apps/ml-predictor/model/ ./model/
 
+# Fail the build if the shipped artifacts don't match their recorded
+# checksums (e.g. a model swap that forgot to update model/SHA256SUMS).
+RUN cd model && sha256sum -c SHA256SUMS
+
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health').read()"
 
