@@ -74,6 +74,20 @@ wait_http() { # name, url, tries
     return 1
 }
 
+wait_tcp() { # name, port, tries — services with no HTTP endpoint (NATS)
+    local name="$1" port="$2" tries="${3:-30}"
+    for _ in $(seq 1 "$tries"); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            exec 3>&- 3<&-
+            echo "  $name: accepting connections (:$port)"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "  $name: FAILED to accept connections (:$port) — check logs in $LOGS" >&2
+    return 1
+}
+
 cmd_start() {
     mkdir -p "$BIN" "$LOGS" "$PIDS"
     local nats
@@ -86,6 +100,8 @@ cmd_start() {
     echo "starting stack..."
     start_one "nats" "$LOGS/nats.log" "$PIDS/nats.pid" \
         "$nats" -js -p "$NATS_PORT"
+    # ingress/bridge exit immediately if NATS isn't accepting yet — wait first.
+    wait_tcp "nats" "$NATS_PORT"
 
     (cd "$ROOT/apps/ml-predictor" && HTTP_PORT="$PREDICTOR_PORT" DEBUG=false \
         python app.py >"$LOGS/ml-predictor.log" 2>&1 & echo $! >"$PIDS/ml-predictor.pid")

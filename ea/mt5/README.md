@@ -66,6 +66,7 @@ See [`docs/customer/webhook-integration.md#supported-commands`](../../docs/custo
 
 ## See also
 
+- [`docs/development/demo-e2e-test.md`](../../docs/development/demo-e2e-test.md) — local demo-account E2E test (includes a Python shim that stands in for this EA)
 - [`docs/customer/webhook-integration.md`](../../docs/customer/webhook-integration.md) — full end-to-end customer guide
 - [`docs/runbooks/fills-not-arriving.md`](../../docs/runbooks/fills-not-arriving.md) — when signals are accepted but fills don't land
 - [`ea/mt4/README.md`](../mt4/README.md) — MT4 equivalent (requires DLL)
