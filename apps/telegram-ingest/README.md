@@ -25,7 +25,13 @@ SL @ 4119
 TP @ 4089
 ```
 
-- First line → market order (`sell`), `SL`/`TP` attached as absolute prices.
+- First line → by default a pending **limit order at the stated entry
+  price** (`TELEGRAM_INGEST_ENTRY_MODE=limit`); set `market` to execute the
+  first leg immediately instead. `SL`/`TP` attached as absolute prices.
+  Note: brokers reject a limit order on the wrong side of the current
+  market price (e.g. a buy limit above market), so in limit mode a signal
+  quoted at a worse-than-market entry is rejected by the broker rather
+  than chased.
 - `SECOND <side> LIMIT|STOP @ <price>` (the `SECOND` prefix is optional) →
   pending order (`selllimit` etc.) with the same SL/TP.
 - Lot size is **never** taken from the message — it is fixed by
@@ -54,6 +60,7 @@ TP @ 4089
 | `TELEGRAM_INGEST_SECRET` | if license has one | — | Body-embedded alert secret |
 | `TELEGRAM_INGEST_WEBHOOK_URL` | no | `http://ingress:8080/webhook` | Add `?token=...` if a perimeter token is configured |
 | `TELEGRAM_INGEST_FIXED_LOT` | no | `0.01` | Lot size for every order this adapter places |
+| `TELEGRAM_INGEST_ENTRY_MODE` | no | `limit` | `limit` = first leg rests at the stated entry price; `market` = first leg executes immediately |
 | `TELEGRAM_INGEST_SYMBOL_MAP` | no | — | Channel jargon → canonical name, e.g. `GOLD=XAUUSD` (per-broker suffixes belong in the EA's `InpSymbolMap`) |
 | `TELEGRAM_INGEST_DRY_RUN` | no | **`true`** | Log commands instead of POSTing them |
 | `TELEGRAM_INGEST_COMMENT` | no | `tg-ingest` | Strategy tag on every order |

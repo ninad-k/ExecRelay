@@ -72,13 +72,22 @@ def test_parses_the_real_gold_message(app_module):
     }
 
 
-def test_builds_two_commands_with_fixed_lot_and_mapped_symbol(app_module):
+def test_builds_two_limit_commands_with_fixed_lot_and_mapped_symbol(app_module):
+    # Default entry mode is "limit": BOTH legs rest as pending limit orders.
     sig = app_module.parse_signal(GOLD_MESSAGE)
     cmds = app_module.build_commands(sig)
     assert cmds == [
-        "60123456789,sell,XAUUSD,vol_lots=0.01,sl=4119,tp=4089,comment=tg-ingest,secret=s3cret",
+        "60123456789,selllimit,XAUUSD,entry=4099,vol_lots=0.01,sl=4119,tp=4089,comment=tg-ingest,secret=s3cret",
         "60123456789,selllimit,XAUUSD,entry=4109,vol_lots=0.01,sl=4119,tp=4089,comment=tg-ingest,secret=s3cret",
     ]
+
+
+def test_market_entry_mode(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "ENTRY_MODE", "market")
+    sig = app_module.parse_signal(GOLD_MESSAGE)
+    cmds = app_module.build_commands(sig)
+    assert cmds[0].startswith("60123456789,sell,XAUUSD,vol_lots=0.01,")
+    assert cmds[1].startswith("60123456789,selllimit,XAUUSD,entry=4109,")
 
 
 def test_buy_signal_without_second_order(app_module):
@@ -86,7 +95,7 @@ def test_buy_signal_without_second_order(app_module):
     assert sig["side"] == "buy" and sig["second"] is None
     cmds = app_module.build_commands(sig)
     assert len(cmds) == 1
-    assert cmds[0].startswith("60123456789,buy,EURUSD,")
+    assert cmds[0].startswith("60123456789,buylimit,EURUSD,entry=1.085,")
 
 
 def test_non_signal_messages_return_none(app_module):

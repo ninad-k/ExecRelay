@@ -58,6 +58,11 @@ SYMBOL_MAP = {
     if "=" in pair
 }
 
+# How the signal's first entry is placed: "limit" (default) rests a pending
+# limit order at the stated entry price; "market" executes immediately at
+# market. The second entry is always pending at its own level.
+ENTRY_MODE = os.environ.get("TELEGRAM_INGEST_ENTRY_MODE", "limit").lower()
+
 # Safety default: log what WOULD be sent, send nothing.
 DRY_RUN = os.environ.get("TELEGRAM_INGEST_DRY_RUN", "true").lower() in (
     "true",
@@ -193,15 +198,22 @@ def _fmt(x: float) -> str:
 
 
 def build_commands(sig: dict) -> list[str]:
-    """Render a parsed signal as flat ExecRelay webhook command bodies —
-    one market order, plus one pending order when the signal has a second
-    entry. The fixed lot is deliberate: position sizing is configured here,
-    never taken from the channel message."""
+    """Render a parsed signal as flat ExecRelay webhook command bodies. In
+    the default "limit" entry mode BOTH legs rest as pending limit orders —
+    the first at the signal's stated entry price, the second at its own
+    level; "market" mode executes the first leg immediately instead. The
+    fixed lot is deliberate: position sizing is configured here, never taken
+    from the channel message."""
     symbol = SYMBOL_MAP.get(sig["symbol"], sig["symbol"])
     secret = f",secret={SECRET}" if SECRET else ""
     common = f"vol_lots={FIXED_LOT},sl={_fmt(sig['sl'])},tp={_fmt(sig['tp'])},comment={COMMENT}{secret}"
 
-    cmds = [f"{LICENSE_ID},{sig['side']},{symbol},{common}"]
+    if ENTRY_MODE == "market":
+        cmds = [f"{LICENSE_ID},{sig['side']},{symbol},{common}"]
+    else:
+        cmds = [
+            f"{LICENSE_ID},{sig['side']}limit,{symbol},entry={_fmt(sig['entry'])},{common}"
+        ]
     if sig["second"] is not None:
         cmd = f"{sig['side']}{sig['second']['kind']}"
         cmds.append(
