@@ -86,7 +86,7 @@ async def extract_signal_features(
                 """
                 SELECT COUNT(*) as count
                 FROM accepted_signals
-                WHERE license_id = $1 AND symbol = $2 AND created_at > now() - interval '7 days'
+                WHERE license_id = $1 AND symbol = $2 AND received_at > now() - interval '7 days'
                 """,
                 license_id,
                 symbol,
@@ -98,11 +98,12 @@ async def extract_signal_features(
             win_rate_row = await conn.fetchrow(
                 """
                 SELECT
-                    COUNT(CASE WHEN f.order_status = 'filled' THEN 1 END)::FLOAT /
+                    COUNT(CASE WHEN f.status = 'filled' THEN 1 END)::FLOAT /
                     NULLIF(COUNT(*), 0) * 100 as win_pct
                 FROM accepted_signals s
                 LEFT JOIN fills f ON s.id = f.signal_id
-                WHERE s.license_id = $1 AND s.symbol = $2 AND s.created_at > now() - interval '30 days'
+                    AND f.status <> 'placed'  -- interim row; terminal row follows
+                WHERE s.license_id = $1 AND s.symbol = $2 AND s.received_at > now() - interval '30 days'
                 """,
                 license_id,
                 symbol,

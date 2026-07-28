@@ -122,11 +122,16 @@ async def fills_summary(
     )
     counts: dict[str, int] = {r["status"]: r["cnt"] for r in rows}
     total = sum(counts.values())
+    # 'placed' is an interim pending-order state (the same trace produces a
+    # terminal 'filled'/'cancelled' row later) and a 'cancelled' pending never
+    # attempted execution — neither belongs in the fill-rate denominator.
+    attempts = total - counts.get("placed", 0) - counts.get("cancelled", 0)
     filled = counts.get("filled", 0)
-    fill_rate = round(filled / total * 100, 2) if total > 0 else 0.0
+    fill_rate = round(filled / attempts * 100, 2) if attempts > 0 else 0.0
     return {
         "window_hours": window_hours,
         "total": total,
+        "execution_attempts": attempts,
         "fill_rate_pct": fill_rate,
         "by_status": counts,
     }

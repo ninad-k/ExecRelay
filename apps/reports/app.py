@@ -228,9 +228,16 @@ async def _build_daily_signal_summary(
         fills_by_status = {r["status"]: r["cnt"] for r in rows}
 
     total_fills = sum(fills_by_status.values())
+    # Interim 'placed' rows and never-executed 'cancelled' pendings are not
+    # execution attempts; keep them out of the fill-rate denominator.
+    attempts = (
+        total_fills
+        - fills_by_status.get("placed", 0)
+        - fills_by_status.get("cancelled", 0)
+    )
     fill_rate = (
-        round(fills_by_status.get("filled", 0) / total_fills * 100, 2)
-        if total_fills > 0
+        round(fills_by_status.get("filled", 0) / attempts * 100, 2)
+        if attempts > 0
         else 0.0
     )
 
