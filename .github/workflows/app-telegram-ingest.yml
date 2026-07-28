@@ -1,0 +1,21 @@
+name: app-telegram-ingest
+
+on:
+  pull_request:
+    paths:
+      - 'apps/telegram-ingest/**'
+      - '.github/workflows/app-telegram-ingest.yml'
+      - '.github/workflows/reusable-python-app.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/telegram-ingest/**'
+      - '.github/workflows/app-telegram-ingest.yml'
+      - '.github/workflows/reusable-python-app.yml'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-app.yml
+    with:
+      app_name: telegram-ingest
+      has_requirements: true

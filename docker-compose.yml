@@ -301,6 +301,7 @@ services:
       NATS_URL: nats://${NATS_USER:-execrelay}:${NATS_PASS:-execrelay_nats_dev}@nats:4222
       INGRESS_URL: http://ingress:8080
       SIGNALS_STREAM: SIGNALS
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -321,6 +322,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-execrelay}:${POSTGRES_PASSWORD:-execrelay_dev_password}@postgres:5432/${POSTGRES_DB:-execrelay}
       RETENTION_DAYS: ${RETENTION_DAYS:-90}
       FILL_TIMEOUT_SECS: ${FILL_TIMEOUT_SECS:-30}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -328,6 +330,27 @@ services:
         condition: service_completed_successfully
     ports:
       - "8086:8080"
+
+  telegram-ingest:
+    profiles: ["ingest"]
+    build:
+      context: .
+      dockerfile: apps/telegram-ingest/Dockerfile
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      TELEGRAM_INGEST_BOT_TOKEN: ${TELEGRAM_INGEST_BOT_TOKEN:-}
+      TELEGRAM_INGEST_ALLOWED_CHAT_IDS: ${TELEGRAM_INGEST_ALLOWED_CHAT_IDS:-}
+      TELEGRAM_INGEST_LICENSE_ID: ${TELEGRAM_INGEST_LICENSE_ID:-}
+      TELEGRAM_INGEST_SECRET: ${TELEGRAM_INGEST_SECRET:-}
+      TELEGRAM_INGEST_WEBHOOK_URL: ${TELEGRAM_INGEST_WEBHOOK_URL:-http://ingress:8080/webhook}
+      TELEGRAM_INGEST_FIXED_LOT: ${TELEGRAM_INGEST_FIXED_LOT:-0.01}
+      TELEGRAM_INGEST_SYMBOL_MAP: ${TELEGRAM_INGEST_SYMBOL_MAP:-}
+      TELEGRAM_INGEST_DRY_RUN: ${TELEGRAM_INGEST_DRY_RUN:-true}
+    depends_on:
+      ingress:
+        condition: service_started
+    ports:
+      - "8089:8080"
 
   analytics:
     profiles: ["apps"]
