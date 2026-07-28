@@ -32,6 +32,10 @@ input int    InpHeartbeatMs   = 30000;         // Heartbeat interval ms (0 = dis
 // unmapped ("EURUSD" + ".r" -> "EURUSD.r").
 input string InpSymbolMap     = "";            // Symbol map "FROM=TO;FROM=TO"
 input string InpSymbolSuffix  = "";            // Suffix appended to unmapped symbols
+// When a pending order is rejected for being on the wrong side of the market
+// (err 129/130), execute at market instead; the order comment gets an "_M"
+// suffix so fallback entries are distinguishable in the account history.
+input bool   InpPendingFallbackMarket = true;  // Market fallback for wrong-side pendings
 
 int  g_handle        = -1;
 bool g_registered    = false;
@@ -360,7 +364,16 @@ void ExecuteSignal(const string traceID, const string cmd,
     double tp     = PDouble(params, "tp");
     double slPips = PDouble(params, "sl_pips");
     double tpPips = PDouble(params, "tp_pips");
+    // Flat-path signals canonicalize the pending entry as "entry_price";
+    // the JSON /webhook/ml path historically used "entry". Accept both.
     double entry  = PDouble(params, "entry");
+    if(entry == 0.0) entry = PDouble(params, "entry_price");
+
+    // The signal's strategy tag becomes the broker order comment (truncated
+    // to leave room for the "_M" fallback suffix within MT4's limit).
+    string cmt = JGetStr(params, "comment");
+    if(cmt == "") cmt = "ExecRelay";
+    if(StringLen(cmt) > 27) cmt = StringSubstr(cmt, 0, 27);
 
     double ask = MarketInfo(sym, MODE_ASK);
     double bid = MarketInfo(sym, MODE_BID);
@@ -375,7 +388,7 @@ void ExecuteSignal(const string traceID, const string cmd,
         if(vol <= 0.0) { SendFill(traceID, "rejected", "", "VOL_MISSING", "vol_lots required"); return; }
         int optype  = (cmd == "buy") ? OP_BUY : OP_SELL;
         double price = (cmd == "buy") ? ask : bid;
-        int ticket = OrderSend(sym, optype, vol, price, 3, sl, tp, "ExecRelay", InpMagicNumber, 0, clrNONE);
+        int ticket = OrderSend(sym, optype, vol, price, 3, sl, tp, cmt, InpMagicNumber, 0, clrNONE);
         if(ticket > 0) SendFill(traceID, "filled",   IntegerToString(ticket), "", "");
         else           SendFill(traceID, "error", "", IntegerToString(GetLastError()),
                                 "OrderSend failed err=" + IntegerToString(GetLastError()));
@@ -394,16 +407,37 @@ void ExecuteSignal(const string traceID, const string cmd,
             SendFill(traceID, "rejected", "", "PARAM_MISSING", "vol_lots and entry required");
             return;
         }
-        int ticket = OrderSend(sym, pendingType, vol, entry, 3, sl, tp, "ExecRelay", InpMagicNumber, 0, clrNONE);
+        int ticket = OrderSend(sym, pendingType, vol, entry, 3, sl, tp, cmt, InpMagicNumber, 0, clrNONE);
         if(ticket > 0)
         {
             // "placed" = pending order accepted by the broker, NOT executed.
             // The real fill is reported by CheckPendingActivations().
             SendFill(traceID, "placed", IntegerToString(ticket), "", "");
             TrackPending(ticket, traceID);
+            return;
         }
-        else SendFill(traceID, "error", "", IntegerToString(GetLastError()),
-                      "OrderSend pending failed err=" + IntegerToString(GetLastError()));
+        int pendErr = GetLastError();
+        if(InpPendingFallbackMarket && (pendErr == 129 || pendErr == 130))
+        {
+            // Wrong side of the market: execute at market instead, tag _M.
+            RefreshRates();
+            double mprice = isBuy ? MarketInfo(sym, MODE_ASK) : MarketInfo(sym, MODE_BID);
+            int mticket = OrderSend(sym, isBuy ? OP_BUY : OP_SELL, vol, mprice, 3,
+                                    sl, tp, cmt + "_M", InpMagicNumber, 0, clrNONE);
+            if(mticket > 0)
+            {
+                SendFill(traceID, "filled", IntegerToString(mticket), "",
+                         "pending wrong-side (err " + IntegerToString(pendErr) +
+                         "); executed at market (_M)");
+                return;
+            }
+            SendFill(traceID, "error", "", IntegerToString(GetLastError()),
+                     "pending err " + IntegerToString(pendErr) +
+                     "; market fallback failed err=" + IntegerToString(GetLastError()));
+            return;
+        }
+        SendFill(traceID, "error", "", IntegerToString(pendErr),
+                 "OrderSend pending failed err=" + IntegerToString(pendErr));
         return;
     }
 

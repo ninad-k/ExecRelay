@@ -24,6 +24,10 @@ input int    InpHeartbeatMs   = 30000;         // Heartbeat interval ms (0 = dis
 // unmapped ("EURUSD" + ".r" -> "EURUSD.r").
 input string InpSymbolMap     = "";            // Symbol map "FROM=TO;FROM=TO"
 input string InpSymbolSuffix  = "";            // Suffix appended to unmapped symbols
+// When a pending order is rejected for being on the wrong side of the market
+// (TRADE_RETCODE_INVALID_PRICE), execute at market instead; the order comment
+// gets an "_M" suffix so fallback entries are distinguishable in history.
+input bool   InpPendingFallbackMarket = true;  // Market fallback for wrong-side pendings
 
 int    g_socket        = INVALID_HANDLE;
 bool   g_registered    = false;
@@ -509,7 +513,16 @@ void ExecuteSignal(const string traceID, const string cmd,
     double tp     = PDouble(params, "tp");
     double slPips = PDouble(params, "sl_pips");
     double tpPips = PDouble(params, "tp_pips");
+    // Flat-path signals canonicalize the pending entry as "entry_price";
+    // the JSON /webhook/ml path historically used "entry". Accept both.
     double entry  = PDouble(params, "entry");
+    if(entry == 0.0) entry = PDouble(params, "entry_price");
+
+    // The signal's strategy tag becomes the broker order comment (truncated
+    // to leave room for the "_M" fallback suffix).
+    string cmt = JGetStr(params, "comment");
+    if(cmt == "") cmt = "ExecRelay";
+    if(StringLen(cmt) > 27) cmt = StringSubstr(cmt, 0, 27);
 
     double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
     double bid = SymbolInfoDouble(sym, SYMBOL_BID);
@@ -522,8 +535,8 @@ void ExecuteSignal(const string traceID, const string cmd,
     if(cmd == "buy" || cmd == "sell")
     {
         if(vol <= 0.0) { SendFill(traceID, "rejected", "", "VOL_MISSING", "vol_lots required"); return; }
-        bool ok = (cmd == "buy") ? g_trade.Buy(vol, sym, 0, sl, tp)
-                                 : g_trade.Sell(vol, sym, 0, sl, tp);
+        bool ok = (cmd == "buy") ? g_trade.Buy(vol, sym, 0, sl, tp, cmt)
+                                 : g_trade.Sell(vol, sym, 0, sl, tp, cmt);
         if(ok) SendFill(traceID, "filled", IntegerToString(g_trade.ResultOrder()), "", "");
         else   SendFill(traceID, "error",  "", IntegerToString(g_trade.ResultRetcode()),
                         g_trade.ResultRetcodeDescription());
@@ -538,17 +551,35 @@ void ExecuteSignal(const string traceID, const string cmd,
     if(otype != -1)
     {
         if(vol <= 0.0 || entry <= 0.0) { SendFill(traceID, "rejected", "", "PARAM_MISSING", "vol_lots and entry required"); return; }
-        if(g_trade.OrderOpen(sym, otype, vol, 0, entry, sl, tp))
+        if(g_trade.OrderOpen(sym, otype, vol, 0, entry, sl, tp, ORDER_TIME_GTC, 0, cmt))
         {
             // "placed" = pending order accepted by the broker, NOT executed.
             // The real fill is reported by CheckPendingActivations().
             ulong ticket = g_trade.ResultOrder();
             SendFill(traceID, "placed", IntegerToString((long)ticket), "", "");
             TrackPending(ticket, traceID);
+            return;
         }
-        else
+        uint pendRet = g_trade.ResultRetcode();
+        if(InpPendingFallbackMarket && pendRet == TRADE_RETCODE_INVALID_PRICE)
+        {
+            // Wrong side of the market: execute at market instead, tag _M.
+            bool mok = isBuy ? g_trade.Buy(vol, sym, 0, sl, tp, cmt + "_M")
+                             : g_trade.Sell(vol, sym, 0, sl, tp, cmt + "_M");
+            if(mok)
+            {
+                SendFill(traceID, "filled", IntegerToString(g_trade.ResultOrder()), "",
+                         "pending wrong-side (retcode " + IntegerToString(pendRet) +
+                         "); executed at market (_M)");
+                return;
+            }
             SendFill(traceID, "error", "", IntegerToString(g_trade.ResultRetcode()),
-                     g_trade.ResultRetcodeDescription());
+                     "pending retcode " + IntegerToString(pendRet) +
+                     "; market fallback failed: " + g_trade.ResultRetcodeDescription());
+            return;
+        }
+        SendFill(traceID, "error", "", IntegerToString(pendRet),
+                 g_trade.ResultRetcodeDescription());
         return;
     }
 

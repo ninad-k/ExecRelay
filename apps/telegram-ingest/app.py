@@ -212,12 +212,12 @@ def build_commands(sig: dict) -> list[str]:
         cmds = [f"{LICENSE_ID},{sig['side']},{symbol},{common}"]
     else:
         cmds = [
-            f"{LICENSE_ID},{sig['side']}limit,{symbol},entry={_fmt(sig['entry'])},{common}"
+            f"{LICENSE_ID},{sig['side']}limit,{symbol},entry_price={_fmt(sig['entry'])},{common}"
         ]
     if sig["second"] is not None:
         cmd = f"{sig['side']}{sig['second']['kind']}"
         cmds.append(
-            f"{LICENSE_ID},{cmd},{symbol},entry={_fmt(sig['second']['entry'])},{common}"
+            f"{LICENSE_ID},{cmd},{symbol},entry_price={_fmt(sig['second']['entry'])},{common}"
         )
     return cmds
 

@@ -36,6 +36,15 @@ INSTANCE_ID = os.environ.get("EA_SHIM_INSTANCE_ID", "test-instance")
 BRIDGE_TOKEN = os.environ.get("EA_SHIM_TOKEN", "test-bridge-token")
 MAGIC = int(os.environ.get("EA_SHIM_MAGIC", "20240101"))
 DEVIATION = 50
+# When a pending order is rejected for being on the wrong side of the market
+# (TRADE_RETCODE_INVALID_PRICE), execute at market instead, tagging the order
+# comment with "_M". Mirrors the EAs' InpPendingFallbackMarket input.
+PENDING_FALLBACK = os.environ.get("EA_SHIM_PENDING_FALLBACK", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
+)
 
 
 def log(*a):
@@ -72,7 +81,7 @@ def fnum(params, *keys, default=0.0):
     return default
 
 
-def send_market(action_type, symbol, volume, comment):
+def send_market(action_type, symbol, volume, comment, sl=0.0, tp=0.0):
     tick = mt5.symbol_info_tick(symbol)
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -86,6 +95,10 @@ def send_market(action_type, symbol, volume, comment):
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+    if sl > 0:
+        req["sl"] = sl
+    if tp > 0:
+        req["tp"] = tp
     res = mt5.order_send(req)
     if res is None:
         return None, f"order_send returned None: {mt5.last_error()}"
@@ -95,6 +108,31 @@ def send_market(action_type, symbol, volume, comment):
     if res.retcode != mt5.TRADE_RETCODE_DONE:
         return None, f"retcode={res.retcode} {res.comment}"
     return res, None
+
+
+def send_pending(pending_type, symbol, volume, entry, sl, tp, comment):
+    """Place a pending order. Returns (result, err, retcode)."""
+    req = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": symbol,
+        "volume": volume,
+        "type": pending_type,
+        "price": entry,
+        "magic": MAGIC,
+        "comment": (comment or "execrelay-shim")[:26],
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_RETURN,
+    }
+    if sl > 0:
+        req["sl"] = sl
+    if tp > 0:
+        req["tp"] = tp
+    res = mt5.order_send(req)
+    if res is None:
+        return None, f"order_send returned None: {mt5.last_error()}", -1
+    if res.retcode != mt5.TRADE_RETCODE_DONE:
+        return None, f"retcode={res.retcode} {res.comment}", res.retcode
+    return res, None, res.retcode
 
 
 def close_positions(symbol, pos_type):
@@ -132,38 +170,71 @@ def close_positions(symbol, pos_type):
     return closed, None
 
 
+# pending command -> (pending order type, market fallback order type)
+_PENDING_TYPES = {
+    "buylimit": ("ORDER_TYPE_BUY_LIMIT", "ORDER_TYPE_BUY"),
+    "selllimit": ("ORDER_TYPE_SELL_LIMIT", "ORDER_TYPE_SELL"),
+    "buystop": ("ORDER_TYPE_BUY_STOP", "ORDER_TYPE_BUY"),
+    "sellstop": ("ORDER_TYPE_SELL_STOP", "ORDER_TYPE_SELL"),
+}
+
+
 def execute(trace_id, command, symbol, params):
+    """Execute one signal. Returns (status, order_id, err) where status is
+    "filled" for executed orders, "placed" for resting pendings."""
     mt5.symbol_select(symbol, True)
     volume = fnum(params, "volume", "vol_lots", default=0.01)
     comment = params.get("comment", "execrelay-shim")
+    sl = fnum(params, "sl")
+    tp = fnum(params, "tp")
     cmd = command.lower()
     log(f"signal trace={trace_id} cmd={cmd} {symbol} vol={volume}")
 
     if cmd == "buy":
-        res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment)
-        return (str(res.order) if res else ""), err
+        res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment, sl, tp)
+        return "filled", (str(res.order) if res else ""), err
     if cmd == "sell":
-        res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment)
-        return (str(res.order) if res else ""), err
+        res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment, sl, tp)
+        return "filled", (str(res.order) if res else ""), err
+    if cmd in _PENDING_TYPES:
+        entry = fnum(params, "entry", "entry_price")
+        if entry <= 0:
+            return "rejected", "", "entry required for pending order"
+        ptype_name, mtype_name = _PENDING_TYPES[cmd]
+        res, err, retcode = send_pending(
+            getattr(mt5, ptype_name), symbol, volume, entry, sl, tp, comment
+        )
+        if res is not None:
+            return "placed", str(res.order), None
+        if PENDING_FALLBACK and retcode == mt5.TRADE_RETCODE_INVALID_PRICE:
+            # Wrong side of the market: execute at market instead, tag _M.
+            log(f"pending {cmd}@{entry} invalid price -> market fallback (_M)")
+            res, merr = send_market(
+                getattr(mt5, mtype_name), symbol, volume, f"{comment}_M", sl, tp
+            )
+            if res is not None:
+                return "filled", str(res.order), None
+            return "filled", "", f"pending invalid price; market fallback failed: {merr}"
+        return "filled", "", err
     if cmd == "closelong":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_BUY)
-        return ",".join(orders), err
+        return "filled", ",".join(orders), err
     if cmd == "closeshort":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_SELL)
-        return ",".join(orders), err
+        return "filled", ",".join(orders), err
     if cmd == "closelongopenshort":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_BUY)
         if err:
-            return ",".join(orders), err
-        res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment)
-        return ",".join(orders + ([str(res.order)] if res else [])), err
+            return "filled", ",".join(orders), err
+        res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment, sl, tp)
+        return "filled", ",".join(orders + ([str(res.order)] if res else [])), err
     if cmd == "closeshortopenlong":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_SELL)
         if err:
-            return ",".join(orders), err
-        res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment)
-        return ",".join(orders + ([str(res.order)] if res else [])), err
-    return "", f"unknown command {command}"
+            return "filled", ",".join(orders), err
+        res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment, sl, tp)
+        return "filled", ",".join(orders + ([str(res.order)] if res else [])), err
+    return "rejected", "", f"unknown command {command}"
 
 
 async def run_session():
@@ -214,7 +285,7 @@ async def run_session():
                     log("REGISTERED with bridge")
                     hb = asyncio.create_task(heartbeat())
                 elif mtype == "signal":
-                    order_id, err = await loop.run_in_executor(
+                    ok_status, order_id, err = await loop.run_in_executor(
                         None,
                         execute,
                         msg.get("trace_id", ""),
@@ -225,7 +296,7 @@ async def run_session():
                     fill = {
                         "type": "fill",
                         "trace_id": msg.get("trace_id", ""),
-                        "status": "rejected" if err else "filled",
+                        "status": "rejected" if err else ok_status,
                         "broker_order_id": order_id,
                         "error_code": "EXEC_FAIL" if err else "",
                         "error_message": err or "",
