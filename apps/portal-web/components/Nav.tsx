@@ -22,6 +22,9 @@ export default function Nav() {
           <Link href="/dashboard" className="text-sm text-gray-600 hover:text-gray-900">
             Licenses
           </Link>
+          <Link href="/dashboard/settings" className="text-sm text-gray-600 hover:text-gray-900">
+            Settings
+          </Link>
         </div>
         <button
           onClick={handleLogout}
