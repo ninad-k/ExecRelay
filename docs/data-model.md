@@ -22,7 +22,7 @@ If you just need DDL, read the SQL. This doc is the prose version.
 | **Tenancy** | `licenses`, `instances`, `regions`, `instance_region_pref` |
 | **Signals (hot-path produce)** | `accepted_signals`, `audit_rejections`, `signal_fingerprints`, `daily_signal_counts` |
 | **Fills (hot-path consume)** | `fills`, `ea_connection_sessions` |
-| **Background work** | `tasks`, `notifications_log` |
+| **Background work** | `tasks`, `notifications_log`, `telegram_links` |
 | **Reports** | `report_runs`, `report_findings`, `report_subscriptions` |
 | **System events** | `system_events` |
 | **Risk & exposure (Phase 6+)** | `account_positions`, `account_drawdowns`, `portfolio_exposure_limits`, `risk_breach_log`, `signal_groups`, `signal_group_members`, `symbol_correlations` |
@@ -36,6 +36,8 @@ If you just need DDL, read the SQL. This doc is the prose version.
        users ─┬─── user_roles ──── roles
               │
               ├─── user_limit_overrides
+              │
+              ├─── telegram_links
               │
               └─── licenses ──┬── instances ─── instance_region_pref ─── regions
                               │      │
@@ -193,7 +195,16 @@ fill timeout checks, retention cleanup, scheduled reports. `status` /
 crude job scheduler.
 
 ### `notifications_log`
-Sent-notification history (email/Slack/webhook). De-dup + audit.
+Sent-notification history (email/Slack/webhook/telegram). De-dup + audit.
+Telegram fill notifications key their de-dup on `payload->>'fill_id'`
+(partial index from migration 000007).
+
+### `telegram_links`
+One row per user: PineConnector-style Telegram account link. Portal-api
+mints `link_token` (short TTL); the tasks-service bot resolves
+`/start <token>` into `chat_id`. `notify_fills` / `notify_timeouts` are the
+per-user notification preferences. A chat may be linked to at most one user
+(partial unique index on `chat_id`).
 
 ---
 

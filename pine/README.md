@@ -53,7 +53,7 @@ A BUY entry produces (a SELL entry is identical with `action:"sell"`):
 | `license_id` | string | ExecRelay license (script input) |
 | `secret` | string | Per-license alert secret (script input) — TradingView's only auth mechanism, so the license used for TV alerts must not require HMAC |
 | `action` | `"buy"` \| `"sell"` | Maps to predictor `direction`: buy → `1`, sell → `-1` |
-| `symbol` | string | TradingView ticker (server applies broker symbol mapping) |
+| `symbol` | string | TradingView ticker — passed through **verbatim** to the broker terminal; per-broker naming (e.g. `GOLD` vs `XAUUSD.r`) is mapped in the EA via its `InpSymbolMap` / `InpSymbolSuffix` inputs |
 | `volume` | number | Lots |
 | `sl` / `tp` | number | Stop loss / take profit (0 = none) |
 | `comment` | string | Strategy tag — isolates strategies sharing a symbol/account |
@@ -130,3 +130,18 @@ request contract, the decision→command table, and the design rationale, and
      (`ret_288`, `vol_288`, `active_rate_288`, `ema_200_slope`, `bb_z`,
      `h1_dist_ema50`, `h1_ret_24`, `h4_dist_ema50`) — this avoids ever sending
      NaN features, which the predictor would otherwise reject as invalid JSON.
+
+## Telegram notifications
+
+Alerts fired by this script can produce Telegram notifications
+(PineConnector-style): once you link your account to the ExecRelay bot
+(portal → `POST /me/telegram/link`, then open the deep link), every fill —
+success, rejection, or timeout — for signals sent by this script arrives as
+a Telegram message. Nothing extra is needed in the Pine script or the alert
+payload: the **`Comment / strategy tag` input is what identifies this
+strategy in the Telegram feed** (the `Strategy:` line of each message), and
+ML-path signals additionally show the model's `prob_win` and decision. Set a
+distinct tag per chart/strategy so the messages are tellable apart.
+
+See [`docs/customer/telegram-notifications.md`](../docs/customer/telegram-notifications.md)
+for the linking flow and bot commands.

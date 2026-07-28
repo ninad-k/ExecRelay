@@ -19,6 +19,7 @@ Format: [Michael Nygard's template](https://github.com/joelparkerhenderson/archi
 | [0006](0006-per-license-hmac-not-global.md) | Per-license HMAC + body secret instead of a global perimeter token (perimeter is *additional*) | Accepted |
 | [0007](0007-wsl2-for-windows-deployment.md) | Deploy on Windows Server via WSL2 instead of native Windows containers | Accepted |
 | [0008](0008-opt-in-json-ml-webhook-path.md) | Opt-in JSON `/webhook/ml` path for ML-filtered signals | Proposed |
+| [0009](0009-telegram-notifications-cold-path.md) | Telegram notifications as a cold-path consumer (bot in `tasks`, long-polling) | Proposed |
 
 ## How to add a new ADR
 
