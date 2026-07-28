@@ -45,7 +45,7 @@ type SignalMsg struct {
 type FillMsg struct {
 	Type          string `json:"type"`
 	TraceID       string `json:"trace_id"`
-	Status        string `json:"status"` // "filled", "rejected", "error"
+	Status        string `json:"status"` // "filled", "placed", "cancelled", "rejected", "error"
 	BrokerOrderID string `json:"broker_order_id,omitempty"`
 	ErrorCode     string `json:"error_code,omitempty"`
 	ErrorMessage  string `json:"error_message,omitempty"`

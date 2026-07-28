@@ -19,6 +19,11 @@ input int    InpMagicNumber   = 20240101;      // Magic number for orders placed
 input string InpEAVersion     = "1.00";        // Reported EA version
 input int    InpTimerMs       = 200;           // Poll interval ms
 input int    InpHeartbeatMs   = 30000;         // Heartbeat interval ms (0 = disabled)
+// Signals carry the sender's symbol verbatim; map it to this broker's naming
+// here. Pairs first ("GOLD=XAUUSD;US30=US30.Cash"), then suffix for everything
+// unmapped ("EURUSD" + ".r" -> "EURUSD.r").
+input string InpSymbolMap     = "";            // Symbol map "FROM=TO;FROM=TO"
+input string InpSymbolSuffix  = "";            // Suffix appended to unmapped symbols
 
 int    g_socket        = INVALID_HANDLE;
 bool   g_registered    = false;
@@ -26,6 +31,12 @@ uint   g_lastConn      = 0;
 uint   g_lastHeartbeat = 0;
 uint   g_startTick     = 0;
 CTrade g_trade;
+
+// Pending orders placed by this EA that have not activated yet, so their
+// real fill (or cancellation) can be reported when it happens. In-memory:
+// orders placed before an EA restart lose activation reporting (documented).
+ulong  g_pendTickets[];
+string g_pendTraces[];
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -69,6 +80,11 @@ void OnTimer()
             g_lastHeartbeat = now;
         }
     }
+
+    // Only while registered: a fill sent into a dead/unregistered socket
+    // would be dropped and the activation would never be reported.
+    if(g_registered)
+        CheckPendingActivations();
 }
 
 void OnTick() {}
@@ -399,9 +415,95 @@ double PipSize(const string sym)
     return (d == 3 || d == 5) ? 10.0 * p : p;
 }
 
-void ExecuteSignal(const string traceID, const string cmd,
-                   const string sym,     const string params)
+// Translate the signal's symbol to this broker's naming: exact pair from
+// InpSymbolMap wins; otherwise InpSymbolSuffix is appended (unless already
+// present). Mapping lives EA-side because broker naming is per-terminal.
+string MapSymbol(const string sym)
 {
+    if(InpSymbolMap != "")
+    {
+        string pairs[];
+        int n = StringSplit(InpSymbolMap, ';', pairs);
+        for(int i = 0; i < n; i++)
+        {
+            string p = pairs[i];
+            StringTrimLeft(p); StringTrimRight(p);
+            int eq = StringFind(p, "=");
+            if(eq <= 0) continue;
+            if(StringSubstr(p, 0, eq) == sym)
+                return StringSubstr(p, eq + 1);
+        }
+    }
+    if(InpSymbolSuffix != "")
+    {
+        int sfxLen = StringLen(InpSymbolSuffix);
+        int symLen = StringLen(sym);
+        if(symLen < sfxLen || StringSubstr(sym, symLen - sfxLen) != InpSymbolSuffix)
+            return sym + InpSymbolSuffix;
+    }
+    return sym;
+}
+
+void TrackPending(const ulong ticket, const string traceID)
+{
+    int n = ArraySize(g_pendTickets);
+    ArrayResize(g_pendTickets, n + 1);
+    ArrayResize(g_pendTraces,  n + 1);
+    g_pendTickets[n] = ticket;
+    g_pendTraces[n]  = traceID;
+}
+
+void UntrackPending(const int idx)
+{
+    int last = ArraySize(g_pendTickets) - 1;
+    g_pendTickets[idx] = g_pendTickets[last];
+    g_pendTraces[idx]  = g_pendTraces[last];
+    ArrayResize(g_pendTickets, last);
+    ArrayResize(g_pendTraces,  last);
+}
+
+// A pending order was reported as "placed" when created; this reports the
+// real outcome: "filled" once it leaves the order book as executed, or
+// "cancelled" if it was deleted/expired/rejected before activating.
+void CheckPendingActivations()
+{
+    for(int i = ArraySize(g_pendTickets) - 1; i >= 0; i--)
+    {
+        ulong ticket = g_pendTickets[i];
+        if(OrderSelect(ticket))
+            continue;  // still a live pending order
+        if(!HistoryOrderSelect(ticket))
+            continue;  // not yet visible in history; check next timer tick
+        ENUM_ORDER_STATE state =
+            (ENUM_ORDER_STATE)HistoryOrderGetInteger(ticket, ORDER_STATE);
+        if(state == ORDER_STATE_FILLED || state == ORDER_STATE_PARTIAL)
+        {
+            SendFill(g_pendTraces[i], "filled", IntegerToString((long)ticket), "", "");
+            UntrackPending(i);
+        }
+        else if(state == ORDER_STATE_CANCELED || state == ORDER_STATE_EXPIRED ||
+                state == ORDER_STATE_REJECTED)
+        {
+            SendFill(g_pendTraces[i], "cancelled", IntegerToString((long)ticket),
+                     "", "pending order removed before activation (state=" +
+                     IntegerToString(state) + ")");
+            UntrackPending(i);
+        }
+    }
+}
+
+void ExecuteSignal(const string traceID, const string cmd,
+                   const string rawSym,  const string params)
+{
+    string sym = MapSymbol(rawSym);
+    if(!SymbolSelect(sym, true))
+    {
+        SendFill(traceID, "rejected", "", "SYMBOL_UNKNOWN",
+                 "symbol not found on this broker: " + sym +
+                 " (from " + rawSym + "; check InpSymbolMap/InpSymbolSuffix)");
+        return;
+    }
+
     double vol    = PDouble(params, "vol_lots");
     double sl     = PDouble(params, "sl");
     double tp     = PDouble(params, "tp");
@@ -437,7 +539,13 @@ void ExecuteSignal(const string traceID, const string cmd,
     {
         if(vol <= 0.0 || entry <= 0.0) { SendFill(traceID, "rejected", "", "PARAM_MISSING", "vol_lots and entry required"); return; }
         if(g_trade.OrderOpen(sym, otype, vol, 0, entry, sl, tp))
-            SendFill(traceID, "filled", IntegerToString(g_trade.ResultOrder()), "", "");
+        {
+            // "placed" = pending order accepted by the broker, NOT executed.
+            // The real fill is reported by CheckPendingActivations().
+            ulong ticket = g_trade.ResultOrder();
+            SendFill(traceID, "placed", IntegerToString((long)ticket), "", "");
+            TrackPending(ticket, traceID);
+        }
         else
             SendFill(traceID, "error", "", IntegerToString(g_trade.ResultRetcode()),
                      g_trade.ResultRetcodeDescription());
