@@ -42,6 +42,9 @@ go.work.sum
 .idea/
 .vscode/
 
+# Claude Code local state (agent worktrees, local settings)
+.claude/
+
 # Python
 __pycache__/
 *.pyc

@@ -11,12 +11,14 @@ Telegram channel ──getUpdates──► telegram-ingest ──POST /webhook�
                                   fixed lot, dry-run
 ```
 
-## Supported message format
+## Supported message formats
 
 Strict by design — anything that doesn't match is ignored; anything that
-matches but is internally inconsistent (SL on the wrong side, second entry
-outside the bracket, mismatched sides) is rejected and logged, and **no
-order is placed**:
+matches but is internally inconsistent (SL on the wrong side, a target on
+the losing side, second entry outside the bracket, mismatched sides) is
+rejected and logged, and **no order is placed**.
+
+### A. Explicit "@" format
 
 ```
 GOLD SELL @ 4099
@@ -34,9 +36,43 @@ TP @ 4089
   than chased.
 - `SECOND <side> LIMIT|STOP @ <price>` (the `SECOND` prefix is optional) →
   pending order (`selllimit` etc.) with the same SL/TP.
+
+### B. "Trigger" format
+
+```
+XAUUSD Sell Trigger only Below 4792 📉
+🛑 SL 4808 ⚠️
+🎯 Target 4790 4788 4784 4770+ 🎯
+```
+
+- The **above/below keyword picks the pending order type**, so
+  `TELEGRAM_INGEST_ENTRY_MODE` does not apply here:
+
+  | Message | Order |
+  |---|---|
+  | Buy … above | `buystop` |
+  | Buy … below | `buylimit` |
+  | Sell … above | `selllimit` |
+  | Sell … below | `sellstop` |
+
+- The symbol must be the **first word** and one this adapter knows
+  (majors, metals, indices, BTC/ETH — see `KNOWN_SYMBOLS` in `app.py`).
+  An unknown first word means "not a signal", never a guess.
+- `SL 4808`, `SL: 4808` and `Stop Loss 4808` all work; so do
+  `Target a b c+` and `TP1: a TP2: b TP3: c`.
+- Common aliases are normalised before the operator map:
+  `GOLD→XAUUSD`, `SILVER→XAGUSD`, `WTI→USOIL`, `BRENT→UKOIL`,
+  `DJ30→US30`, `SPX500→US500`, `USTEC→NAS100`.
+- A flat webhook command carries one `tp`, so a target ladder is reduced by
+  `TELEGRAM_INGEST_TP_MODE`: `first` (nearest, default), `last`
+  (furthest), or `ladder` — one order per target, **each at the full fixed
+  lot, so N targets means N× the exposure**.
+
+### Both formats
+
 - Lot size is **never** taken from the message — it is fixed by
   `TELEGRAM_INGEST_FIXED_LOT` (default `0.01`).
-- Trailing commentary (risk tables, disclaimers, emojis) is ignored.
+- Emoji, risk tables, disclaimers and referral links are stripped/ignored.
 
 ## Setup
 
@@ -45,9 +81,11 @@ TP @ 4089
      receives every post via `channel_post` updates.
    - **You follow someone else's channel:** Telegram bots cannot read
      channels they aren't in. Create a private group, add the bot, and
-     forward (or auto-forward) the signals there. Driving a *user* session
-     with automation (Telethon et al.) is possible but sits in a grey zone
-     of Telegram's terms — this service deliberately only speaks the Bot API.
+     forward the signals there — by hand, or automatically with
+     [`scripts/telegram_user_forwarder.py`](../../scripts/telegram_user_forwarder.py),
+     which relays posts using your own account (MTProto/Telethon). This
+     service itself only ever speaks the Bot API; the forwarder is a
+     separate, optional script that runs on your machine under your account.
 2. Find the chat id (forward a message to `@userinfobot`, or read this
    service's debug logs) and allowlist it.
 3. Configure and start (compose profile `apps`):
@@ -60,7 +98,8 @@ TP @ 4089
 | `TELEGRAM_INGEST_SECRET` | if license has one | — | Body-embedded alert secret |
 | `TELEGRAM_INGEST_WEBHOOK_URL` | no | `http://ingress:8080/webhook` | Add `?token=...` if a perimeter token is configured |
 | `TELEGRAM_INGEST_FIXED_LOT` | no | `0.01` | Lot size for every order this adapter places |
-| `TELEGRAM_INGEST_ENTRY_MODE` | no | `limit` | `limit` = first leg rests at the stated entry price; `market` = first leg executes immediately |
+| `TELEGRAM_INGEST_ENTRY_MODE` | no | `limit` | `limit` = first leg rests at the stated entry price; `market` = first leg executes immediately. Ignored by trigger-format signals |
+| `TELEGRAM_INGEST_TP_MODE` | no | `first` | Which target of a ladder to trade: `first`, `last`, or `ladder` (one order each) |
 | `TELEGRAM_INGEST_SYMBOL_MAP` | no | — | Channel jargon → canonical name, e.g. `GOLD=XAUUSD` (per-broker suffixes belong in the EA's `InpSymbolMap`) |
 | `TELEGRAM_INGEST_DRY_RUN` | no | **`true`** | Log commands instead of POSTing them |
 | `TELEGRAM_INGEST_COMMENT` | no | `tg-ingest` | Strategy tag on every order |

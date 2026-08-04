@@ -61,7 +61,18 @@ SYMBOL_MAP = {
 # How the signal's first entry is placed: "limit" (default) rests a pending
 # limit order at the stated entry price; "market" executes immediately at
 # market. The second entry is always pending at its own level.
+#
+# Only applies to signals that don't state their own trigger direction. A
+# "Trigger only Above/Below" message names the pending order type itself and
+# always wins over this setting.
 ENTRY_MODE = os.environ.get("TELEGRAM_INGEST_ENTRY_MODE", "limit").lower()
+
+# Channels that publish a target ladder ("Target 4790 4788 4784 4770+") give
+# more take-profit levels than one flat webhook command can carry:
+#   first  — nearest target only (default, smallest exposure)
+#   last   — furthest target only
+#   ladder — one order per target, each at the fixed lot (N x exposure)
+TP_MODE = os.environ.get("TELEGRAM_INGEST_TP_MODE", "first").lower()
 
 # Safety default: log what WOULD be sent, send nothing.
 DRY_RUN = os.environ.get("TELEGRAM_INGEST_DRY_RUN", "true").lower() in (
@@ -109,16 +120,27 @@ _readiness = {"poll_ok": False, "detail": "not started"}
 # Signal grammar
 # ---------------------------------------------------------------------------
 #
-# Strict by design: the whole message is rejected unless every recognised
-# part is consistent. Target format (whitespace/case tolerant):
+# Two dialects are understood. Both are strict: the whole message is rejected
+# unless every recognised part is consistent.
 #
-#   GOLD SELL @ 4099
-#   SECOND SELL LIMIT @ 4109
-#   SL @ 4119
-#   TP @ 4089
+# A. Explicit "@" format — the entry line names symbol and side, an optional
+#    second leg names its own pending kind:
 #
-# Trailing commentary ("Risk Management Example", disclaimers, lot tables)
-# is ignored.
+#      GOLD SELL @ 4099
+#      SECOND SELL LIMIT @ 4109
+#      SL @ 4119
+#      TP @ 4089
+#
+# B. "Trigger" format — the message states a breakout/pullback trigger and a
+#    ladder of targets. The above/below keyword decides the pending order
+#    type, so ENTRY_MODE does not apply:
+#
+#      XAUUSD Sell Trigger only Below 4792 📉
+#      🛑 SL 4808 ⚠️
+#      🎯 Target 4790 4788 4784 4770+ 🎯
+#
+# Trailing commentary (risk tables, disclaimers, referral links, emoji) is
+# ignored in both.
 
 _ENTRY_RE = re.compile(
     r"^\s*(?P<symbol>[A-Z][A-Z0-9._]{1,14})\s+(?P<side>BUY|SELL)\s*@\s*(?P<entry>\d+(?:\.\d+)?)\s*$",
@@ -131,9 +153,75 @@ _SECOND_RE = re.compile(
 _SL_RE = re.compile(r"^\s*SL\s*@\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE | re.MULTILINE)
 _TP_RE = re.compile(r"^\s*TP\s*@\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE | re.MULTILINE)
 
+# --- dialect B ---------------------------------------------------------------
+
+# Emoji and other pictographic decoration, stripped before matching so that
+# "🛑 SL 4808 ⚠️" reads as a plain SL line.
+_EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001F9FF\U00002600-\U000027BF\U0000FE00-\U0000FEFF"
+    r"\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002702-\U000027B0"
+    r"\U0000200D\U0000FE0F]+",
+    flags=re.UNICODE,
+)
+
+# Symbols this adapter will accept as the leading word of a trigger message.
+# An unknown first word means "not a signal" rather than "guess" — a channel
+# that posts a symbol we don't list is a config change, not a trade.
+KNOWN_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "XAUUSD", "XAGUSD", "GOLD", "SILVER",
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "NZDUSD", "USDCAD",
+        "GBPJPY", "EURJPY", "EURGBP", "AUDJPY", "CADJPY", "CHFJPY",
+        "EURCHF", "EURAUD", "EURNZD", "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF",
+        "AUDNZD", "AUDCAD", "AUDCHF", "NZDCAD", "NZDCHF", "CADCHF",
+        "US30", "NAS100", "SPX500", "US500", "USTEC", "DJ30",
+        "BTCUSD", "ETHUSD", "BTCUSDT", "ETHUSDT",
+        "USOIL", "UKOIL", "WTI", "BRENT",
+    }
+)
+
+# Channel jargon → the name the rest of the platform uses. Applied before the
+# operator's TELEGRAM_INGEST_SYMBOL_MAP, which still has the final say.
+SYMBOL_ALIASES: dict[str, str] = {
+    "GOLD": "XAUUSD",
+    "SILVER": "XAGUSD",
+    "WTI": "USOIL",
+    "BRENT": "UKOIL",
+    "DJ30": "US30",
+    "SPX500": "US500",
+    "USTEC": "NAS100",
+}
+
+_BUY_RE = re.compile(r"\b(?:buy|long)\b", re.IGNORECASE)
+_SELL_RE = re.compile(r"\b(?:sell|short)\b", re.IGNORECASE)
+_ABOVE_RE = re.compile(r"\babove\b", re.IGNORECASE)
+_BELOW_RE = re.compile(r"\bbelow\b", re.IGNORECASE)
+_TRIGGER_RE = re.compile(r"(?:\b(?:above|below|at)\b|@)\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+# "SL 4808", "SL: 4808", "Stop Loss 4808" — with or without the "@" of dialect A.
+_SL_LOOSE_RE = re.compile(r"\b(?:sl|stop\s*loss)\s*:?\s*@?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_TARGET_HEADER_RE = re.compile(r"\b(?:target|targets|tp)\s*:?\s*", re.IGNORECASE)
+# Deliberately no optional digit after the keyword: "Target 4790" must not have
+# its leading 4 eaten as a "TP4" label.
+_TP_LABEL_RE = re.compile(r"\btp\s*\d\s*:?\s*", re.IGNORECASE)
+_TP_LABELED_RE = re.compile(r"\btp\s*\d\s*:?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
 
 class SignalError(ValueError):
     """Message looked like a signal but is inconsistent — reject loudly."""
+
+
+def _blank_signal(symbol: str, side: str, entry: float) -> dict:
+    return {
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": 0.0,
+        "tp": 0.0,
+        "tps": [],
+        "order_type": None,
+        "second": None,
+    }
 
 
 def parse_signal(text: str) -> dict | None:
@@ -141,34 +229,32 @@ def parse_signal(text: str) -> dict | None:
     not a signal at all. Raises SignalError when it matches the grammar but
     fails a consistency check (wrong stop side, mismatched second order, ...).
     """
-    entry_m = _ENTRY_RE.search(text)
-    if entry_m is None:
-        return None
-
-    sl_m = _SL_RE.search(text)
-    tp_m = _TP_RE.search(text)
-    if sl_m is None or tp_m is None:
+    clean = _EMOJI_RE.sub(" ", text)
+    entry_m = _ENTRY_RE.search(clean)
+    sl_m = _SL_RE.search(clean)
+    tp_m = _TP_RE.search(clean)
+    if entry_m is not None and sl_m is not None and tp_m is not None:
+        return _parse_explicit(clean, entry_m, sl_m, tp_m)
+    # A dialect-A entry line with looser SL/TP lines still parses as a trigger
+    # signal; only if that fails too is the message genuinely malformed.
+    sig = _parse_trigger(clean)
+    if sig is None and entry_m is not None:
         raise SignalError("signal missing SL or TP line")
+    return sig
 
+
+def _parse_explicit(
+    text: str, entry_m: re.Match[str], sl_m: re.Match[str], tp_m: re.Match[str]
+) -> dict:
+    """Dialect A: `SYMBOL SIDE @ price` with `SL @` / `TP @` lines."""
     side = entry_m.group("side").lower()
     entry = float(entry_m.group("entry"))
     sl = float(sl_m.group(1))
     tp = float(tp_m.group(1))
 
-    # SL must be on the losing side, TP on the winning side.
-    if side == "sell" and not (sl > entry > tp):
-        raise SignalError(f"sell price sanity failed: SL {sl} > entry {entry} > TP {tp} required")
-    if side == "buy" and not (sl < entry < tp):
-        raise SignalError(f"buy price sanity failed: SL {sl} < entry {entry} < TP {tp} required")
-
-    sig: dict = {
-        "symbol": entry_m.group("symbol").upper(),
-        "side": side,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "second": None,
-    }
+    sig = _blank_signal(entry_m.group("symbol").upper(), side, entry)
+    sig.update(sl=sl, tp=tp, tps=[tp])
+    _check_bracket(side, entry, sl, [tp])
 
     second_m = _SECOND_RE.search(text)
     if second_m is not None:
@@ -193,32 +279,187 @@ def parse_signal(text: str) -> dict | None:
     return sig
 
 
+def _parse_trigger(text: str) -> dict | None:
+    """Dialect B: `SYMBOL Buy Trigger only Above <price>` + SL + target ladder.
+
+    The symbol must be the first word and known; the direction, trigger price
+    and SL are taken from their first occurrence, which is the signal block at
+    the top of the post — everything below it is promo copy.
+    """
+    symbol = _extract_symbol(text)
+    if symbol is None:
+        return None
+    side = _extract_side(text)
+    if side is None:
+        return None
+    trigger_m = _TRIGGER_RE.search(text)
+    if trigger_m is None:
+        return None
+    entry = float(trigger_m.group(1))
+
+    sl_m = _SL_LOOSE_RE.search(text)
+    if sl_m is None:
+        raise SignalError("signal missing SL")
+    sl = float(sl_m.group(1))
+
+    tps = _extract_targets(text)
+    if not tps:
+        raise SignalError("signal missing TP/target line")
+
+    _check_bracket(side, entry, sl, tps)
+
+    sig = _blank_signal(symbol, side, entry)
+    sig.update(sl=sl, tp=tps[0], tps=tps, order_type=_derive_order_type(side, text))
+    return sig
+
+
+def _extract_symbol(text: str) -> str | None:
+    words = text.split()
+    if not words:
+        return None
+    candidate = words[0].upper().strip(".,;:!?")
+    if candidate in KNOWN_SYMBOLS:
+        return candidate
+    # Some channels split the pair ("XAU USD").
+    if len(words) >= 2:
+        combined = (words[0] + words[1]).upper().strip(".,;:!?")
+        if combined in KNOWN_SYMBOLS:
+            return combined
+    return None
+
+
+def _extract_side(text: str) -> str | None:
+    buy = _BUY_RE.search(text)
+    sell = _SELL_RE.search(text)
+    if buy and sell:
+        # Both words present (e.g. a disclaimer mentions the other side) —
+        # whichever leads the message is the signal.
+        return "buy" if buy.start() < sell.start() else "sell"
+    if buy:
+        return "buy"
+    if sell:
+        return "sell"
+    return None
+
+
+def _derive_order_type(side: str, text: str) -> str | None:
+    """Map the above/below keyword onto an ExecRelay pending order type.
+
+    buy + above  -> buystop   (break upward into the entry)
+    buy + below  -> buylimit  (dip down into the entry)
+    sell + above -> selllimit (rally up into the entry)
+    sell + below -> sellstop  (break downward into the entry)
+
+    No keyword means the message never said which way price reaches the
+    entry — fall back to ENTRY_MODE rather than guessing.
+    """
+    if _ABOVE_RE.search(text):
+        return "buystop" if side == "buy" else "selllimit"
+    if _BELOW_RE.search(text):
+        return "buylimit" if side == "buy" else "sellstop"
+    return None
+
+
+def _extract_targets(text: str) -> list[float]:
+    """Pull the take-profit ladder out of `TP1: .. TP2: ..` or a `Target` line."""
+    labeled = _TP_LABELED_RE.findall(text)
+    if len(labeled) >= 2:
+        return [float(v) for v in labeled]
+
+    for line in text.split("\n"):
+        if not _TARGET_HEADER_RE.search(line):
+            continue
+        # Separators and the "+" that marks an open-ended last target are
+        # noise; so are the header words themselves.
+        cleaned = re.sub(r"[/|,+]", " ", line)
+        cleaned = _TP_LABEL_RE.sub(" ", cleaned)
+        cleaned = _TARGET_HEADER_RE.sub(" ", cleaned)
+        numbers = _NUMBER_RE.findall(cleaned)
+        if numbers:
+            return [float(n) for n in numbers]
+    return []
+
+
+def _check_bracket(side: str, entry: float, sl: float, tps: list[float]) -> None:
+    """SL must sit on the losing side of entry and every target on the winning
+    side. A stray number swept up from promo text lands on the wrong side and
+    takes the whole message down with it — deliberately."""
+    if side == "sell":
+        if not sl > entry:
+            raise SignalError(f"sell price sanity failed: SL {sl} > entry {entry} required")
+        bad = [tp for tp in tps if not tp < entry]
+    else:
+        if not sl < entry:
+            raise SignalError(f"buy price sanity failed: SL {sl} < entry {entry} required")
+        bad = [tp for tp in tps if not tp > entry]
+    if bad:
+        raise SignalError(f"{side} target(s) {bad} on the wrong side of entry {entry}")
+
+
 def _fmt(x: float) -> str:
     return f"{x:g}"
 
 
-def build_commands(sig: dict) -> list[str]:
-    """Render a parsed signal as flat ExecRelay webhook command bodies. In
-    the default "limit" entry mode BOTH legs rest as pending limit orders —
-    the first at the signal's stated entry price, the second at its own
-    level; "market" mode executes the first leg immediately instead. The
-    fixed lot is deliberate: position sizing is configured here, never taken
-    from the channel message."""
-    symbol = SYMBOL_MAP.get(sig["symbol"], sig["symbol"])
-    secret = f",secret={SECRET}" if SECRET else ""
-    common = f"vol_lots={FIXED_LOT},sl={_fmt(sig['sl'])},tp={_fmt(sig['tp'])},comment={COMMENT}{secret}"
+def resolve_symbol(raw: str) -> str:
+    """Channel jargon -> canonical name. The built-in alias table normalises
+    the obvious ones (GOLD -> XAUUSD); the operator's SYMBOL_MAP overrides it
+    for either spelling."""
+    if raw in SYMBOL_MAP:
+        return SYMBOL_MAP[raw]
+    canonical = SYMBOL_ALIASES.get(raw, raw)
+    return SYMBOL_MAP.get(canonical, canonical)
 
-    if ENTRY_MODE == "market":
-        cmds = [f"{LICENSE_ID},{sig['side']},{symbol},{common}"]
-    else:
-        cmds = [
-            f"{LICENSE_ID},{sig['side']}limit,{symbol},entry_price={_fmt(sig['entry'])},{common}"
-        ]
-    if sig["second"] is not None:
-        cmd = f"{sig['side']}{sig['second']['kind']}"
-        cmds.append(
-            f"{LICENSE_ID},{cmd},{symbol},entry_price={_fmt(sig['second']['entry'])},{common}"
+
+def select_targets(sig: dict) -> list[float]:
+    """Reduce the signal's target ladder to the take-profit(s) actually traded."""
+    tps = sig.get("tps") or [sig["tp"]]
+    if len(tps) == 1 or TP_MODE == "ladder":
+        return tps
+    return [tps[-1]] if TP_MODE == "last" else [tps[0]]
+
+
+def build_commands(sig: dict) -> list[str]:
+    """Render a parsed signal as flat ExecRelay webhook command bodies.
+
+    A signal that names its own trigger direction ("Trigger only Above") is
+    placed as exactly that pending order type. Otherwise the default "limit"
+    entry mode rests BOTH legs as pending limit orders — the first at the
+    signal's stated entry price, the second at its own level; "market" mode
+    executes the first leg immediately instead. In `ladder` TP mode each
+    target gets its own order at the fixed lot.
+
+    The fixed lot is deliberate: position sizing is configured here, never
+    taken from the channel message."""
+    symbol = resolve_symbol(sig["symbol"])
+    secret = f",secret={SECRET}" if SECRET else ""
+    targets = select_targets(sig)
+
+    def common(tp: float) -> str:
+        return (
+            f"vol_lots={FIXED_LOT},sl={_fmt(sig['sl'])},tp={_fmt(tp)}"
+            f",comment={COMMENT}{secret}"
         )
+
+    cmds: list[str] = []
+    for tp in targets:
+        if sig.get("order_type"):
+            cmds.append(
+                f"{LICENSE_ID},{sig['order_type']},{symbol}"
+                f",entry_price={_fmt(sig['entry'])},{common(tp)}"
+            )
+        elif ENTRY_MODE == "market":
+            cmds.append(f"{LICENSE_ID},{sig['side']},{symbol},{common(tp)}")
+        else:
+            cmds.append(
+                f"{LICENSE_ID},{sig['side']}limit,{symbol}"
+                f",entry_price={_fmt(sig['entry'])},{common(tp)}"
+            )
+        if sig["second"] is not None:
+            cmd = f"{sig['side']}{sig['second']['kind']}"
+            cmds.append(
+                f"{LICENSE_ID},{cmd},{symbol}"
+                f",entry_price={_fmt(sig['second']['entry'])},{common(tp)}"
+            )
     return cmds
 
 
@@ -313,10 +554,12 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
 def poll_loop() -> None:
     offset: int | None = None
     logger.info(
-        "ingest loop started (dry_run=%s, chats=%s, lot=%s)",
+        "ingest loop started (dry_run=%s, chats=%s, lot=%s, entry_mode=%s, tp_mode=%s)",
         DRY_RUN,
         sorted(ALLOWED_CHAT_IDS),
         FIXED_LOT,
+        ENTRY_MODE,
+        TP_MODE,
     )
     while True:
         params: dict = {
@@ -410,6 +653,10 @@ def main() -> None:
         errors.append("TELEGRAM_INGEST_ALLOWED_CHAT_IDS is required (comma-separated)")
     if not DRY_RUN and not LICENSE_ID:
         errors.append("TELEGRAM_INGEST_LICENSE_ID is required when dry-run is off")
+    if ENTRY_MODE not in ("limit", "market"):
+        errors.append(f"TELEGRAM_INGEST_ENTRY_MODE must be limit|market, got {ENTRY_MODE!r}")
+    if TP_MODE not in ("first", "last", "ladder"):
+        errors.append(f"TELEGRAM_INGEST_TP_MODE must be first|last|ladder, got {TP_MODE!r}")
     if errors:
         for e in errors:
             logger.error(e)
