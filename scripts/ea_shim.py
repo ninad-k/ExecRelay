@@ -31,6 +31,10 @@ import time
 import MetaTrader5 as mt5
 import websockets
 
+from _txnlog import get_txn_logger, log_txn
+
+TXN_LOG = get_txn_logger("mt5-fills")
+
 BRIDGE_URL = os.environ.get("EA_SHIM_BRIDGE_URL", "ws://127.0.0.1:8082/ea/ws")
 INSTANCE_ID = os.environ.get("EA_SHIM_INSTANCE_ID", "test-instance")
 BRIDGE_TOKEN = os.environ.get("EA_SHIM_TOKEN", "test-bridge-token")
@@ -285,13 +289,16 @@ async def run_session():
                     log("REGISTERED with bridge")
                     hb = asyncio.create_task(heartbeat())
                 elif mtype == "signal":
+                    command = msg.get("command", "")
+                    symbol = msg.get("symbol", "")
+                    params = msg.get("params") or {}
                     ok_status, order_id, err = await loop.run_in_executor(
                         None,
                         execute,
                         msg.get("trace_id", ""),
-                        msg.get("command", ""),
-                        msg.get("symbol", ""),
-                        msg.get("params") or {},
+                        command,
+                        symbol,
+                        params,
                     )
                     fill = {
                         "type": "fill",
@@ -303,6 +310,22 @@ async def run_session():
                     }
                     await ws.send(json.dumps(fill))
                     log("fill reported:", fill["status"], order_id, err or "")
+                    log_txn(
+                        TXN_LOG,
+                        account=acct.login,
+                        broker=acct.company,
+                        instance_id=INSTANCE_ID,
+                        trace_id=fill["trace_id"],
+                        command=command,
+                        symbol=symbol,
+                        volume=params.get("volume") or params.get("vol_lots"),
+                        sl=params.get("sl"),
+                        tp=params.get("tp"),
+                        entry=params.get("entry") or params.get("entry_price"),
+                        status=fill["status"],
+                        broker_order_id=order_id,
+                        error=err or "",
+                    )
                 elif mtype == "ping":
                     await ws.send(json.dumps({"type": "pong"}))
         finally:

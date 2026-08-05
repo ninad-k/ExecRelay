@@ -25,6 +25,12 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+from _txnlog import get_txn_logger, log_txn  # noqa: E402
+
+TXN_LOG = get_txn_logger("telegram-signals")
 
 SERVICE = "telegram-ingest"
 ENV = os.environ.get("ENV", "development").lower()
@@ -532,6 +538,14 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         logger.warning(
             "chat %s msg %s: signal REJECTED (%s): %r", chat_id, message_id, exc, text[:200]
         )
+        log_txn(
+            TXN_LOG,
+            chat_id=chat_id,
+            message_id=message_id,
+            outcome="rejected",
+            reason=str(exc),
+            raw_text=text[:500],
+        )
         return
     if sig is None:
         logger.debug("chat %s msg %s: not a signal", chat_id, message_id)
@@ -541,14 +555,41 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
     for body in commands:
         if DRY_RUN:
             logger.info("DRY-RUN would POST: %s", body)
+            log_txn(
+                TXN_LOG,
+                chat_id=chat_id,
+                message_id=message_id,
+                outcome="dry_run",
+                signal=sig,
+                command=body,
+            )
             continue
         try:
             status, resp = post_webhook(body)
         except Exception as exc:
             logger.error("webhook POST failed: %s (body: %s)", exc, body)
+            log_txn(
+                TXN_LOG,
+                chat_id=chat_id,
+                message_id=message_id,
+                outcome="webhook_error",
+                signal=sig,
+                command=body,
+                error=str(exc),
+            )
             continue
         log = logger.info if status == 200 else logger.error
         log("webhook %s -> %d %s", body.split(",", 3)[1], status, resp)
+        log_txn(
+            TXN_LOG,
+            chat_id=chat_id,
+            message_id=message_id,
+            outcome="posted",
+            signal=sig,
+            command=body,
+            http_status=status,
+            response=resp,
+        )
 
 
 def poll_loop() -> None:
