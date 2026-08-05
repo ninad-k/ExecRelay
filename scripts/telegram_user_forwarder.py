@@ -152,12 +152,20 @@ async def cmd_run() -> None:
         sys.exit(2)
     target = targets[0][0]
 
+    names_by_id = {cid: name for cid, name in sources}
+
     @c.on(events.NewMessage(chats=[cid for cid, _ in sources]))
     async def _on_message(event) -> None:
         text = event.message.message or ""
         if not text.strip():
             return  # media-only posts carry nothing the parser can use
-        await c.send_message(target, text)
+        # Tag with the source channel's title so telegram-ingest can label
+        # the trade comment (and notifications) with where it came from —
+        # the bot otherwise only ever sees this relay chat, never the
+        # source channel itself.
+        name = names_by_id.get(event.chat_id, "")
+        tagged = f"[SRC:{name}]\n{text}" if name else text
+        await c.send_message(target, tagged)
         log(f"relayed message {event.message.id}: {text[:60].replace(chr(10), ' / ')}")
 
     names = ", ".join(f"{name} ({cid})" for cid, name in sources)

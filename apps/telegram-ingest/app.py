@@ -198,6 +198,12 @@ SYMBOL_ALIASES: dict[str, str] = {
     "USTEC": "NAS100",
 }
 
+# Messages relayed by scripts/telegram_user_forwarder.py carry a leading
+# "[SRC:<channel title>]" line identifying the original channel (the bot only
+# ever sees the relay chat, never the source channel itself). Stripped before
+# parsing so it can never be mistaken for the signal's first line.
+_SRC_TAG_RE = re.compile(r"^\[SRC:(?P<name>.+?)\]\n", re.DOTALL)
+
 _BUY_RE = re.compile(r"\b(?:buy|long)\b", re.IGNORECASE)
 _SELL_RE = re.compile(r"\b(?:sell|short)\b", re.IGNORECASE)
 _ABOVE_RE = re.compile(r"\babove\b", re.IGNORECASE)
@@ -215,6 +221,24 @@ _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 
 class SignalError(ValueError):
     """Message looked like a signal but is inconsistent — reject loudly."""
+
+
+def strip_source_tag(text: str) -> tuple[str | None, str]:
+    """Split a "[SRC:<name>]" header off the front of a relayed message.
+
+    Returns (channel_name, remaining_text). channel_name is None when the
+    message carries no tag (e.g. a message sent to the bot directly)."""
+    m = _SRC_TAG_RE.match(text)
+    if m is None:
+        return None, text
+    return m.group("name").strip(), text[m.end():]
+
+
+def channel_initials(name: str, max_len: int = 6) -> str:
+    """"Dr Devendra's Crypto Advisory" -> "DDCA"; "VIP GOLD TRADING ACADEMY"
+    -> "VGTA". Used to tag trade comments with their originating channel."""
+    letters = [w[0].upper() for w in name.split() if w[:1].isalnum()]
+    return "".join(letters)[:max_len] or "TG"
 
 
 def _blank_signal(symbol: str, side: str, entry: float) -> dict:
@@ -424,7 +448,7 @@ def select_targets(sig: dict) -> list[float]:
     return [tps[-1]] if TP_MODE == "last" else [tps[0]]
 
 
-def build_commands(sig: dict) -> list[str]:
+def build_commands(sig: dict, comment: str | None = None) -> list[str]:
     """Render a parsed signal as flat ExecRelay webhook command bodies.
 
     A signal that names its own trigger direction ("Trigger only Above") is
@@ -435,15 +459,20 @@ def build_commands(sig: dict) -> list[str]:
     target gets its own order at the fixed lot.
 
     The fixed lot is deliberate: position sizing is configured here, never
-    taken from the channel message."""
+    taken from the channel message.
+
+    comment defaults to TELEGRAM_INGEST_COMMENT; callers pass an override
+    (e.g. the originating channel's initials) to identify the source on the
+    broker side, where MT5's comment field is the only place it's visible."""
     symbol = resolve_symbol(sig["symbol"])
     secret = f",secret={SECRET}" if SECRET else ""
     targets = select_targets(sig)
+    comment = comment or COMMENT
 
     def common(tp: float) -> str:
         return (
             f"vol_lots={FIXED_LOT},sl={_fmt(sig['sl'])},tp={_fmt(tp)}"
-            f",comment={COMMENT}{secret}"
+            f",comment={comment}{secret}"
         )
 
     cmds: list[str] = []
@@ -507,6 +536,52 @@ def post_webhook(body: str) -> tuple[int, str]:
         return exc.code, exc.read().decode()[:300]
 
 
+def _command_field(body: str, key: str) -> str:
+    for part in body.split(","):
+        if part.startswith(f"{key}="):
+            return part.split("=", 1)[1]
+    return ""
+
+
+def send_notification(chat_id: int, text: str) -> None:
+    """Best-effort Telegram notification back to the chat a signal came
+    from. Never raises — a failed notification must not affect ingest."""
+    try:
+        resp = telegram_call("sendMessage", {"chat_id": chat_id, "text": text})
+        if not resp.get("ok"):
+            logger.error("notify sendMessage failed: %s", resp.get("description"))
+    except Exception as exc:
+        logger.error("notify sendMessage failed: %s", exc)
+
+
+def notify_order_placed(
+    chat_id: int, body: str, channel_name: str | None, webhook_response: str
+) -> None:
+    """Confirms the signal was accepted and routed to the broker. This is
+    ingress acceptance, not a fill confirmation — MT5 fills happen
+    asynchronously once the EA executes the order."""
+    _license, command, symbol = body.split(",", 3)[:3]
+    entry = _command_field(body, "entry_price")
+    sl = _command_field(body, "sl")
+    tp = _command_field(body, "tp")
+    vol = _command_field(body, "vol_lots")
+    trace_id = ""
+    try:
+        trace_id = json.loads(webhook_response).get("trace_id", "")
+    except Exception:
+        pass
+
+    lines = [f"✅ Order placed: {command.upper()} {symbol}"]
+    if entry:
+        lines.append(f"Entry {entry}")
+    lines.append(f"SL {sl or '-'} | TP {tp or '-'} | Lot {vol}")
+    if channel_name:
+        lines.append(f"Source: {channel_name}")
+    if trace_id:
+        lines.append(f"trace {trace_id[:12]}")
+    send_notification(chat_id, "\n".join(lines))
+
+
 # Bounded (chat_id, message_id) memory so restarts/redeliveries can't
 # double-trade within a process lifetime. Ingress-side duplicate/quota
 # checks are the durable backstop.
@@ -532,6 +607,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         return
     if not _mark_seen((chat_id, message_id)):
         return
+    channel_name, text = strip_source_tag(text)
     try:
         sig = parse_signal(text)
     except SignalError as exc:
@@ -542,6 +618,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
             TXN_LOG,
             chat_id=chat_id,
             message_id=message_id,
+            channel=channel_name,
             outcome="rejected",
             reason=str(exc),
             raw_text=text[:500],
@@ -551,7 +628,8 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         logger.debug("chat %s msg %s: not a signal", chat_id, message_id)
         return
 
-    commands = build_commands(sig)
+    comment = f"tg-{channel_initials(channel_name)}" if channel_name else None
+    commands = build_commands(sig, comment=comment)
     for body in commands:
         if DRY_RUN:
             logger.info("DRY-RUN would POST: %s", body)
@@ -559,6 +637,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
                 TXN_LOG,
                 chat_id=chat_id,
                 message_id=message_id,
+                channel=channel_name,
                 outcome="dry_run",
                 signal=sig,
                 command=body,
@@ -572,6 +651,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
                 TXN_LOG,
                 chat_id=chat_id,
                 message_id=message_id,
+                channel=channel_name,
                 outcome="webhook_error",
                 signal=sig,
                 command=body,
@@ -584,12 +664,15 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
             TXN_LOG,
             chat_id=chat_id,
             message_id=message_id,
+            channel=channel_name,
             outcome="posted",
             signal=sig,
             command=body,
             http_status=status,
             response=resp,
         )
+        if status == 200:
+            notify_order_placed(chat_id, body, channel_name, resp)
 
 
 def poll_loop() -> None:
