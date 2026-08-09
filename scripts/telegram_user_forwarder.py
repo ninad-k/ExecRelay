@@ -15,7 +15,9 @@ Setup (one time, run by the account owner — the login is interactive):
   3. TG_FORWARDER_API_ID=... TG_FORWARDER_API_HASH=... \
        python scripts/telegram_user_forwarder.py login
      (asks for your phone + the code Telegram sends you; a session file is
-     saved so this never repeats)
+     saved so this never repeats). If code delivery is flood-limited
+     (FloodWaitError on SendCodeRequest), use `qrlogin` instead: it links via
+     a QR scan from the phone app and sends no code at all.
   4. python scripts/telegram_user_forwarder.py chats
      -> lists your dialogs with numeric ids; note the source channel id and
         the relay group id
@@ -40,12 +42,31 @@ import asyncio
 import os
 import sys
 import time
+from pathlib import Path
 
 try:
     from telethon import TelegramClient, events
 except ImportError:  # pragma: no cover
     print("telethon is required: pip install telethon", file=sys.stderr)
     sys.exit(2)
+
+
+def _load_dotenv() -> None:
+    """Fill os.environ from the repo's .env so the script works when run by
+    hand, not only under local-stack.ps1 (which exports these itself).
+    Already-set variables win, so an explicit override still works."""
+    path = Path(__file__).resolve().parent.parent / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_dotenv()
 
 API_ID = os.environ.get("TG_FORWARDER_API_ID", "")
 API_HASH = os.environ.get("TG_FORWARDER_API_HASH", "")
@@ -133,6 +154,48 @@ async def cmd_resolve() -> None:
         await _resolve_all(c, TARGET_CHAT, "target")
 
 
+async def cmd_qrlogin() -> None:
+    """Log in by scanning a QR code with the Telegram app on your phone
+    (Settings -> Devices -> Link Desktop Device). No SMS/login code is sent,
+    so this also works while SendCodeRequest is flood-limited."""
+    try:
+        import qrcode
+    except ImportError:  # pragma: no cover
+        print("qrcode is required: pip install qrcode", file=sys.stderr)
+        sys.exit(2)
+    from telethon.errors import SessionPasswordNeededError
+
+    c = client()
+    await c.connect()
+    if await c.is_user_authorized():
+        me = await c.get_me()
+        log(f"already logged in as {me.first_name} (@{me.username}) — nothing to do")
+        await c.disconnect()
+        return
+
+    qr = await c.qr_login()
+    log("on your phone: Telegram -> Settings -> Devices -> Link Desktop Device, then scan:")
+    while True:
+        code = qrcode.QRCode()
+        code.add_data(qr.url)
+        code.print_ascii(invert=True)
+        print(f"(or open manually: {qr.url})")
+        try:
+            await qr.wait(30)
+            break
+        except asyncio.TimeoutError:
+            await qr.recreate()  # tokens expire every ~30s; show a fresh one
+            log("QR expired — here is a new one:")
+        except SessionPasswordNeededError:
+            import getpass
+
+            await c.sign_in(password=getpass.getpass("two-step verification password: "))
+            break
+    me = await c.get_me()
+    log(f"logged in as {me.first_name} (@{me.username}) — session saved to {SESSION}.session")
+    await c.disconnect()
+
+
 async def cmd_run() -> None:
     if not SOURCE_CHAT or not TARGET_CHAT:
         print("TG_FORWARDER_SOURCE_CHAT and TG_FORWARDER_TARGET_CHAT are required", file=sys.stderr)
@@ -175,7 +238,7 @@ async def cmd_run() -> None:
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    commands = {"login": cmd_login, "chats": cmd_chats, "resolve": cmd_resolve, "run": cmd_run}
+    commands = {"login": cmd_login, "qrlogin": cmd_qrlogin, "chats": cmd_chats, "resolve": cmd_resolve, "run": cmd_run}
     if cmd not in commands:
         print(f"usage: telegram_user_forwarder.py {'|'.join(commands)}", file=sys.stderr)
         sys.exit(2)

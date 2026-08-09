@@ -40,6 +40,7 @@ account.
 | [`docs/api/portal-api.md`](docs/api/portal-api.md) | Portal API reference, auth flow, curl examples |
 | [`docs/api/ingress.md`](docs/api/ingress.md) | Webhook + admin endpoint reference for ingress |
 | [`docs/customer/webhook-integration.md`](docs/customer/webhook-integration.md) | End-to-end customer guide: TradingView alert → broker fill |
+| [`docs/development/windows-local-stack.md`](docs/development/windows-local-stack.md) | Windows demo stack: `run.ps1`, Telegram ingest, risk sizing, trade dashboard |
 | [`docs/runbooks/`](docs/runbooks/) | On-call runbooks: ingress 5xx, postgres down, kill switch tripped, fills not arriving, license misconfigured |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records — why NATS, why FastAPI, why hand-rolled proto, etc. |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release |
@@ -47,6 +48,17 @@ account.
 ---
 
 ## Quick start
+
+### Windows demo stack (native, against a running MT5 terminal)
+
+```powershell
+.\run.ps1     # build + start everything, print webhook/dashboard/bot links
+.\stop.ps1    # stop everything
+```
+
+See [`docs/development/windows-local-stack.md`](docs/development/windows-local-stack.md)
+for services, the public TradingView webhook, Telegram setup, risk sizing,
+and the Rey Capital trade dashboard.
 
 ### Local development (any host with Docker)
 

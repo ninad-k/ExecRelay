@@ -3,14 +3,30 @@
 # execution shim and telegram-ingest, i.e. the full stack used for local
 # demo-account testing against a running MT5 terminal).
 #
+#   .\run.ps1 (repo root)                    # the usual entry point: start -Public
 #   scripts\local-stack.ps1 start            # build + start everything, wait healthy
-#   scripts\local-stack.ps1 start -Tunnel    # ...and expose ingress publicly (Cloudflare
-#                                             #    quick tunnel) so TradingView can reach it
-#   scripts\local-stack.ps1 stop             # stop everything started by this script
+#   scripts\local-stack.ps1 start -Public    # ...and print/verify the public webhook URL
+#                                             #    (direct hosting on this machine's public
+#                                             #    IP -- no tunnel service) so TradingView
+#                                             #    can reach ingress. -Tunnel is a
+#                                             #    deprecated alias for -Public.
+#   scripts\local-stack.ps1 stop             # stop everything (or .\stop.ps1)
 #   scripts\local-stack.ps1 status           # health-check each component
 #
+# Full guide: docs/development/windows-local-stack.md
+#
 # Services: nats (4222), ml-predictor (8080), ingress (8081), bridge (8082),
-# ea-shim (MT5 execution, no HTTP port), telegram-ingest (8089).
+# ea-shim (MT5 execution, no HTTP port), telegram-ingest (8089),
+# telegram-forwarder (personal-account channel relay, no HTTP port),
+# trade-dashboard (8090, localhost-only trade summary UI).
+#
+# Public hosting (-Public): TradingView only delivers webhooks to ports 80 and
+# 443, so ingress (8081) is reached through a Windows portproxy on port 80.
+# One-time setup, run as Administrator (persists across reboots):
+#   netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=127.0.0.1 connectport=8081
+#   New-NetFirewallRule -DisplayName "ExecRelay ingress 80" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow
+# plus an inbound TCP 80 rule in the cloud firewall (e.g. the AWS security
+# group). -Public verifies the portproxy and prints these commands if missing.
 #
 # Every service's stdout/stderr is written to a date-stamped file under
 # .local-stack\logs (e.g. bridge-2026-08-05.log) and files older than
@@ -24,14 +40,16 @@
 # Requires: the portable Go toolchain in .local-stack\go, a Python 3.11+
 # interpreter with MetaTrader5/websockets installed for ea-shim, a running
 # demo-account-logged-in MT5 terminal for ea-shim to attach to, and (for
-# -Tunnel) cloudflared on PATH or in Program Files.
+# -Public) the one-time port-80 portproxy/firewall setup described above.
 
 param(
     [Parameter(Position = 0)]
     [ValidateSet("start", "stop", "status")]
     [string]$Command = "status",
-    [switch]$Tunnel
+    [switch]$Public,
+    [switch]$Tunnel  # deprecated alias for -Public (kept so old invocations keep working)
 )
+if ($Tunnel) { $Public = $true }
 
 $ErrorActionPreference = "Stop"
 
@@ -47,6 +65,8 @@ $PredictorPort = 8080
 $IngressPort = 8081
 $BridgePort = 8082
 $TelegramIngestPort = 8089
+$DashboardPort = 8090
+$PublicPort = 80   # TradingView only posts webhooks to ports 80/443
 $RetentionDays = 7
 
 function Resolve-PythonExe {
@@ -148,55 +168,31 @@ function Remove-OldLogs {
         }
 }
 
-function Resolve-Cloudflared {
-    $cmd = Get-Command cloudflared -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    foreach ($candidate in @(
-        "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe",
-        "$env:ProgramFiles\cloudflared\cloudflared.exe"
-    )) {
-        if ($candidate -and (Test-Path $candidate)) { return $candidate }
-    }
+# The instance's internet-facing IP: EC2 instance metadata first (IMDSv2,
+# link-local, no external dependency), then a generic echo service for
+# non-AWS hosts. Returns $null when neither answers (fully offline box).
+function Get-PublicIP {
+    try {
+        $token = Invoke-RestMethod -Method Put -Uri "http://169.254.169.254/latest/api/token" `
+            -Headers @{ "X-aws-ec2-metadata-token-ttl-seconds" = "60" } -TimeoutSec 2
+        return (Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/public-ipv4" `
+            -Headers @{ "X-aws-ec2-metadata-token" = $token } -TimeoutSec 2)
+    } catch {}
+    try { return (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 5) } catch {}
     return $null
 }
 
-# Starts a Cloudflare quick tunnel for a local port and blocks (up to
-# $TimeoutSec) until the assigned https://*.trycloudflare.com URL shows up
-# in its log. The tunnel process is tracked via the same pid-file mechanism
-# as every other service, so Invoke-Stop kills it with no special-casing.
-function Start-CloudflareTunnel {
-    param(
-        [Parameter(Mandatory = $true)][string]$CloudflaredPath,
-        [Parameter(Mandatory = $true)][int]$Port,
-        [int]$TimeoutSec = 30
-    )
-    $logPath = Join-Path $Logs "cloudflared-tunnel.log"
-    if (Test-Path $logPath) { Remove-Item $logPath -Force }
-
-    $proc = Start-Process -FilePath $CloudflaredPath `
-        -ArgumentList @("tunnel", "--url", "http://127.0.0.1:$Port") `
-        -WindowStyle Hidden -PassThru `
-        -RedirectStandardError $logPath -RedirectStandardOutput (Join-Path $Logs "cloudflared-tunnel.out.log")
-    $proc.Id | Out-File -FilePath (Join-Path $Pids "cloudflared.pid") -Encoding ascii
-
-    $url = $null
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        if ($proc.HasExited) { break }
-        if (Test-Path $logPath) {
-            $match = Select-String -Path $logPath -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if ($match) { $url = $match.Matches[0].Value; break }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    return $url
+# True when a portproxy already forwards public port $Port to somewhere local.
+# The forward itself is one-time admin setup (see header) -- this only checks.
+function Test-PublicPortForward {
+    param([int]$Port)
+    $rules = netsh interface portproxy show v4tov4 2>$null
+    return [bool]($rules | Select-String -Pattern "(0\.0\.0\.0|\*)\s+$Port\s")
 }
 
 # Writes a double-clickable Windows internet shortcut pointing at the current
-# public tunnel URL. Quick tunnels get a new random URL every run, so this is
-# overwritten (or removed, if no tunnel came up) each time -- a leftover
-# shortcut would otherwise point at a dead tunnel.
+# public webhook URL, or removes it when the stack has no public exposure so
+# a leftover shortcut never points at a dead endpoint.
 function Set-PublicLinkFile {
     param([string]$Path, [string]$Url)
     if ($Url) {
@@ -274,9 +270,13 @@ function Invoke-Start {
     Start-Tracked -Name "ea-shim" -FilePath $python -ArgumentList @("scripts\ea_shim.py") | Out-Null
 
     if ($env:TELEGRAM_INGEST_BOT_TOKEN -and $env:TELEGRAM_INGEST_ALLOWED_CHAT_IDS) {
+        # When the perimeter gate is on, every webhook caller (including the
+        # internal ingest module) must carry ?token=<value>.
+        $webhookUrl = "http://127.0.0.1:$IngressPort/webhook"
+        if ($env:INGRESS_PERIMETER_TOKEN) { $webhookUrl += "?token=$($env:INGRESS_PERIMETER_TOKEN)" }
         Start-Tracked -Name "telegram-ingest" -FilePath $python -ArgumentList @("apps\telegram-ingest\app.py") -Env @{
             HTTP_ADDR = "0.0.0.0:$TelegramIngestPort"
-            TELEGRAM_INGEST_WEBHOOK_URL = "http://127.0.0.1:$IngressPort/webhook"
+            TELEGRAM_INGEST_WEBHOOK_URL = $webhookUrl
         } | Out-Null
         Start-Sleep -Seconds 2
         Wait-Http -Name "telegram-ingest" -Url "http://127.0.0.1:$TelegramIngestPort/health"
@@ -284,24 +284,49 @@ function Invoke-Start {
         Write-Warning "skipping telegram-ingest: TELEGRAM_INGEST_BOT_TOKEN / TELEGRAM_INGEST_ALLOWED_CHAT_IDS not set in .env"
     }
 
-    if ($Tunnel) {
-        $cloudflared = Resolve-Cloudflared
-        if (-not $cloudflared) {
-            Write-Warning "cloudflared not found -- skipping public tunnel. Install: winget install Cloudflare.cloudflared"
+    # Personal-account channel relay. Needs a one-time interactive login
+    # (python scripts\telegram_user_forwarder.py login) done by the account
+    # owner beforehand; if the session isn't authorized the process exits and
+    # the error lands in telegram-forwarder-<date>.err.log.
+    if ($env:TG_FORWARDER_API_ID -and $env:TG_FORWARDER_SOURCE_CHAT -and $env:TG_FORWARDER_TARGET_CHAT) {
+        Start-Tracked -Name "telegram-forwarder" -FilePath $python `
+            -ArgumentList @("scripts\telegram_user_forwarder.py", "run") | Out-Null
+    } else {
+        Write-Warning "skipping telegram-forwarder: TG_FORWARDER_SOURCE_CHAT / TG_FORWARDER_TARGET_CHAT (or API_ID) not set in .env -- Telegram signals will only flow if posted directly to the ingest bot's chat"
+    }
+
+    # Localhost-only (shows account balances, has no auth) -- keep it off the
+    # public interface even though ingress itself is exposed.
+    Start-Tracked -Name "trade-dashboard" -FilePath $python `
+        -ArgumentList @("scripts\trade_dashboard.py") -Env @{
+        DASHBOARD_ADDR = "127.0.0.1:$DashboardPort"
+    } | Out-Null
+    Wait-Http -Name "trade-dashboard" -Url "http://127.0.0.1:$DashboardPort/health"
+
+    if ($Public) {
+        $ip = Get-PublicIP
+        if (-not $ip) {
+            Write-Warning "could not determine this machine's public IP -- no public webhook URL available"
         } else {
-            Write-Host "starting Cloudflare quick tunnel for ingress..."
-            $url = Start-CloudflareTunnel -CloudflaredPath $cloudflared -Port $IngressPort
-            if ($url) {
-                Set-PublicLinkFile -Path $PublicLinkPath -Url $url
-                Write-Host "  public ingress URL: $url"
-                Write-Host "  webhook endpoints:  $url/webhook  and  $url/webhook/ml"
-                Write-Warning "reachable from the public internet until this stack is stopped -- still requires a valid license/secret to place a trade, but treat the URL as sensitive and tear it down (stop) when you're done testing."
-            } else {
-                Write-Warning "tunnel didn't report a URL in time -- check .local-stack\logs\cloudflared-tunnel.log"
+            if (-not (Test-PublicPortForward -Port $PublicPort)) {
+                Write-Warning ("public port $PublicPort is not forwarded to ingress yet. One-time setup, run as Administrator:`n" +
+                    "  netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$PublicPort connectaddress=127.0.0.1 connectport=$IngressPort`n" +
+                    "  New-NetFirewallRule -DisplayName 'ExecRelay ingress $PublicPort' -Direction Inbound -Protocol TCP -LocalPort $PublicPort -Action Allow`n" +
+                    "and allow inbound TCP $PublicPort in the cloud firewall (AWS security group) for this instance.")
             }
+            $url = "http://$ip"
+            Set-PublicLinkFile -Path $PublicLinkPath -Url $url
+            Write-Host "  public ingress URL: $url"
+            Write-Host "  webhook endpoints:  $url/webhook  and  $url/webhook/ml  (TradingView needs port 80/443)"
+            Write-Warning "reachable from the public internet while port $PublicPort stays open -- still requires a valid license/secret to place a trade, but treat the URL as sensitive."
         }
     }
 
+    $botUser = if ($env:TELEGRAM_BOT_USERNAME) { $env:TELEGRAM_BOT_USERNAME } else { "TeleGoldSignalsBot" }
+    Write-Host ""
+    Write-Host "  trade dashboard:  http://127.0.0.1:$DashboardPort  (local only)"
+    Write-Host "  telegram bot:     https://t.me/$botUser  (order + open/close notifications)"
+    Write-Host ""
     Write-Host "stack is up. EA connects to 127.0.0.1:$BridgePort (instance: test-instance)."
 }
 
@@ -322,7 +347,7 @@ function Invoke-Stop {
         }
         Remove-Item $f.FullName -Force
     }
-    # The tunnel dies with cloudflared; a leftover shortcut would point at a dead URL.
+    # Ingress is down, so the public webhook URL no longer answers.
     Set-PublicLinkFile -Path $PublicLinkPath -Url $null
 }
 
@@ -331,22 +356,25 @@ function Invoke-Status {
     Test-Health -Name "ingress" -Url "http://127.0.0.1:$IngressPort/health"
     Test-Health -Name "bridge" -Url "http://127.0.0.1:$BridgePort/health"
     Test-Health -Name "telegram-ingest" -Url "http://127.0.0.1:$TelegramIngestPort/health"
-    $shimPidFile = Join-Path $Pids "ea-shim.pid"
-    if (Test-Path $shimPidFile) {
-        $procId = Get-Content $shimPidFile | Select-Object -First 1
-        if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
-            Write-Host "ea-shim: running (pid $procId)"
+    Test-Health -Name "trade-dashboard" -Url "http://127.0.0.1:$DashboardPort/health"
+    foreach ($name in @("ea-shim", "telegram-forwarder")) {
+        $pidFile = Join-Path $Pids "$name.pid"
+        if (Test-Path $pidFile) {
+            $procId = Get-Content $pidFile | Select-Object -First 1
+            if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
+                Write-Host "$name`: running (pid $procId)"
+            } else {
+                Write-Host "$name`: DOWN (stale pid file)"
+            }
         } else {
-            Write-Host "ea-shim: DOWN (stale pid file)"
+            Write-Host "$name`: not started"
         }
-    } else {
-        Write-Host "ea-shim: not started"
     }
     if (Test-Path $PublicLinkPath) {
         $line = Get-Content $PublicLinkPath | Where-Object { $_ -like "URL=*" } | Select-Object -First 1
-        Write-Host "public tunnel: $($line -replace '^URL=', '')"
+        Write-Host "public webhook: $($line -replace '^URL=', '')/webhook"
     } else {
-        Write-Host "public tunnel: not running"
+        Write-Host "public webhook: not exposed (start with -Public)"
     }
 }
 

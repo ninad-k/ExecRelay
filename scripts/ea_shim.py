@@ -20,13 +20,22 @@ Environment overrides:
     EA_SHIM_INSTANCE_ID  default test-instance (must match EXECRELAY_LICENSES)
     EA_SHIM_TOKEN        default test-bridge-token (must match BRIDGE_AUTH_TOKEN)
     EA_SHIM_MAGIC        default 20240101 (order magic; isolates shim positions)
+    EA_SHIM_RISK_USD     max $ loss per order; sizes the lot from the SL
+                         distance, overriding the signal's vol_lots. 0 = off.
+    EA_SHIM_NOTIFY_CHAT_ID  Telegram chat for open/close notifications
+                         (default: first TELEGRAM_INGEST_ALLOWED_CHAT_IDS entry;
+                         sent via TELEGRAM_INGEST_BOT_TOKEN, empty = disabled)
 """
 
 import asyncio
 import json
+import math
 import os
 import sys
+import threading
 import time
+import urllib.request
+from datetime import datetime, timedelta
 
 import MetaTrader5 as mt5
 import websockets
@@ -49,6 +58,15 @@ PENDING_FALLBACK = os.environ.get("EA_SHIM_PENDING_FALLBACK", "true").lower() in
     "yes",
     "on",
 )
+RISK_USD = float(os.environ.get("EA_SHIM_RISK_USD", "0") or 0)
+
+NOTIFY_TOKEN = os.environ.get("TELEGRAM_INGEST_BOT_TOKEN", "")
+_notify_chat_raw = (
+    os.environ.get("EA_SHIM_NOTIFY_CHAT_ID")
+    or os.environ.get("TELEGRAM_INGEST_ALLOWED_CHAT_IDS", "").split(",")[0]
+).strip()
+NOTIFY_CHAT = int(_notify_chat_raw) if _notify_chat_raw.lstrip("-").isdigit() else 0
+POSITION_POLL_SECS = 5
 
 
 def log(*a):
@@ -83,6 +101,113 @@ def fnum(params, *keys, default=0.0):
             except (TypeError, ValueError):
                 pass
     return default
+
+
+def sized_volume(symbol, ref_price, sl, requested, risk_usd):
+    """$-risk position sizing: the largest lot whose loss from ref_price to
+    the SL stays within risk_usd, floored to the broker's volume step.
+
+    Returns the requested volume unchanged when sizing can't run (no risk
+    budget, no SL, missing symbol specs), and 0.0 when even the minimum lot
+    would lose more than risk_usd — the caller must reject, not oversize.
+    """
+    if risk_usd <= 0 or sl <= 0 or ref_price <= 0:
+        return requested
+    info = mt5.symbol_info(symbol)
+    if info is None or info.trade_tick_value <= 0 or info.trade_tick_size <= 0:
+        log(f"risk sizing: no specs for {symbol}; keeping vol {requested}")
+        return requested
+    distance = abs(ref_price - sl)
+    if distance <= 0:
+        return requested
+    loss_per_lot = distance / info.trade_tick_size * info.trade_tick_value
+    step = info.volume_step or 0.01
+    vol = math.floor(risk_usd / loss_per_lot / step) * step
+    vol = round(vol, 8)  # kill float dust like 0.19999999
+    if vol < info.volume_min:
+        return 0.0
+    return min(vol, info.volume_max)
+
+
+def tg_notify(text):
+    """Best-effort Telegram message to the signal chat. Never raises."""
+    if not (NOTIFY_TOKEN and NOTIFY_CHAT):
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
+            data=json.dumps({"chat_id": NOTIFY_CHAT, "text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        log(f"telegram notify failed: {e!r}")
+
+
+def _fmt_position(p):
+    side = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
+    return f"{side} {p.symbol} {p.volume:g} lot @ {p.price_open:g}"
+
+
+def _closed_result(ticket):
+    """Realized P/L (incl. commission/swap) and close price of a position
+    that just left the open-positions list."""
+    deals = (
+        mt5.history_deals_get(
+            datetime.now() - timedelta(days=7),
+            datetime.now() + timedelta(days=1),
+            position=ticket,
+        )
+        or []
+    )
+    out = [d for d in deals if d.entry != mt5.DEAL_ENTRY_IN]
+    profit = sum(d.profit + d.commission + d.swap for d in out)
+    price = out[-1].price if out else 0.0
+    return profit, price
+
+
+def position_monitor():
+    """Notify Telegram when a shim-owned position opens (market fill or a
+    pending order triggering) and when one closes (with realized P/L)."""
+    known = None
+    while True:
+        try:
+            current = {
+                p.ticket: p for p in (mt5.positions_get() or []) if p.magic == MAGIC
+            }
+            if known is not None:
+                for ticket, p in current.items():
+                    if ticket not in known:
+                        tg_notify(
+                            f"🟢 Trade opened\n{_fmt_position(p)}\n"
+                            f"SL {p.sl:g} | TP {p.tp:g}"
+                        )
+                for ticket, p in known.items():
+                    if ticket not in current:
+                        profit, close_price = _closed_result(ticket)
+                        sign = "+" if profit >= 0 else "-"
+                        tg_notify(
+                            f"{'✅' if profit >= 0 else '❌'} Trade closed\n"
+                            f"{_fmt_position(p)} -> {close_price:g}\n"
+                            f"P/L {sign}${abs(profit):.2f}"
+                        )
+                        log_txn(
+                            TXN_LOG,
+                            event="position_closed",
+                            position=ticket,
+                            symbol=p.symbol,
+                            side="buy" if p.type == mt5.POSITION_TYPE_BUY else "sell",
+                            volume=p.volume,
+                            open_price=p.price_open,
+                            close_price=close_price,
+                            profit=round(profit, 2),
+                        )
+            known = current
+        except Exception as e:
+            log(f"position monitor error: {e!r}")
+        time.sleep(POSITION_POLL_SECS)
 
 
 def send_market(action_type, symbol, volume, comment, sl=0.0, tp=0.0):
@@ -186,12 +311,50 @@ _PENDING_TYPES = {
 def execute(trace_id, command, symbol, params):
     """Execute one signal. Returns (status, order_id, err) where status is
     "filled" for executed orders, "placed" for resting pendings."""
+    # Broker symbol-name fallback: many brokers suffix their instruments
+    # (XAUUSD_ here). If the exact name is unknown, try common variants
+    # rather than failing the order on a naming mismatch.
+    if mt5.symbol_info(symbol) is None:
+        for variant in (f"{symbol}_", f"{symbol}.", f"{symbol}m"):
+            if mt5.symbol_info(variant) is not None:
+                log(f"symbol {symbol} unknown to broker; using {variant}")
+                symbol = variant
+                break
     mt5.symbol_select(symbol, True)
     volume = fnum(params, "volume", "vol_lots", default=0.01)
     comment = params.get("comment", "execrelay-shim")
     sl = fnum(params, "sl")
     tp = fnum(params, "tp")
     cmd = command.lower()
+
+    # $-risk sizing for every order that opens exposure. A per-order `risk`
+    # param (how telegram-ingest splits its per-signal budget across legs)
+    # wins over the env-level default. The reference price is the stated
+    # entry for pendings, the current market for the rest.
+    _opens = {"buy", "sell", "closelongopenshort", "closeshortopenlong"}
+    if cmd in _opens or cmd in _PENDING_TYPES:
+        risk_usd = fnum(params, "risk", default=RISK_USD)
+        if cmd in _PENDING_TYPES:
+            ref = fnum(params, "entry", "entry_price")
+        else:
+            t = mt5.symbol_info_tick(symbol)
+            buys = cmd in ("buy", "closeshortopenlong")
+            ref = (t.ask if buys else t.bid) if t else 0.0
+        sized = sized_volume(symbol, ref, sl, volume, risk_usd)
+        if sized <= 0:
+            err = (
+                f"risk sizing: minimum lot for {symbol} already risks more "
+                f"than ${risk_usd:g} at SL {sl:g} (ref {ref:g})"
+            )
+            log(f"signal trace={trace_id} REJECTED: {err}")
+            return "rejected", "", err
+        if sized != volume:
+            log(
+                f"risk sizing: vol {volume:g} -> {sized:g} "
+                f"(${risk_usd:g} over {abs(ref - sl):g} SL distance)"
+            )
+        volume = sized
+
     log(f"signal trace={trace_id} cmd={cmd} {symbol} vol={volume}")
 
     if cmd == "buy":
@@ -319,6 +482,8 @@ async def run_session():
                         command=command,
                         symbol=symbol,
                         volume=params.get("volume") or params.get("vol_lots"),
+                        risk=params.get("risk"),
+                        comment=params.get("comment"),
                         sl=params.get("sl"),
                         tp=params.get("tp"),
                         entry=params.get("entry") or params.get("entry_price"),
@@ -335,6 +500,11 @@ async def run_session():
 
 async def main():
     init_mt5()
+    if RISK_USD > 0:
+        log(f"risk sizing active: max ${RISK_USD:g} loss per order")
+    if NOTIFY_TOKEN and NOTIFY_CHAT:
+        threading.Thread(target=position_monitor, daemon=True).start()
+        log(f"position monitor active: notifying chat {NOTIFY_CHAT}")
     while True:
         try:
             await run_session()

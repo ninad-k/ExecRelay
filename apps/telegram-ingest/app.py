@@ -56,6 +56,14 @@ SECRET = os.environ.get("TELEGRAM_INGEST_SECRET", "")
 FIXED_LOT = os.environ.get("TELEGRAM_INGEST_FIXED_LOT", "0.01")
 COMMENT = os.environ.get("TELEGRAM_INGEST_COMMENT", "tg-ingest")
 
+# Total $ risk budget per SIGNAL. When set, orders carry `risk=<budget/N>`
+# (N = number of orders the signal expands into) instead of a fixed lot, and
+# the executor sizes each lot from its SL distance — so one signal can never
+# lose more than this in total, no matter how many legs/targets it has.
+# Empty = legacy fixed-lot behavior.
+_risk_raw = os.environ.get("TELEGRAM_INGEST_RISK_USD", "").strip()
+RISK_USD_TOTAL = float(_risk_raw) if _risk_raw else 0.0
+
 # Adapter-level symbol rewrite ("GOLD=XAUUSD;US30=US30.Cash"). The EA has its
 # own per-terminal map; this one is for channel jargon -> canonical name.
 SYMBOL_MAP = {
@@ -469,9 +477,17 @@ def build_commands(sig: dict, comment: str | None = None) -> list[str]:
     targets = select_targets(sig)
     comment = comment or COMMENT
 
+    # Split the per-signal risk budget evenly over every order this signal
+    # expands into, so the SIGNAL total — not each leg — is the cap.
+    n_orders = len(targets) * (2 if sig["second"] is not None else 1)
+    if RISK_USD_TOTAL > 0:
+        sizing = f"risk={round(RISK_USD_TOTAL / n_orders, 2):g}"
+    else:
+        sizing = f"vol_lots={FIXED_LOT}"
+
     def common(tp: float) -> str:
         return (
-            f"vol_lots={FIXED_LOT},sl={_fmt(sig['sl'])},tp={_fmt(tp)}"
+            f"{sizing},sl={_fmt(sig['sl'])},tp={_fmt(tp)}"
             f",comment={comment}{secret}"
         )
 
@@ -565,6 +581,7 @@ def notify_order_placed(
     sl = _command_field(body, "sl")
     tp = _command_field(body, "tp")
     vol = _command_field(body, "vol_lots")
+    risk = _command_field(body, "risk")
     trace_id = ""
     try:
         trace_id = json.loads(webhook_response).get("trace_id", "")
@@ -574,7 +591,8 @@ def notify_order_placed(
     lines = [f"✅ Order placed: {command.upper()} {symbol}"]
     if entry:
         lines.append(f"Entry {entry}")
-    lines.append(f"SL {sl or '-'} | TP {tp or '-'} | Lot {vol}")
+    size = f"Lot {vol}" if vol else (f"Risk ${risk}" if risk else "Lot auto")
+    lines.append(f"SL {sl or '-'} | TP {tp or '-'} | {size}")
     if channel_name:
         lines.append(f"Source: {channel_name}")
     if trace_id:
