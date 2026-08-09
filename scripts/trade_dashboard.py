@@ -290,8 +290,15 @@ def _signal_stats() -> dict:
     }
 
 
-def _order_stats() -> dict:
+def _order_stats(source: str | None = None) -> dict:
+    """`source`, when given, restricts to orders whose comment-derived source
+    matches (telegram/tradingview). mt5-fills.log only ever logs this stack's
+    own orders (telegram/tradingview by comment prefix) -- "other" EA/manual
+    activity never appears here, so source="other" naturally yields empty
+    buckets/recent rows rather than needing special-casing."""
     rows = [r for r in _read_txn("mt5-fills") if r.get("command")]
+    if source:
+        rows = [r for r in rows if _source_of(r.get("comment", "")) == source]
     out = {"telegram": _empty_bucket(), "tradingview": _empty_bucket()}
     recent = []
     for r in rows:
@@ -429,7 +436,14 @@ def _closed_positions(days: int, journal: dict) -> tuple[list[dict], float | Non
     return grouped, offset
 
 
-def _mt5_stats(journal: dict, days: int) -> dict:
+def _mt5_stats(journal: dict, days: int, source: str | None = None) -> dict:
+    """`source`, when given ("telegram"/"tradingview"/"other"), restricts open
+    positions and the closed-trades window (count/wins/losses/net/rows/daily/
+    review_queue) to that source. `closed.by_source` is the one exception --
+    it is always computed from the *unfiltered* closed set, because the
+    "Performance by source" section is a three-way comparison that must stay
+    visible regardless of which source is selected (the UI highlights the
+    selected row instead of hiding the others)."""
     if not _ensure_mt5():
         return {"available": False}
     acct = mt5.account_info()
@@ -440,10 +454,10 @@ def _mt5_stats(journal: dict, days: int) -> dict:
         _mt5_reset()
         return {"available": False}
 
-    open_rows = []
+    open_rows_all = []
     positions = mt5.positions_get() or []
     for p in positions:
-        open_rows.append(
+        open_rows_all.append(
             {
                 "ticket": p.ticket,
                 "symbol": p.symbol,
@@ -456,14 +470,16 @@ def _mt5_stats(journal: dict, days: int) -> dict:
                 "source": _deal_source(p.magic, p.comment),
             }
         )
-    open_floating = round(sum(p.profit for p in positions), 2) if positions else 0.0
+    open_rows = [r for r in open_rows_all if r["source"] == source] if source else open_rows_all
+    open_floating = round(sum(r["profit"] for r in open_rows), 2) if open_rows else 0.0
 
-    grouped, offset = _closed_positions(days, journal)
+    grouped_all, offset = _closed_positions(days, journal)
     time_label = "UTC" if offset is not None else "broker time"
+    grouped = [r for r in grouped_all if r["source"] == source] if source else grouped_all
 
     wins = [r for r in grouped if r["profit"] >= 0]
     by_source: dict[str, float] = {"telegram": 0.0, "tradingview": 0.0, "other": 0.0}
-    for r in grouped:
+    for r in grouped_all:
         by_source[r["source"]] = round(by_source.get(r["source"], 0.0) + r["profit"], 2)
 
     review_queue = [r for r in grouped if not r.get("journal")][:8]
@@ -493,23 +509,31 @@ def _mt5_stats(journal: dict, days: int) -> dict:
     }
 
 
-def summary(days: int = 7) -> dict:
+def summary(days: int = 7, source: str | None = None) -> dict:
+    """`source` ("telegram"/"tradingview"/"other"), when given, filters orders,
+    open positions and the closed-trades window throughout. Signals are left
+    unfiltered (they are inherently telegram-only; the client hides that
+    section instead when a non-telegram source is selected) and the
+    "Performance by source" comparison inside mt5.closed.by_source is always
+    computed unfiltered -- see _mt5_stats. source=None (the default) must
+    produce byte-for-byte the same numbers as before this parameter existed."""
     journal = _load_journal()
     journaled = [j for j in journal.values() if j.get("setup") or j.get("notes") or j.get("rating")]
     ratings = [j["rating"] for j in journaled if j.get("rating")]
     return {
         "updated": datetime.now(timezone.utc).isoformat(),
         "days": days,
+        "source": source or "",
         "signals": _signal_stats(),
-        "orders": _order_stats(),
-        "mt5": _mt5_stats(journal, days),
+        "orders": _order_stats(source),
+        "mt5": _mt5_stats(journal, days, source),
         "journal": {
             "entries": len(journaled),
             "reviewed": sum(1 for j in journaled if j.get("reviewed")),
             "avg_rating": round(sum(ratings) / len(ratings), 1) if ratings else None,
             "emotions": EMOTIONS,
         },
-        "risk": risk_panel(days),
+        "risk": risk_panel(days, source),
     }
 
 
@@ -560,12 +584,14 @@ def _write_csv(header: list[str], data_rows: list[list]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def trades_csv(days: int) -> bytes:
+def trades_csv(days: int, source: str | None = None) -> bytes:
     """ReyLens import-template column order for closed (grouped) trades."""
     journal = _load_journal()
     rows: list[dict] = []
     if _ensure_mt5() and mt5.account_info() is not None:
         rows, _ = _closed_positions(days, journal)
+        if source:
+            rows = [r for r in rows if r["source"] == source]
     elif _mt5_state["ready"] and mt5 is not None and mt5.account_info() is None:
         _mt5_reset()
 
@@ -643,6 +669,15 @@ def _parse_days(path: str) -> int:
     except ValueError:
         d = 7
     return max(1, min(120, d))
+
+
+_VALID_SOURCES = ("telegram", "tradingview", "other")
+
+
+def _parse_source(path: str) -> str | None:
+    qs = parse_qs(urlsplit(path).query)
+    raw = (qs.get("source") or [""])[0].strip().lower()
+    return raw if raw in _VALID_SOURCES else None
 
 
 # ---------------------------------------------------------------------------
@@ -875,18 +910,35 @@ def _live_risk() -> dict:
     }
 
 
-def _compliance(days: int) -> dict:
+def _compliance(days: int, source: str | None = None) -> dict:
+    """Stack-level (telegram+tradingview) risk-cap compliance, keyed off the
+    orders table's `source` column. `source`, when given, restricts both rows
+    to that source; "other" naturally yields empty (the orders table never
+    records "other"-EA activity -- only this stack's own telegram/tradingview
+    orders go through it)."""
     cutoff = _cutoff_iso(days)
-    risk_orders = ts.query(
-        "SELECT trace_id, ts, symbol, requested_risk, status FROM orders "
-        "WHERE requested_risk IS NOT NULL AND ts >= ? ORDER BY ts DESC",
-        (cutoff,),
-    )
-    rejections = ts.query(
-        "SELECT trace_id, ts, symbol, error FROM orders "
-        "WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ? ORDER BY ts DESC",
-        (cutoff,),
-    )
+    if source:
+        risk_orders = ts.query(
+            "SELECT trace_id, ts, symbol, requested_risk, status FROM orders "
+            "WHERE requested_risk IS NOT NULL AND ts >= ? AND source = ? ORDER BY ts DESC",
+            (cutoff, source),
+        )
+        rejections = ts.query(
+            "SELECT trace_id, ts, symbol, error FROM orders "
+            "WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ? AND source = ? ORDER BY ts DESC",
+            (cutoff, source),
+        )
+    else:
+        risk_orders = ts.query(
+            "SELECT trace_id, ts, symbol, requested_risk, status FROM orders "
+            "WHERE requested_risk IS NOT NULL AND ts >= ? ORDER BY ts DESC",
+            (cutoff,),
+        )
+        rejections = ts.query(
+            "SELECT trace_id, ts, symbol, error FROM orders "
+            "WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ? ORDER BY ts DESC",
+            (cutoff,),
+        )
     max_risk = max((r["requested_risk"] for r in risk_orders), default=None)
     return {
         "cap_usd": EA_SHIM_RISK_USD,
@@ -897,19 +949,24 @@ def _compliance(days: int) -> dict:
     }
 
 
-def risk_panel(days: int = 30) -> dict:
+def risk_panel(days: int = 30, source: str | None = None) -> dict:
+    """equity_curve and live margin are account-level and always unfiltered
+    (labeled "account-wide" client-side); only compliance is source-filtered."""
     return {
         "days": days,
         "equity_curve": _equity_curve(days),
         "live": _live_risk(),
-        "compliance": _compliance(days),
+        "compliance": _compliance(days, source),
     }
 
 
 # --- monthly P/L calendar -----------------------------------------------
 
 
-def calendar_month(month: str, stack_only: bool = True) -> dict:
+def calendar_month(month: str, stack_only: bool = True, source: str | None = None) -> dict:
+    """`source`, when given, takes priority over `stack_only` and restricts
+    the month to that single source; otherwise `stack_only` behaves as
+    before (excludes "other" EA/manual activity when true)."""
     now = datetime.now(timezone.utc)
     try:
         year_s, mon_s = month.split("-", 1)
@@ -925,7 +982,9 @@ def calendar_month(month: str, stack_only: bool = True) -> dict:
         "SELECT close_ts, profit, source FROM closed_trades WHERE close_ts >= ? AND close_ts < ?",
         (start.isoformat(), end.isoformat()),
     )
-    if stack_only:
+    if source:
+        rows = [r for r in rows if r.get("source") == source]
+    elif stack_only:
         rows = [r for r in rows if r.get("source") != "other"]
 
     daily: dict[str, dict] = {}
@@ -953,18 +1012,33 @@ def calendar_month(month: str, stack_only: bool = True) -> dict:
         "prev": f"{prev_ref.year:04d}-{prev_ref.month:02d}",
         "next": f"{end.year:04d}-{end.month:02d}",
         "stack_only": stack_only,
+        "source": source or "",
     }
 
 
 # --- digest text -----------------------------------------------------------
 
 
-def _digest_period(days: int) -> dict:
+def _digest_period(days: int, source: str | None = None) -> dict:
+    """`source`, when given, restricts signals/orders/closed-trade counts to
+    that source (signals has no source column, so it zeroes for non-telegram
+    sources). Equity/margin readouts stay account-level/unfiltered. Callers
+    that omit `source` (the Telegram digest thread, --digest-now CLI) see no
+    behavior change."""
     cutoff = _cutoff_iso(days)
-    received = len(ts.query("SELECT 1 FROM signals WHERE ts >= ?", (cutoff,)))
-    order_rows = ts.query("SELECT status FROM orders WHERE ts >= ?", (cutoff,))
+    if source and source != "telegram":
+        received = 0
+    else:
+        received = len(ts.query("SELECT 1 FROM signals WHERE ts >= ?", (cutoff,)))
+    if source:
+        order_rows = ts.query("SELECT status FROM orders WHERE ts >= ? AND source = ?", (cutoff, source))
+        closed_rows = ts.query(
+            "SELECT profit, source FROM closed_trades WHERE close_ts >= ? AND source = ?", (cutoff, source)
+        )
+    else:
+        order_rows = ts.query("SELECT status FROM orders WHERE ts >= ?", (cutoff,))
+        closed_rows = ts.query("SELECT profit, source FROM closed_trades WHERE close_ts >= ?", (cutoff,))
     executed = sum(1 for o in order_rows if o.get("status") in ("filled", "placed"))
-    closed_rows = ts.query("SELECT profit, source FROM closed_trades WHERE close_ts >= ?", (cutoff,))
     wins = sum(1 for c in closed_rows if (c.get("profit") or 0) >= 0)
     losses = len(closed_rows) - wins
     net = round(sum(c.get("profit") or 0 for c in closed_rows), 2)
@@ -972,10 +1046,17 @@ def _digest_period(days: int) -> dict:
     for c in closed_rows:
         s = c.get("source") or "other"
         by_source[s] = round(by_source.get(s, 0.0) + (c.get("profit") or 0.0), 2)
-    rej = ts.query(
-        "SELECT COUNT(*) AS n FROM orders WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ?",
-        (cutoff,),
-    )
+    if source:
+        rej = ts.query(
+            "SELECT COUNT(*) AS n FROM orders WHERE status='rejected' AND error LIKE 'risk sizing%' "
+            "AND ts >= ? AND source = ?",
+            (cutoff, source),
+        )
+    else:
+        rej = ts.query(
+            "SELECT COUNT(*) AS n FROM orders WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ?",
+            (cutoff,),
+        )
     risk_cap_events = rej[0]["n"] if rej else 0
 
     equity_now = None
@@ -1207,20 +1288,24 @@ def _mgmt_thread_loop() -> None:
 # --- weekly XLSX export --------------------------------------------------
 
 
-def build_weekly_xlsx(days: int = 7) -> bytes | None:
-    """Returns None if openpyxl isn't installed -- caller responds 501."""
+def build_weekly_xlsx(days: int = 7, source: str | None = None) -> bytes | None:
+    """Returns None if openpyxl isn't installed -- caller responds 501.
+    `source`, when given, filters the Summary figures and the Closed Trades
+    sheet to that source; the Scorecard sheet stays unfiltered (it is itself
+    the source comparison) and Equity stays account-level."""
     try:
         from openpyxl import Workbook
     except ImportError:
         return None
 
-    d = _digest_period(days)
+    d = _digest_period(days, source)
     wb = Workbook()
 
     ws = wb.active
     ws.title = "Summary"
     ws.append(["Rey Capital — Weekly Management Report"])
     ws.append(["Period (days)", days])
+    ws.append(["Source filter", source or "All sources"])
     ws.append(["Generated (UTC)", datetime.now(timezone.utc).isoformat()])
     ws.append([])
     ws.append(["Signals received", d["received"]])
@@ -1237,11 +1322,19 @@ def build_weekly_xlsx(days: int = 7) -> bytes | None:
     ws.append(["Risk-cap rejections", d["risk_cap_events"]])
 
     cutoff = _cutoff_iso(days)
-    closed_rows = ts.query(
-        "SELECT position_id, close_ts, symbol, side, volume, entry_price, close_price, "
-        "profit, magic, comment, source FROM closed_trades WHERE close_ts >= ? ORDER BY close_ts DESC",
-        (cutoff,),
-    )
+    if source:
+        closed_rows = ts.query(
+            "SELECT position_id, close_ts, symbol, side, volume, entry_price, close_price, "
+            "profit, magic, comment, source FROM closed_trades WHERE close_ts >= ? AND source = ? "
+            "ORDER BY close_ts DESC",
+            (cutoff, source),
+        )
+    else:
+        closed_rows = ts.query(
+            "SELECT position_id, close_ts, symbol, side, volume, entry_price, close_price, "
+            "profit, magic, comment, source FROM closed_trades WHERE close_ts >= ? ORDER BY close_ts DESC",
+            (cutoff,),
+        )
     ws2 = wb.create_sheet("Closed Trades")
     ct_header = [
         "position_id", "close_ts", "symbol", "side", "volume", "entry_price",
@@ -1347,15 +1440,35 @@ body {
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-thumb { background: var(--color-border-light); border-radius: 2px; }
 
+.topbar { position: sticky; top: 0; z-index: 20; }
 header {
-  position: sticky; top: 0; z-index: 10;
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
   gap: 1rem; padding: 0.875rem 1.5rem;
   background: color-mix(in srgb, var(--color-surface) 85%, transparent 15%);
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--color-border);
   box-shadow: 0 1px 0 color-mix(in srgb, var(--color-primary) 6%, transparent), 0 4px 16px rgb(0 0 0 / 0.25);
 }
+.controlsbar {
+  display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap;
+  padding: 0.5rem 1.5rem;
+  background: color-mix(in srgb, var(--color-surface-2) 90%, transparent 10%);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.2);
+}
+.ctrl-group { display: flex; align-items: center; gap: 0.5rem; }
+.ctrl-label { font-size: 0.66rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--color-text-muted); }
+.seg-select {
+  background: var(--color-background); color: var(--color-text);
+  border: 1px solid var(--color-border-light); border-radius: 999px;
+  padding: 0.28rem 1.9rem 0.28rem 0.8rem; font-size: 0.74rem; cursor: pointer;
+  font-family: inherit;
+  appearance: none; -webkit-appearance: none; -moz-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%234e7aab' stroke-width='1.4'/></svg>");
+  background-repeat: no-repeat; background-position: right 0.7rem center; background-size: 0.6rem;
+}
+.seg-select:focus { outline: 1px solid var(--color-primary); }
+.controlsbar .icon-btn { margin-left: auto; }
 .brand { display: flex; align-items: center; gap: 0.65rem; }
 .logo-tile {
   width: 2.25rem; height: 2.25rem; border-radius: 0.5rem; background: #004AAC;
@@ -1395,6 +1508,14 @@ h2 { font-size: 0.82rem; letter-spacing: 0.08em; text-transform: uppercase; colo
 h2 .chip { font-size: 0.65rem; letter-spacing: normal; text-transform: none; border-radius: 999px; padding: 0.1rem 0.6rem; border: 1px solid var(--color-border-light); color: var(--color-text-muted); }
 .grid2 { display: grid; grid-template-columns: 1fr; gap: 1.5rem; }
 @media (min-width: 1100px) { .grid2 { grid-template-columns: 1fr 1fr; } }
+.grid3 { display: grid; grid-template-columns: 1fr; gap: 1.5rem; }
+@media (min-width: 1100px) { .grid3 { grid-template-columns: 1fr 1fr 1.6fr; } }
+.donut-card svg { width: 100%; height: 170px; display: block; overflow: visible; }
+.donut-wrap { display: flex; align-items: center; justify-content: center; }
+.donut-legend { display: flex; gap: 1rem; justify-content: center; margin-top: 0.5rem; font-size: 0.72rem; color: var(--color-text-dim); }
+.donut-legend .dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 999px; margin-right: 0.3rem; vertical-align: middle; }
+.stat-card.highlight { border-color: var(--color-primary); box-shadow: 0 0 0 1px var(--color-primary) inset, 0 0 16px var(--color-primary-glow); }
+.chip.acctwide { border-style: dashed; }
 
 .seg { display: inline-flex; border: 1px solid var(--color-border-light); border-radius: 999px; overflow: hidden; }
 .seg button { background: transparent; border: 0; color: var(--color-text-muted); font-size: 0.68rem; padding: 0.25rem 0.7rem; cursor: pointer; letter-spacing: normal; text-transform: none; }
@@ -1420,6 +1541,8 @@ h2 .chip { font-size: 0.65rem; letter-spacing: normal; text-transform: none; bor
   padding: 1rem 1.25rem; margin-bottom: 0.5rem; overflow-x: auto;
 }
 .chart-card svg { width: 100%; height: 120px; display: block; min-width: 320px; }
+#chart-symbol svg { height: auto; min-height: 120px; }
+#chart-winloss svg, #chart-buysell svg { height: 170px; width: 170px; min-width: 0; }
 
 .tablewrap { overflow-x: auto; border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: linear-gradient(180deg, color-mix(in srgb, var(--color-surface-2) 60%, var(--color-surface)), var(--color-surface)); }
 table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
@@ -1494,6 +1617,7 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .cal-cell .d { color: var(--color-text-muted); font-size: 0.68rem; }
 .cal-cell .amt { font-weight: 600; margin-top: 0.15rem; }
 </style></head><body>
+<div class="topbar">
 <header>
   <div class="brand">
     <div class="logo-tile">__LOGO__</div>
@@ -1501,61 +1625,89 @@ button.jbtn:hover { background: var(--color-primary-glow); }
   </div>
   <div class="kpi"><div class="kpi-label" id="kpi-label">Net P/L · 7 days</div><div class="kpi-value number" id="kpi-net">—</div></div>
   <div class="header-right">
-    <button id="theme-toggle" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">&#9789;</button>
     <div class="acct" id="acct">connecting…</div>
   </div>
 </header>
+<div class="controlsbar">
+  <div class="ctrl-group">
+    <span class="ctrl-label">Source</span>
+    <select id="source-filter" class="seg-select">
+      <option value="">All sources</option>
+      <option value="telegram">Telegram</option>
+      <option value="tradingview">TradingView</option>
+      <option value="other">Other EAs</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <span class="ctrl-label">Window</span>
+    <span class="seg" id="seg-days">
+      <button type="button" data-days="7" class="active">7d</button>
+      <button type="button" data-days="30">30d</button>
+      <button type="button" data-days="90">90d</button>
+    </span>
+  </div>
+  <button id="theme-toggle" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">&#9789;</button>
+</div>
+</div>
 <main>
   <div class="cards" id="cards"></div>
 
+  <h2>Performance</h2>
   <div class="grid2">
-    <section>
-      <h2>Telegram signals <span class="chip" id="chip-tg"></span></h2>
-      <div class="tablewrap"><table id="tbl-signals"></table></div>
-    </section>
-    <section>
-      <h2>Orders executed <span class="chip" id="chip-orders"></span></h2>
-      <div class="tablewrap"><table id="tbl-orders"></table></div>
-    </section>
+    <div class="chart-card"><h2 style="margin:0 0 .5rem" id="chart-equity-h2">Equity curve <span class="chip acctwide" id="chip-equity">account-wide</span></h2><div id="chart-equity"></div></div>
+    <div class="chart-card"><h2 style="margin:0 0 .5rem">Cumulative net P/L <span class="chip" id="chip-cum"></span></h2><div id="chart-cum"></div></div>
   </div>
-
-  <h2>Open positions</h2>
-  <div class="tablewrap"><table id="tbl-open"></table></div>
+  <div class="grid2">
+    <div class="chart-card"><h2 style="margin:0 0 .5rem">Daily P/L</h2><div id="chart-daily"></div></div>
+    <div class="chart-card"><h2 style="margin:0 0 .5rem">P/L by symbol <span class="chip" id="chip-symbol"></span></h2><div id="chart-symbol"></div></div>
+  </div>
+  <div class="grid3">
+    <div class="chart-card donut-card"><h2 style="margin:0 0 .5rem">Win / loss</h2><div class="donut-wrap" id="chart-winloss"></div></div>
+    <div class="chart-card donut-card"><h2 style="margin:0 0 .5rem">Buy / sell split</h2><div class="donut-wrap" id="chart-buysell"></div></div>
+    <div class="chart-card">
+      <h2 style="margin:0 0 .5rem">Monthly P/L calendar <span class="chip" id="chip-calendar"></span>
+        <span class="cal-controls">
+          <button type="button" class="navbtn" id="cal-prev">&#8592;</button>
+          <span class="cal-label" id="cal-label">—</span>
+          <button type="button" class="navbtn" id="cal-next">&#8594;</button>
+        </span>
+        <span class="seg" id="seg-cal-source">
+          <button type="button" data-source="stack" class="active">Stack only</button>
+          <button type="button" data-source="all">All sources</button>
+        </span>
+      </h2>
+      <div id="cal-grid" class="cal-grid"></div>
+    </div>
+  </div>
 
   <h2>Performance by source <span class="chip" id="chip-srcpl"></span></h2>
   <div class="srcpl" id="srcpl"></div>
-
-  <h2>Daily P/L</h2>
-  <div class="chart-card"><div id="chart-daily"></div></div>
 
   <h2>Channel scorecard <span class="chip" id="chip-scorecard"></span></h2>
   <div class="tablewrap"><table id="tbl-scorecard"></table></div>
 
   <h2>Risk &amp; exposure <span class="chip" id="chip-risk"></span></h2>
   <div class="cards" id="risk-cards" style="margin-bottom:1rem"></div>
-  <div class="chart-card"><div id="chart-equity"></div></div>
   <div class="compliance-strip" id="compliance-strip"></div>
   <div class="tablewrap" id="wrap-risk-rejections"><table id="tbl-risk-rejections"></table></div>
 
-  <h2>Monthly P/L calendar <span class="chip" id="chip-calendar"></span>
-    <span class="cal-controls">
-      <button type="button" class="navbtn" id="cal-prev">&#8592;</button>
-      <span class="cal-label" id="cal-label">—</span>
-      <button type="button" class="navbtn" id="cal-next">&#8594;</button>
-    </span>
-    <span class="seg" id="seg-cal-source">
-      <button type="button" data-source="stack" class="active">Stack only</button>
-      <button type="button" data-source="all">All sources</button>
-    </span>
-  </h2>
-  <div id="cal-grid" class="cal-grid"></div>
+  <div class="grid2">
+    <section>
+      <h2>Orders executed <span class="chip" id="chip-orders"></span></h2>
+      <div class="tablewrap"><table id="tbl-orders"></table></div>
+    </section>
+    <section>
+      <h2>Open positions <span class="chip" id="chip-open"></span></h2>
+      <div class="tablewrap"><table id="tbl-open"></table></div>
+    </section>
+  </div>
+
+  <section id="section-signals">
+    <h2>Telegram signals <span class="chip" id="chip-tg"></span></h2>
+    <div class="tablewrap"><table id="tbl-signals"></table></div>
+  </section>
 
   <h2>Closed trades &amp; journal <span class="chip" id="chip-journal"></span>
-    <span class="seg" id="seg-days">
-      <button type="button" data-days="7" class="active">7d</button>
-      <button type="button" data-days="30">30d</button>
-      <button type="button" data-days="90">90d</button>
-    </span>
     <span class="exports">
       <a id="export-trades" href="/api/export/trades.csv">Export trades CSV</a><a id="export-journal" href="/api/export/journal.csv">Export journal CSV</a><a id="export-weekly-xlsx" href="/api/export/weekly.xlsx">Export weekly XLSX</a>
     </span>
@@ -1591,7 +1743,43 @@ const srcBadge = s => s === "telegram" ? '<span class="badge tg">Telegram</span>
   : '<span class="badge neutral">Other EA</span>';
 const sideBadge = s => s === "close" ? '<span class="badge neutral">CLOSE</span>'
   : `<span class="badge ${s}">${s.toUpperCase()}</span>`;
-let lastSummary = null, ratingVal = 0, currentDays = 7;
+const sourceLabel = s => s === "telegram" ? "Telegram" : s === "tradingview" ? "TradingView" : s === "other" ? "Other EAs" : "All sources";
+let lastSummary = null, ratingVal = 0, currentDays = 7, currentSource = "";
+
+// --- global filter state: persisted to localStorage + the URL hash so a
+// reload (or a shared link) keeps the same days/source selection. -------
+const STATE_DAYS_KEY = "execrelay-dashboard-days";
+const STATE_SOURCE_KEY = "execrelay-dashboard-source";
+const VALID_DAYS = [7, 30, 90];
+const VALID_SOURCES = ["", "telegram", "tradingview", "other"];
+
+function loadState() {
+  let days = null, source = null;
+  try {
+    const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
+    if (hash.has("days")) days = parseInt(hash.get("days"), 10);
+    if (hash.has("source")) source = hash.get("source");
+  } catch (e) {}
+  if (days === null || !VALID_DAYS.includes(days)) {
+    try { const v = parseInt(localStorage.getItem(STATE_DAYS_KEY), 10); if (VALID_DAYS.includes(v)) days = v; } catch (e) {}
+  }
+  if (source === null || !VALID_SOURCES.includes(source)) {
+    try { const v = localStorage.getItem(STATE_SOURCE_KEY); if (VALID_SOURCES.includes(v)) source = v; } catch (e) {}
+  }
+  currentDays = VALID_DAYS.includes(days) ? days : 7;
+  currentSource = VALID_SOURCES.includes(source) ? source : "";
+}
+function persistState() {
+  try {
+    localStorage.setItem(STATE_DAYS_KEY, String(currentDays));
+    localStorage.setItem(STATE_SOURCE_KEY, currentSource);
+  } catch (e) {}
+  const params = new URLSearchParams();
+  params.set("days", String(currentDays));
+  if (currentSource) params.set("source", currentSource);
+  try { history.replaceState(null, "", "#" + params.toString()); } catch (e) {}
+}
+function sourceQS() { return currentSource ? "&source=" + encodeURIComponent(currentSource) : ""; }
 
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
 function authHeaders(extra) {
@@ -1608,8 +1796,8 @@ if (TOKEN) {
   if (icon) icon.href = withToken("/assets/favicon.png");
 }
 
-function card(label, value, extra, sub) {
-  return `<div class="stat-card"><b class="number ${extra||""}">${value}</b><span>${label}</span>${sub?`<div class="sub">${sub}</div>`:""}</div>`;
+function card(label, value, extra, sub, wrapCls) {
+  return `<div class="stat-card${wrapCls?" "+wrapCls:""}"><b class="number ${extra||""}">${value}</b><span>${label}</span>${sub?`<div class="sub">${sub}</div>`:""}</div>`;
 }
 function table(id, header, rows, footer) {
   $(id).innerHTML = "<thead><tr>" + header.map(h => `<th>${h}</th>`).join("") + "</tr></thead><tbody>" +
@@ -1622,16 +1810,21 @@ async function refresh() {
 }
 
 async function refreshSummary() {
-  const res = await fetch(withToken("/api/summary?days=" + currentDays), { headers: authHeaders() });
+  const res = await fetch(withToken("/api/summary?days=" + currentDays + sourceQS()), { headers: authHeaders() });
   if (!res.ok) { $("meta").textContent = "refresh failed: " + res.status + " " + (await res.text()); return; }
   const s = await res.json();
   lastSummary = s;
   const bs = s.orders.by_source, tg = bs.telegram, tv = bs.tradingview;
-  const c = s.mt5.available ? s.mt5.closed : {count:0,wins:0,losses:0,net:0,rows:[],by_source:{},daily:[],review_queue:[]};
+  const c = s.mt5.available ? s.mt5.closed : {count:0,wins:0,losses:0,net:0,buys:0,sells:0,rows:[],by_source:{},daily:[],review_queue:[]};
   const winRate = c.count ? Math.round(100 * c.wins / c.count) : null;
   const timeLabel = s.mt5.available ? (s.mt5.time_label || "broker time") : "UTC";
+  const risk = s.risk || {};
+  const eqc = risk.equity_curve || { points: [], estimated: true, max_drawdown_pct: 0, current_drawdown_pct: 0 };
+  const comp = risk.compliance || {};
+  const overCap = comp.max_single_order_risk != null && comp.cap_usd && comp.max_single_order_risk > comp.cap_usd;
+  const capStatus = comp.cap_usd ? (overCap ? "Breached" : "OK") : "—";
 
-  $("kpi-label").textContent = `Net P/L · ${currentDays} days`;
+  $("kpi-label").textContent = `Net P/L · ${currentDays} days` + (currentSource ? ` · ${sourceLabel(currentSource)}` : "");
   $("kpi-net").textContent = money(c.net);
   $("kpi-net").className = "kpi-value number " + cls(c.net);
   $("acct").innerHTML = s.mt5.available
@@ -1639,19 +1832,20 @@ async function refreshSummary() {
     : '<span class="neg">MT5 offline</span>';
 
   $("cards").innerHTML =
-    card("Telegram signals", s.signals.received, "", `${s.signals.posted} routed · ${s.signals.rejected} rejected`) +
-    card("Telegram orders", tg.executed, "", `${tg.buys} buy · ${tg.sells} sell`) +
-    card("TradingView orders", tv.executed, "", `${tv.buys} buy · ${tv.sells} sell`) +
-    card("Open positions", s.mt5.available ? s.mt5.open.length : "—") +
-    card(`Closed · ${currentDays}d`, c.count, "", `${c.wins} win · ${c.losses} loss · ${c.rows.filter(r => r.source !== "other").length} from signals`) +
-    card("Win rate", winRate === null ? "—" : winRate + "%", winRate === null ? "" : (winRate >= 50 ? "pos" : "neg")) +
-    card(`Net P/L · ${currentDays}d`, money(c.net), cls(c.net)) +
-    card("Journal", s.journal.entries, "", s.journal.avg_rating ? `avg rating ${s.journal.avg_rating}\u2605 · ${s.journal.reviewed} reviewed` : `${s.journal.reviewed} reviewed`);
+    card(`Net P/L · ${currentDays}d`, money(c.net), cls(c.net), `${c.wins}W / ${c.losses}L`) +
+    card("Win rate", winRate === null ? "—" : winRate + "%", winRate === null ? "" : (winRate >= 50 ? "pos" : "neg"), c.count ? `${c.count} closed` : "no trades yet") +
+    card(`Trades closed · ${currentDays}d`, c.count, "", `${c.buys||0} buy · ${c.sells||0} sell`) +
+    card("Open positions", s.mt5.available ? s.mt5.open.length : "—", "", s.mt5.available ? `floating ${money(s.mt5.open_floating || 0)}` : "MT5 offline") +
+    card("Equity", s.mt5.available ? "$" + s.mt5.equity.toFixed(2) : "—", "", s.mt5.available ? `balance $${s.mt5.balance.toFixed(2)} · account-wide` : "") +
+    card("Max drawdown", eqc.max_drawdown_pct.toFixed(2) + "%", eqc.max_drawdown_pct > 0 ? "neg" : "", `current ${eqc.current_drawdown_pct.toFixed(2)}% · account-wide`) +
+    card("Risk cap status", capStatus, capStatus === "Breached" ? "neg" : (capStatus === "OK" ? "pos" : ""), comp.cap_usd ? `$${comp.cap_usd.toFixed(2)} cap` : "no cap set");
 
   $("chip-tg").textContent = `${s.signals.received} total`;
   $("chip-orders").textContent = `${tg.total + tv.total} total`;
   $("chip-journal").textContent = `${s.journal.entries} entries`;
   $("chip-srcpl").textContent = `${currentDays}d window`;
+
+  $("section-signals").style.display = (currentSource === "tradingview" || currentSource === "other") ? "none" : "";
 
   table("tbl-signals", ["time (UTC)","channel","outcome","detail"], s.signals.recent.map(r =>
     `<tr><td class="muted number">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${esc(r.channel)}</td>
@@ -1667,6 +1861,7 @@ async function refreshSummary() {
 
   const openRows = s.mt5.open || [];
   const floatTotal = s.mt5.available ? (s.mt5.open_floating || 0) : 0;
+  $("chip-open").textContent = `${openRows.length} open`;
   table("tbl-open", ["ticket","source","symbol","side","lot","entry","SL","TP","floating P/L"], openRows.map(p =>
     `<tr><td class="muted number">${p.ticket}</td><td>${srcBadge(p.source)}</td><td>${esc(p.symbol)}</td><td>${sideBadge(p.side)}</td>
      <td class="number">${p.volume}</td><td class="number">${p.entry}</td><td class="number">${p.sl}</td><td class="number">${p.tp}</td>
@@ -1675,11 +1870,15 @@ async function refreshSummary() {
 
   const bySrc = c.by_source || {};
   $("srcpl").innerHTML =
-    card("Telegram", money(bySrc.telegram || 0), cls(bySrc.telegram || 0), `net over ${currentDays}d`) +
-    card("TradingView", money(bySrc.tradingview || 0), cls(bySrc.tradingview || 0), `net over ${currentDays}d`) +
-    card("Other EA / manual", money(bySrc.other || 0), cls(bySrc.other || 0), `net over ${currentDays}d`);
+    card("Telegram", money(bySrc.telegram || 0), cls(bySrc.telegram || 0), `net over ${currentDays}d`, currentSource === "telegram" ? "highlight" : "") +
+    card("TradingView", money(bySrc.tradingview || 0), cls(bySrc.tradingview || 0), `net over ${currentDays}d`, currentSource === "tradingview" ? "highlight" : "") +
+    card("Other EA / manual", money(bySrc.other || 0), cls(bySrc.other || 0), `net over ${currentDays}d`, currentSource === "other" ? "highlight" : "");
 
   renderChart(c.daily || []);
+  renderCumulative(c.daily || []);
+  renderSymbolChart(c.rows || []);
+  renderDonutWinLoss(c.wins || 0, c.losses || 0);
+  renderDonutBuySell(c.buys || 0, c.sells || 0);
   renderRisk(s.risk);
 
   const rq = (c.review_queue || []).slice(0, 8);
@@ -1706,9 +1905,9 @@ async function refreshSummary() {
      <td><button class="jbtn" type="button" data-ticket="${esc(r.ticket)}">Journal</button></td></tr>`;
   }));
 
-  $("export-trades").href = withToken("/api/export/trades.csv?days=" + currentDays);
+  $("export-trades").href = withToken("/api/export/trades.csv?days=" + currentDays + sourceQS());
   $("export-journal").href = withToken("/api/export/journal.csv");
-  $("export-weekly-xlsx").href = withToken("/api/export/weekly.xlsx?days=7");
+  $("export-weekly-xlsx").href = withToken("/api/export/weekly.xlsx?days=7" + sourceQS());
 
   $("meta").textContent = "updated " + s.updated + " — auto-refreshes every 10s — journal entries are stored locally and mirror the ReyLens schema";
 }
@@ -1727,6 +1926,7 @@ function renderScorecard(sc) {
 }
 
 async function refreshScorecard() {
+  // Deliberately unfiltered -- the scorecard IS the source comparison.
   const res = await fetch(withToken("/api/scorecard?days=" + currentDays), { headers: authHeaders() });
   if (!res.ok) return;
   renderScorecard(await res.json());
@@ -1738,14 +1938,16 @@ function renderRisk(risk) {
   const eqc = risk.equity_curve || { points: [], estimated: true, max_drawdown_pct: 0, current_drawdown_pct: 0 };
   const comp = risk.compliance || {};
 
-  $("chip-risk").textContent = `${risk.days}d window` + (eqc.estimated ? " · equity curve estimated" : "");
+  // Equity curve + margin are account-level and always unfiltered.
+  $("chip-equity").textContent = "account-wide" + (eqc.estimated ? " · estimated" : "");
+  $("chip-risk").textContent = `${risk.days}d window` +
+    (currentSource ? ` · compliance filtered: ${sourceLabel(currentSource)}` : " · stack-level (telegram+tradingview)");
 
   $("risk-cards").innerHTML =
-    card("Margin used", live.available ? "$" + live.margin.toFixed(2) : "—", "", live.available ? `free $${live.margin_free.toFixed(2)}` : "MT5 offline") +
-    card("Margin level", (live.available && live.margin_level != null) ? live.margin_level.toFixed(1) + "%" : "—") +
-    card("Open lots", live.available ? live.open_lots : "—") +
-    card("Max drawdown", eqc.max_drawdown_pct.toFixed(2) + "%", eqc.max_drawdown_pct > 0 ? "neg" : "") +
-    card("Current drawdown", eqc.current_drawdown_pct.toFixed(2) + "%", eqc.current_drawdown_pct > 0 ? "neg" : "");
+    card("Margin used", live.available ? "$" + live.margin.toFixed(2) : "—", "", live.available ? `free $${live.margin_free.toFixed(2)} · account-wide` : "MT5 offline") +
+    card("Margin level", (live.available && live.margin_level != null) ? live.margin_level.toFixed(1) + "%" : "—", "", "account-wide") +
+    card("Open lots", live.available ? live.open_lots : "—", "", "account-wide") +
+    card("Current drawdown", eqc.current_drawdown_pct.toFixed(2) + "%", eqc.current_drawdown_pct > 0 ? "neg" : "", "account-wide");
 
   renderEquityCurve(eqc.points || [], eqc.estimated);
 
@@ -1766,7 +1968,7 @@ function renderRisk(risk) {
 
 function renderEquityCurve(points, estimated) {
   const el = $("chart-equity");
-  if (!points.length) { el.innerHTML = '<span class="muted">no data</span>'; return; }
+  if (!points.length) { el.innerHTML = '<span class="muted">no data in this window</span>'; return; }
   const w = 1000, h = 120, padB = 18, padT = 10, padL = 2, padR = 2;
   const vals = points.map(p => p.equity);
   const min = Math.min(...vals), max = Math.max(...vals);
@@ -1774,10 +1976,12 @@ function renderEquityCurve(points, estimated) {
   const n = points.length;
   const stepX = n > 1 ? (w - padL - padR) / (n - 1) : 0;
   const yOf = v => padT + (h - padT - padB) * (1 - (v - min) / range);
-  let path = "";
+  let path = "", markers = "";
   points.forEach((p, i) => {
     const x = padL + i * stepX;
-    path += (i === 0 ? "M" : "L") + x.toFixed(1) + "," + yOf(p.equity).toFixed(1) + " ";
+    const y = yOf(p.equity);
+    path += (i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1) + " ";
+    markers += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="7" fill="transparent"><title>${esc((p.ts||"").slice(0,10))}: ${money(p.equity)}</title></circle>`;
   });
   const area = path + `L${(padL + (n - 1) * stepX).toFixed(1)},${(h - padB).toFixed(1)} L${padL},${(h - padB).toFixed(1)} Z`;
   const tickEvery = Math.max(1, Math.ceil(n / 8));
@@ -1785,22 +1989,139 @@ function renderEquityCurve(points, estimated) {
   points.forEach((p, i) => {
     if (i % tickEvery === 0 || i === n - 1) {
       const x = padL + i * stepX;
-      labels += `<text x="${x.toFixed(1)}" y="${h-4}" font-size="9" text-anchor="middle" fill="var(--color-text-muted)">${esc((p.ts||"").slice(5,10))}</text>`;
+      labels += `<text x="${x.toFixed(1)}" y="${h-4}" font-size="10" text-anchor="middle" fill="var(--color-text-muted)">${esc((p.ts||"").slice(5,10))}</text>`;
     }
   });
   el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Equity curve${estimated ? ' (estimated)' : ''}">
     <path d="${area}" fill="var(--color-primary-glow)" stroke="none"/>
     <path d="${path}" fill="none" stroke="var(--color-primary)" stroke-width="2"/>
-    ${labels}
+    ${markers}${labels}
   </svg>` + (estimated
     ? '<div class="muted" style="font-size:0.68rem;margin-top:0.35rem">estimated: balance now minus reverse-cumulated daily closed P/L (fewer than 2 live equity snapshots in this window)</div>'
     : '');
 }
 
+function renderCumulative(daily) {
+  const el = $("chart-cum");
+  if (!daily.length) { el.innerHTML = '<span class="muted">no data in this window</span>'; $("chip-cum").textContent = ""; return; }
+  let running = 0;
+  const points = daily.map(d => { running += d.pnl; return { date: d.date, cum: running }; });
+  const w = 1000, h = 120, padB = 18, padT = 10, padL = 2, padR = 2;
+  const vals = points.map(p => p.cum).concat([0]);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = (max - min) || 1;
+  const n = points.length;
+  const stepX = n > 1 ? (w - padL - padR) / (n - 1) : 0;
+  const yOf = v => padT + (h - padT - padB) * (1 - (v - min) / range);
+  const zeroY = yOf(0);
+  let path = "", markers = "";
+  points.forEach((p, i) => {
+    const x = padL + i * stepX;
+    const y = yOf(p.cum);
+    path += (i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1) + " ";
+    markers += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="7" fill="transparent"><title>${esc(p.date)}: ${money(p.cum)}</title></circle>`;
+  });
+  const last = points[points.length - 1].cum;
+  const color = last >= 0 ? "var(--color-profit)" : "var(--color-loss)";
+  const glow = last >= 0 ? "var(--color-profit-dim)" : "var(--color-loss-dim)";
+  const area = path + `L${(padL + (n - 1) * stepX).toFixed(1)},${zeroY.toFixed(1)} L${padL},${zeroY.toFixed(1)} Z`;
+  const tickEvery = Math.max(1, Math.ceil(n / 8));
+  let labels = "";
+  points.forEach((p, i) => {
+    if (i % tickEvery === 0 || i === n - 1) {
+      const x = padL + i * stepX;
+      labels += `<text x="${x.toFixed(1)}" y="${h-4}" font-size="10" text-anchor="middle" fill="var(--color-text-muted)">${esc(p.date.slice(5))}</text>`;
+    }
+  });
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Cumulative net P/L">
+    <line x1="0" y1="${zeroY.toFixed(1)}" x2="${w}" y2="${zeroY.toFixed(1)}" stroke="var(--color-border-light)" stroke-width="1"/>
+    <path d="${area}" fill="${glow}" stroke="none"/>
+    <path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>
+    ${markers}${labels}
+  </svg>`;
+  $("chip-cum").textContent = money(last) + ` over ${currentDays}d` + (currentSource ? ` · ${sourceLabel(currentSource)}` : "");
+}
+
+function renderSymbolChart(rows) {
+  const el = $("chart-symbol");
+  const bySymbol = {};
+  (rows || []).forEach(r => { bySymbol[r.symbol] = (bySymbol[r.symbol] || 0) + r.profit; });
+  let entries = Object.entries(bySymbol).map(([symbol, net]) => ({ symbol, net: Math.round(net * 100) / 100 }));
+  entries.sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+  const total = entries.length;
+  entries = entries.slice(0, 8);
+  if (!entries.length) { el.innerHTML = '<span class="muted">no data in this window</span>'; $("chip-symbol").textContent = ""; return; }
+  $("chip-symbol").textContent = `top ${entries.length} of ${total}`;
+  const w = 1000, rowH = 28, padL = 92, padR = 74, padT = 6, padB = 6;
+  const n = entries.length;
+  const h = padT + padB + n * rowH;
+  const max = Math.max(1, ...entries.map(e => Math.abs(e.net)));
+  const scale = (w - padL - padR) / max;
+  let bars = "";
+  entries.forEach((e, i) => {
+    const y = padT + i * rowH;
+    const barW = Math.max(Math.abs(e.net) * scale, e.net !== 0 ? 1 : 0);
+    const x = e.net >= 0 ? padL : padL - barW;
+    const color = e.net >= 0 ? "var(--color-profit)" : "var(--color-loss)";
+    const midY = (y + rowH / 2 + 3.5).toFixed(1);
+    bars += `<text x="${padL - 8}" y="${midY}" font-size="10" text-anchor="end" fill="var(--color-text)">${esc(e.symbol)}</text>`;
+    bars += `<rect x="${x.toFixed(1)}" y="${(y + 5).toFixed(1)}" width="${barW.toFixed(1)}" height="${(rowH - 10).toFixed(1)}" fill="${color}"><title>${esc(e.symbol)}: ${money(e.net)}</title></rect>`;
+    const labelX = e.net >= 0 ? padL + barW + 6 : padL - barW - 6;
+    const anchor = e.net >= 0 ? "start" : "end";
+    bars += `<text x="${labelX.toFixed(1)}" y="${midY}" font-size="10" text-anchor="${anchor}" fill="var(--color-text-muted)" class="number">${money(e.net)}</text>`;
+  });
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="P/L by symbol" style="height:${Math.max(120, h * 0.24)}px">
+    <line x1="${padL}" y1="0" x2="${padL}" y2="${h}" stroke="var(--color-border-light)" stroke-width="1"/>
+    ${bars}
+  </svg>`;
+}
+
+function donutSVG(segments, ariaLabel, centerLabel, centerSub) {
+  const total = segments.reduce((a, s) => a + s.value, 0);
+  const size = 170, r = 58, cx = size / 2, cy = size / 2, sw = 20;
+  const legend = segments.map(s => `<span><span class="dot" style="background:${s.color}"></span>${esc(s.label)}</span>`).join("");
+  if (!total) {
+    return `<div><svg viewBox="0 0 ${size} ${size}" role="img" aria-label="${esc(ariaLabel)}">
+      <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--color-border)" stroke-width="${sw}"/>
+      <text x="${cx}" y="${cy+4}" text-anchor="middle" font-size="11" fill="var(--color-text-muted)">no data</text>
+    </svg><div class="muted" style="text-align:center;font-size:0.72rem;margin-top:.4rem">no data in this window</div></div>`;
+  }
+  const circumference = 2 * Math.PI * r;
+  let offset = 0, arcs = "";
+  segments.forEach(s => {
+    if (!s.value) return;
+    const frac = s.value / total;
+    const len = frac * circumference;
+    arcs += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${s.color}" stroke-width="${sw}" stroke-dasharray="${len.toFixed(2)} ${(circumference-len).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"><title>${esc(s.label)}</title></circle>`;
+    offset += len;
+  });
+  return `<div><svg viewBox="0 0 ${size} ${size}" role="img" aria-label="${esc(ariaLabel)}">
+    ${arcs}
+    <text x="${cx}" y="${cy-2}" text-anchor="middle" font-size="20" font-weight="600" fill="var(--color-text)">${esc(centerLabel)}</text>
+    <text x="${cx}" y="${cy+16}" text-anchor="middle" font-size="10" fill="var(--color-text-muted)">${esc(centerSub||"")}</text>
+  </svg><div class="donut-legend">${legend}</div></div>`;
+}
+
+function renderDonutWinLoss(wins, losses) {
+  const total = wins + losses;
+  const rate = total ? Math.round(100 * wins / total) : null;
+  $("chart-winloss").innerHTML = donutSVG(
+    [{ value: wins, color: "var(--color-profit)", label: `Wins (${wins})` }, { value: losses, color: "var(--color-loss)", label: `Losses (${losses})` }],
+    "Win/loss split", rate === null ? "—" : rate + "%", "win rate"
+  );
+}
+
+function renderDonutBuySell(buys, sells) {
+  $("chart-buysell").innerHTML = donutSVG(
+    [{ value: buys, color: "var(--color-primary)", label: `Buys (${buys})` }, { value: sells, color: "var(--color-gold)", label: `Sells (${sells})` }],
+    "Buy/sell split", String(buys + sells), "orders"
+  );
+}
+
 let calMonth = null, calStackOnly = true, lastCalendar = null;
 
 function calQuery() {
-  return "?stack_only=" + (calStackOnly ? "1" : "0") + (calMonth ? "&month=" + encodeURIComponent(calMonth) : "");
+  return "?stack_only=" + (calStackOnly ? "1" : "0") + (calMonth ? "&month=" + encodeURIComponent(calMonth) : "") + sourceQS();
 }
 
 async function refreshCalendar() {
@@ -1814,7 +2135,8 @@ async function refreshCalendar() {
 
 function renderCalendar(data) {
   $("cal-label").textContent = data.month;
-  $("chip-calendar").textContent = money(data.total) + (data.stack_only ? " · stack only" : " · all sources");
+  const srcNote = data.source ? sourceLabel(data.source) : (data.stack_only ? "stack only" : "all sources");
+  $("chip-calendar").textContent = money(data.total) + " · " + srcNote;
   const days = data.days || [];
   const dow = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
   let html = dow.map(d => `<div class="cal-dow">${d}</div>`).join("");
@@ -1832,7 +2154,7 @@ function renderCalendar(data) {
 
 function renderChart(daily) {
   const el = $("chart-daily");
-  if (!daily.length) { el.innerHTML = '<span class="muted">no data</span>'; return; }
+  if (!daily.length) { el.innerHTML = '<span class="muted">no data in this window</span>'; return; }
   const w = 1000, h = 120, padB = 18, padT = 6;
   const max = Math.max(1, ...daily.map(d => Math.abs(d.pnl)));
   const n = daily.length;
@@ -1849,7 +2171,7 @@ function renderChart(daily) {
     const color = d.pnl >= 0 ? "var(--color-profit)" : "var(--color-loss)";
     bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bwid.toFixed(1)}" height="${barH.toFixed(1)}" fill="${color}"><title>${esc(d.date)}: ${money(d.pnl)}</title></rect>`;
     if (i % tickEvery === 0 || i === n - 1) {
-      labels += `<text x="${(x + bwid/2).toFixed(1)}" y="${h - 4}" font-size="9" text-anchor="middle" fill="var(--color-text-muted)">${esc(d.date.slice(5))}</text>`;
+      labels += `<text x="${(x + bwid/2).toFixed(1)}" y="${h - 4}" font-size="10" text-anchor="middle" fill="var(--color-text-muted)">${esc(d.date.slice(5))}</text>`;
     }
   });
   el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Daily net P/L">
@@ -1908,6 +2230,7 @@ document.addEventListener("click", e => {
   if (segBtn) {
     currentDays = parseInt(segBtn.getAttribute("data-days"), 10);
     document.querySelectorAll("#seg-days button").forEach(b => b.classList.toggle("active", b === segBtn));
+    persistState();
     refresh();
     return;
   }
@@ -1920,6 +2243,13 @@ document.addEventListener("click", e => {
     calStackOnly = calSrcBtn.getAttribute("data-source") === "stack";
     document.querySelectorAll("#seg-cal-source button").forEach(b => b.classList.toggle("active", b === calSrcBtn));
     refreshCalendar();
+  }
+});
+document.addEventListener("change", e => {
+  if (e.target.id === "source-filter") {
+    currentSource = e.target.value;
+    persistState();
+    refresh();
   }
 });
 
@@ -1940,6 +2270,11 @@ function toggleTheme() {
   const theme = saved || ((window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark");
   applyTheme(theme);
 })();
+
+loadState();
+$("source-filter").value = currentSource;
+document.querySelectorAll("#seg-days button").forEach(b => b.classList.toggle("active", parseInt(b.getAttribute("data-days"), 10) === currentDays));
+persistState();
 
 fetch(withToken("/api/summary"), { headers: authHeaders() }).then(r => r.json()).then(s => {
   const sel = $("j-emotion");
@@ -1984,26 +2319,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/summary":
             days = _parse_days(self.path)
-            self._send(200, json.dumps(summary(days), default=str).encode(), "application/json")
+            source = _parse_source(self.path)
+            self._send(200, json.dumps(summary(days, source), default=str).encode(), "application/json")
         elif path == "/api/scorecard":
+            # Deliberately source-unfiltered: this endpoint IS the source
+            # comparison (see scorecard() docstring / PLAN item 1).
             days = _parse_days(self.path)
             self._send(200, json.dumps(scorecard(days), default=str).encode(), "application/json")
         elif path == "/api/risk":
             days = _parse_days(self.path)
-            self._send(200, json.dumps(risk_panel(days), default=str).encode(), "application/json")
+            source = _parse_source(self.path)
+            self._send(200, json.dumps(risk_panel(days, source), default=str).encode(), "application/json")
         elif path == "/api/calendar":
             qs = parse_qs(urlsplit(self.path).query)
             month = (qs.get("month") or [""])[0]
             stack_only = (qs.get("stack_only") or ["1"])[0].lower() not in ("0", "false", "")
-            self._send(200, json.dumps(calendar_month(month, stack_only), default=str).encode(), "application/json")
+            source = _parse_source(self.path)
+            self._send(
+                200, json.dumps(calendar_month(month, stack_only, source), default=str).encode(), "application/json"
+            )
         elif path == "/api/export/trades.csv":
             days = _parse_days(self.path)
-            self._send_csv(trades_csv(days), "trades.csv")
+            source = _parse_source(self.path)
+            self._send_csv(trades_csv(days, source), "trades.csv")
         elif path == "/api/export/journal.csv":
             self._send_csv(journal_csv(), "journal.csv")
         elif path == "/api/export/weekly.xlsx":
             days = _parse_days(self.path)
-            xbytes = build_weekly_xlsx(days)
+            source = _parse_source(self.path)
+            xbytes = build_weekly_xlsx(days, source)
             if xbytes is None:
                 self._send(
                     501,
