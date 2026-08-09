@@ -559,6 +559,16 @@ def _command_field(body: str, key: str) -> str:
     return ""
 
 
+_SECRET_RE = re.compile(r"secret=[^,]*")
+
+
+def _redact_secret(body: str) -> str:
+    """Mask the live webhook secret out of a command body before it is
+    logged anywhere (transaction log or logger calls). The un-redacted body
+    must still be the one POSTed to the webhook — this is for output only."""
+    return _SECRET_RE.sub("secret=***", body)
+
+
 def send_notification(chat_id: int, text: str) -> None:
     """Best-effort Telegram notification back to the chat a signal came
     from. Never raises — a failed notification must not affect ingest."""
@@ -650,7 +660,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
     commands = build_commands(sig, comment=comment)
     for body in commands:
         if DRY_RUN:
-            logger.info("DRY-RUN would POST: %s", body)
+            logger.info("DRY-RUN would POST: %s", _redact_secret(body))
             log_txn(
                 TXN_LOG,
                 chat_id=chat_id,
@@ -658,13 +668,13 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
                 channel=channel_name,
                 outcome="dry_run",
                 signal=sig,
-                command=body,
+                command=_redact_secret(body),
             )
             continue
         try:
             status, resp = post_webhook(body)
         except Exception as exc:
-            logger.error("webhook POST failed: %s (body: %s)", exc, body)
+            logger.error("webhook POST failed: %s (body: %s)", exc, _redact_secret(body))
             log_txn(
                 TXN_LOG,
                 chat_id=chat_id,
@@ -672,7 +682,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
                 channel=channel_name,
                 outcome="webhook_error",
                 signal=sig,
-                command=body,
+                command=_redact_secret(body),
                 error=str(exc),
             )
             continue
@@ -685,7 +695,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
             channel=channel_name,
             outcome="posted",
             signal=sig,
-            command=body,
+            command=_redact_secret(body),
             http_status=status,
             response=resp,
         )

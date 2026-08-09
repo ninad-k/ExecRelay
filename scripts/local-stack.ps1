@@ -306,8 +306,9 @@ function Invoke-Start {
         Write-Warning "skipping telegram-forwarder: TG_FORWARDER_SOURCE_CHAT / TG_FORWARDER_TARGET_CHAT (or API_ID) not set in .env -- Telegram signals will only flow if posted directly to the ingest bot's chat"
     }
 
-    # Localhost-only (shows account balances, has no auth) -- keep it off the
-    # public interface even though ingress itself is exposed.
+    # Localhost-only (shows account balances; optional bearer-token auth via
+    # DASHBOARD_TOKEN in .env) -- keep it off the public interface even
+    # though ingress itself is exposed.
     Start-Tracked -Name "trade-dashboard" -FilePath $python `
         -ArgumentList @("scripts\trade_dashboard.py") -Env @{
         DASHBOARD_ADDR = "127.0.0.1:$DashboardPort"
@@ -334,8 +335,10 @@ function Invoke-Start {
     }
 
     $botUser = if ($env:TELEGRAM_BOT_USERNAME) { $env:TELEGRAM_BOT_USERNAME } else { "TeleGoldSignalsBot" }
+    $dashboardUrl = "http://127.0.0.1:$DashboardPort"
+    if ($env:DASHBOARD_TOKEN) { $dashboardUrl += "?token=$($env:DASHBOARD_TOKEN)" }
     Write-Host ""
-    Write-Host "  trade dashboard:  http://127.0.0.1:$DashboardPort  (local only)"
+    Write-Host "  trade dashboard:  $dashboardUrl  (local only)"
     Write-Host "  telegram bot:     https://t.me/$botUser  (order + open/close notifications)"
     Write-Host ""
     Write-Host "stack is up. EA connects to 127.0.0.1:$BridgePort (instance: test-instance)."
