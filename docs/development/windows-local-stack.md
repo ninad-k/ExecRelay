@@ -6,14 +6,21 @@ ingress → NATS → bridge → EA shim → broker, plus the public TradingView
 webhook and the Rey Capital trade dashboard.
 
 ```powershell
-.\run.ps1              # build + start everything, print links (public webhook on)
-.\run.ps1 -LocalOnly   # same, but skip public-exposure verification
-.\stop.ps1             # stop every service the stack started
+.\run.ps1                     # start + follow logs; Ctrl+C stops the stack
+.\run.ps1 -LocalOnly          # ...without public-exposure verification
+.\run.ps1 -NoFollow           # start, print links, and return
+.\run.ps1 -StopOnExit:$false  # Ctrl+C detaches; services keep running
+.\stop.ps1                    # stop everything (e.g. from another window)
 scripts\local-stack.ps1 status   # health-check each component
 ```
 
-`run.ps1` / `stop.ps1` are thin forwarders; the implementation is
-`scripts\local-stack.ps1`.
+`run.ps1` stays attached after startup, streaming every service's log to the
+console (color-coded per service, `.err.log` lines in red) until Ctrl+C —
+which shuts the stack down with it. It refuses to double-start: a second
+`run.ps1` (or a `run.ps1` while the stack is already up) attaches to the
+logs instead, because duplicate services don't fail cleanly on Windows and a
+duplicate ea-shim would execute every signal twice. Startup/stop behavior
+lives in `scripts\local-stack.ps1`.
 
 ## Services
 

@@ -52,8 +52,8 @@ account.
 ### Windows demo stack (native, against a running MT5 terminal)
 
 ```powershell
-.\run.ps1     # build + start everything, print webhook/dashboard/bot links
-.\stop.ps1    # stop everything
+.\run.ps1     # start everything + follow live logs; Ctrl+C stops the stack
+.\stop.ps1    # stop everything (from another window)
 ```
 
 See [`docs/development/windows-local-stack.md`](docs/development/windows-local-stack.md)

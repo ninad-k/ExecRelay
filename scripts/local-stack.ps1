@@ -220,6 +220,17 @@ function Get-NatsExe {
 }
 
 function Invoke-Start {
+    # Refuse to double-start. Duplicate services don't fail cleanly on
+    # Windows (SO_REUSEADDR lets them share ports), and a duplicate ea-shim
+    # would execute every signal twice.
+    try {
+        $probe = Invoke-WebRequest -Uri "http://127.0.0.1:$IngressPort/health" -TimeoutSec 2 -UseBasicParsing
+        if ($probe.StatusCode -eq 200) {
+            Write-Warning "stack already running (ingress healthy on :$IngressPort) -- refusing to start twice. Run 'stop' first, or use .\run.ps1 to attach to its logs."
+            return
+        }
+    } catch {}
+
     New-Item -ItemType Directory -Force -Path $Bin, $Logs, $Pids | Out-Null
     Write-Host "purging logs older than $RetentionDays days..."
     Remove-OldLogs
