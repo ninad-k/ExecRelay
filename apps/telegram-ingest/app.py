@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
 from _txnlog import get_txn_logger, log_txn  # noqa: E402
+from _tradestore import append_signal_trace, record_order, record_signal  # noqa: E402
 
 TXN_LOG = get_txn_logger("telegram-signals")
 
@@ -559,6 +560,15 @@ def _command_field(body: str, key: str) -> str:
     return ""
 
 
+def _as_float(v: str) -> float | None:
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
 _SECRET_RE = re.compile(r"secret=[^,]*")
 
 
@@ -651,6 +661,14 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
             reason=str(exc),
             raw_text=text[:500],
         )
+        record_signal(
+            chat_id=chat_id,
+            message_id=message_id,
+            channel=channel_name,
+            outcome="rejected",
+            n_commands=0,
+            raw=_redact_secret(text)[:500],
+        )
         return
     if sig is None:
         logger.debug("chat %s msg %s: not a signal", chat_id, message_id)
@@ -658,6 +676,19 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
 
     comment = f"tg-{channel_initials(channel_name)}" if channel_name else None
     commands = build_commands(sig, comment=comment)
+    record_signal(
+        chat_id=chat_id,
+        message_id=message_id,
+        channel=channel_name,
+        outcome="dry_run" if DRY_RUN else "posted",
+        symbol=sig.get("symbol"),
+        side=sig.get("side"),
+        entry=sig.get("entry"),
+        sl=sig.get("sl"),
+        tp=sig.get("tp"),
+        n_commands=len(commands),
+        raw=_redact_secret(text)[:500],
+    )
     for body in commands:
         if DRY_RUN:
             logger.info("DRY-RUN would POST: %s", _redact_secret(body))
@@ -701,6 +732,26 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         )
         if status == 200:
             notify_order_placed(chat_id, body, channel_name, resp)
+            try:
+                trace_id = json.loads(resp).get("trace_id", "")
+            except (json.JSONDecodeError, AttributeError):
+                trace_id = ""
+            if trace_id:
+                _command, _symbol = body.split(",", 3)[1:3]
+                append_signal_trace(chat_id, message_id, trace_id)
+                record_order(
+                    trace_id=trace_id,
+                    source="telegram",
+                    command=_command,
+                    symbol=_symbol,
+                    requested_risk=_as_float(_command_field(body, "risk")),
+                    volume=_as_float(_command_field(body, "vol_lots")),
+                    sl=_as_float(_command_field(body, "sl")),
+                    tp=_as_float(_command_field(body, "tp")),
+                    entry=_as_float(_command_field(body, "entry_price")),
+                    status="accepted",
+                    comment=_command_field(body, "comment") or None,
+                )
 
 
 def poll_loop() -> None:

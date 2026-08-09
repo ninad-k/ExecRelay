@@ -35,12 +35,13 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import MetaTrader5 as mt5
 import websockets
 
 from _txnlog import get_txn_logger, log_txn
+from _tradestore import record_closed_trade, record_equity, record_order
 
 TXN_LOG = get_txn_logger("mt5-fills")
 
@@ -168,10 +169,19 @@ def _closed_result(ticket):
     return profit, price
 
 
+# Equity snapshot cadence: position_monitor already polls every
+# POSITION_POLL_SECS (5s); snapshot on every 60th iteration (~300s = 5min)
+# instead of running a second timing loop.
+EQUITY_SNAPSHOT_EVERY = 60
+
+
 def position_monitor():
     """Notify Telegram when a shim-owned position opens (market fill or a
-    pending order triggering) and when one closes (with realized P/L)."""
+    pending order triggering) and when one closes (with realized P/L). Also
+    persists closed positions to the trade store and, every ~5 minutes,
+    an account equity snapshot."""
     known = None
+    iteration = 0
     while True:
         try:
             current = {
@@ -193,18 +203,44 @@ def position_monitor():
                             f"{_fmt_position(p)} -> {close_price:g}\n"
                             f"P/L {sign}${abs(profit):.2f}"
                         )
+                        side = "buy" if p.type == mt5.POSITION_TYPE_BUY else "sell"
                         log_txn(
                             TXN_LOG,
                             event="position_closed",
                             position=ticket,
                             symbol=p.symbol,
-                            side="buy" if p.type == mt5.POSITION_TYPE_BUY else "sell",
+                            side=side,
                             volume=p.volume,
                             open_price=p.price_open,
                             close_price=close_price,
                             profit=round(profit, 2),
                         )
+                        record_closed_trade(
+                            position_id=str(ticket),
+                            close_ts=datetime.now(timezone.utc).isoformat(),
+                            symbol=p.symbol,
+                            side=side,
+                            volume=p.volume,
+                            entry_price=p.price_open,
+                            close_price=close_price,
+                            profit=round(profit, 2),
+                            magic=p.magic,
+                            comment=p.comment,
+                            source="telegram" if str(p.comment).startswith("tg-") else "tradingview",
+                        )
             known = current
+
+            iteration += 1
+            if iteration % EQUITY_SNAPSHOT_EVERY == 0:
+                a = mt5.account_info()
+                if a is not None:
+                    record_equity(
+                        balance=a.balance,
+                        equity=a.equity,
+                        margin=a.margin,
+                        margin_free=a.margin_free,
+                        floating=round(a.equity - a.balance, 2),
+                    )
         except Exception as e:
             log(f"position monitor error: {e!r}")
         time.sleep(POSITION_POLL_SECS)
@@ -309,8 +345,10 @@ _PENDING_TYPES = {
 
 
 def execute(trace_id, command, symbol, params):
-    """Execute one signal. Returns (status, order_id, err) where status is
-    "filled" for executed orders, "placed" for resting pendings."""
+    """Execute one signal. Returns (status, order_id, err, volume) where
+    status is "filled" for executed orders, "placed" for resting pendings,
+    and volume is the FINAL sized lot actually sent to the broker (after
+    $-risk sizing overrides the requested vol_lots/volume)."""
     # Broker symbol-name fallback: many brokers suffix their instruments
     # (XAUUSD_ here). If the exact name is unknown, try common variants
     # rather than failing the order on a naming mismatch.
@@ -347,7 +385,7 @@ def execute(trace_id, command, symbol, params):
                 f"than ${risk_usd:g} at SL {sl:g} (ref {ref:g})"
             )
             log(f"signal trace={trace_id} REJECTED: {err}")
-            return "rejected", "", err
+            return "rejected", "", err, sized
         if sized != volume:
             log(
                 f"risk sizing: vol {volume:g} -> {sized:g} "
@@ -359,20 +397,20 @@ def execute(trace_id, command, symbol, params):
 
     if cmd == "buy":
         res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment, sl, tp)
-        return "filled", (str(res.order) if res else ""), err
+        return "filled", (str(res.order) if res else ""), err, volume
     if cmd == "sell":
         res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment, sl, tp)
-        return "filled", (str(res.order) if res else ""), err
+        return "filled", (str(res.order) if res else ""), err, volume
     if cmd in _PENDING_TYPES:
         entry = fnum(params, "entry", "entry_price")
         if entry <= 0:
-            return "rejected", "", "entry required for pending order"
+            return "rejected", "", "entry required for pending order", volume
         ptype_name, mtype_name = _PENDING_TYPES[cmd]
         res, err, retcode = send_pending(
             getattr(mt5, ptype_name), symbol, volume, entry, sl, tp, comment
         )
         if res is not None:
-            return "placed", str(res.order), None
+            return "placed", str(res.order), None, volume
         if PENDING_FALLBACK and retcode == mt5.TRADE_RETCODE_INVALID_PRICE:
             # Wrong side of the market: execute at market instead, tag _M.
             log(f"pending {cmd}@{entry} invalid price -> market fallback (_M)")
@@ -380,28 +418,28 @@ def execute(trace_id, command, symbol, params):
                 getattr(mt5, mtype_name), symbol, volume, f"{comment}_M", sl, tp
             )
             if res is not None:
-                return "filled", str(res.order), None
-            return "filled", "", f"pending invalid price; market fallback failed: {merr}"
-        return "filled", "", err
+                return "filled", str(res.order), None, volume
+            return "filled", "", f"pending invalid price; market fallback failed: {merr}", volume
+        return "filled", "", err, volume
     if cmd == "closelong":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_BUY)
-        return "filled", ",".join(orders), err
+        return "filled", ",".join(orders), err, volume
     if cmd == "closeshort":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_SELL)
-        return "filled", ",".join(orders), err
+        return "filled", ",".join(orders), err, volume
     if cmd == "closelongopenshort":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_BUY)
         if err:
-            return "filled", ",".join(orders), err
+            return "filled", ",".join(orders), err, volume
         res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment, sl, tp)
-        return "filled", ",".join(orders + ([str(res.order)] if res else [])), err
+        return "filled", ",".join(orders + ([str(res.order)] if res else [])), err, volume
     if cmd == "closeshortopenlong":
         orders, err = close_positions(symbol, mt5.POSITION_TYPE_SELL)
         if err:
-            return "filled", ",".join(orders), err
+            return "filled", ",".join(orders), err, volume
         res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment, sl, tp)
-        return "filled", ",".join(orders + ([str(res.order)] if res else [])), err
-    return "rejected", "", f"unknown command {command}"
+        return "filled", ",".join(orders + ([str(res.order)] if res else [])), err, volume
+    return "rejected", "", f"unknown command {command}", volume
 
 
 async def run_session():
@@ -455,7 +493,7 @@ async def run_session():
                     command = msg.get("command", "")
                     symbol = msg.get("symbol", "")
                     params = msg.get("params") or {}
-                    ok_status, order_id, err = await loop.run_in_executor(
+                    ok_status, order_id, err, exec_volume = await loop.run_in_executor(
                         None,
                         execute,
                         msg.get("trace_id", ""),
@@ -490,6 +528,22 @@ async def run_session():
                         status=fill["status"],
                         broker_order_id=order_id,
                         error=err or "",
+                    )
+                    _comment = params.get("comment") or ""
+                    record_order(
+                        trace_id=fill["trace_id"],
+                        source="telegram" if str(_comment).startswith("tg-") else "tradingview",
+                        command=command,
+                        symbol=symbol,
+                        requested_risk=fnum(params, "risk") or None,
+                        volume=exec_volume,
+                        sl=fnum(params, "sl") or None,
+                        tp=fnum(params, "tp") or None,
+                        entry=fnum(params, "entry", "entry_price") or None,
+                        status=fill["status"],
+                        broker_order_id=order_id or None,
+                        comment=_comment or None,
+                        error=err or None,
                     )
                 elif mtype == "ping":
                     await ws.send(json.dumps({"type": "pong"}))

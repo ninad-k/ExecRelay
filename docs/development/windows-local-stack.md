@@ -99,6 +99,114 @@ fields mirror the ReyLens `trades` schema so entries can be migrated there.
 The dashboard binds to localhost only — it shows account balances and has no
 auth. View it in an RDP session; do not expose the port.
 
+## Management reporting
+
+The dashboard is backed by a SQLite store, `.local-stack\execrelay.db` (WAL
+mode; module `scripts/_tradestore.py`) — every signal telegram-ingest
+parses, every order the EA shim places/reports, every closed position, and a
+periodic account-equity snapshot lands there, correlated by ExecRelay's
+`trace_id`. Not the production persistence path (that's `apps/persist/app.py`
+via NATS) — dev-harness tooling only, same tier as `_txnlog.py`.
+
+```powershell
+python scripts\_tradestore.py backfill   # idempotent import from JSONL txn logs + 90d MT5 closed-deal history
+python scripts\_tradestore.py stats      # row counts per table
+```
+
+### Channel scorecard
+
+`GET /api/scorecard?days=N` and a "Channel scorecard" table on the
+dashboard: per Telegram channel (`signals.channel`, blank/`NULL` shown as
+"direct"), signals received / posted / rejected, orders executed (joined via
+`signals.trace_ids` → `orders.trace_id`), and win/loss/net P/L/avg R of the
+closed outcomes. Two synthetic reconciliation rows are always included:
+**tradingview** (orders with `source=tradingview`, which never go through
+the signals table) and **other EAs** (`closed_trades.source=other` — the
+rest of the account, e.g. other EAs or manual trades) — so the section
+totals reconcile against the whole account, not just the Telegram-signal
+slice.
+
+The order → closed-trade join is a heuristic: `orders.broker_order_id ==
+closed_trades.position_id`, which only resolves once MT5 reports a market
+fill's close. Pending limit orders, or fills the closed-trade recorder
+hasn't caught up to yet, show as **open/pending** rather than a win or loss.
+
+### Risk & exposure panel
+
+Embedded in `/api/summary` under `"risk"`, and separately at `GET
+/api/risk?days=N`:
+
+- **Equity curve** — from `equity_snapshots` over the selected window. With
+  fewer than 2 snapshots in the window (e.g. a fresh stack), it falls back
+  to a synthetic curve — current balance minus each day's closed P/L
+  reverse-cumulated backwards — clearly flagged `"estimated": true` in the
+  JSON and labeled "estimated" under the chart. The estimate ignores
+  floating P/L on open positions and any deposits/withdrawals.
+- **Max / current drawdown %** computed off that curve.
+- **Live margin usage** (`margin`, `margin_free`, `margin_level` from MT5
+  `account_info`) and total open lots.
+- **Compliance strip**: the `EA_SHIM_RISK_USD` cap value, the count and list
+  of risk-sized orders (`orders.requested_risk IS NOT NULL`), the count of
+  risk-cap rejections (`orders.status='rejected' AND error LIKE 'risk
+  sizing%'`), and the max single-order `requested_risk` in the window vs the
+  cap.
+
+### Monthly P/L calendar
+
+`GET /api/calendar?month=YYYY-MM&stack_only=1` and a Mon–Sun grid on the
+dashboard: each day colored by net closed P/L (profit/loss-dim background),
+day number + net amount, month total in the header, prev/next navigation.
+Data is `closed_trades` grouped by UTC close date; the "stack only" /
+"all sources" toggle filters out `source=other` (other EAs / manual trades
+on the same account) or includes everything.
+
+### Telegram digest & loss/drawdown alerts
+
+A background thread in the dashboard process (started with the server, not
+a separate service) sends a plain-text digest once a day and polls for loss/
+drawdown breaches every 60s. Env keys (`.env`, all optional):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `MGMT_CHAT_ID` | first id in `TELEGRAM_INGEST_ALLOWED_CHAT_IDS` | Telegram chat the digest/alerts go to |
+| `MGMT_DIGEST_TIME` | `20:00` | UTC `HH:MM` send time; empty disables the digest |
+| `MGMT_DIGEST_WEEKLY_DAY` | `Mon` | on this weekday (`%a`) the digest covers the trailing 7 days instead of 1 |
+| `MGMT_ALERT_DAILY_LOSS_USD` | `500` | equity vs today's UTC baseline; `0` disables |
+| `MGMT_ALERT_DRAWDOWN_PCT` | `10` | equity vs 90-day peak equity; `0` disables |
+
+The digest reports: period, signals received/executed, trades closed W/L,
+net P/L (period), per-source split, floating P/L now, equity now vs period
+start, margin level, and risk-cap rejection count. Alerts state the exact
+numbers and the formula used, and are throttled to one send per 6h per alert
+type (last-sent/last-alert timestamps persist in the store's `meta` table so
+a restart doesn't double-send or re-alert immediately).
+
+Sends go through the `telegram-ingest` bot (`TELEGRAM_INGEST_BOT_TOKEN`).
+To preview or manually trigger a digest without waiting for the scheduled
+time:
+
+```powershell
+python scripts\trade_dashboard.py --digest-now                    # prints today's/weekly digest text
+python scripts\trade_dashboard.py --digest-now --period-days 7    # prints a 7-day digest
+```
+
+`--digest-now` only *prints* by default — it sends only when `MGMT_DIGEST_SEND=1`
+is set in the environment, so it's safe to run while testing.
+
+### Weekly XLSX export
+
+`GET /api/export/weekly.xlsx` (also linked next to the CSV exports) builds
+a workbook with four sheets — **Summary** (the digest numbers), **Closed
+Trades** (the window), **Scorecard**, and **Equity** (snapshots) — using
+`openpyxl`. This is the one dashboard dependency beyond the stdlib:
+
+```powershell
+python -m pip install openpyxl --quiet --disable-pip-version-check
+```
+
+If `openpyxl` isn't installed, the route responds `501` with a message
+telling you to install it rather than erroring the whole dashboard.
+
 ## Broker symbol names
 
 The CFI demo server suffixes instruments with an underscore (`XAUUSD_`, not

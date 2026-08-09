@@ -38,8 +38,11 @@ import io
 import json
 import os
 import re
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +53,8 @@ try:
 except ImportError:  # dashboard still works log-only
     mt5 = None
 
+import _tradestore as ts
+
 ADDR = os.environ.get("DASHBOARD_ADDR", "127.0.0.1:8090")
 MAGIC = int(os.environ.get("EA_SHIM_MAGIC", "20240101"))
 DASHBOARD_TOKEN = (os.environ.get("DASHBOARD_TOKEN") or "").strip()
@@ -59,6 +64,29 @@ JOURNAL_PATH = ROOT / ".local-stack" / "journal.json"
 ASSETS = Path(__file__).resolve().parent / "dashboard-assets"
 
 EMOTIONS = ["calm", "confident", "neutral", "anxious", "fearful", "greedy", "fomo", "revenge", "bored"]
+
+# ---------------------------------------------------------------------------
+# Management reporting — env config
+#
+# Risk cap mirrors the EA shim's own cap (docs/development/windows-local-stack
+# "Risk sizing — max loss per trade"); the compliance panel reports orders
+# against it, it does not enforce anything itself.
+# ---------------------------------------------------------------------------
+
+EA_SHIM_RISK_USD = float(os.environ.get("EA_SHIM_RISK_USD", "0") or 0)
+
+_ALLOWED_CHAT_IDS = [
+    c.strip() for c in (os.environ.get("TELEGRAM_INGEST_ALLOWED_CHAT_IDS") or "").split(",") if c.strip()
+]
+MGMT_CHAT_ID = (os.environ.get("MGMT_CHAT_ID") or "").strip() or (_ALLOWED_CHAT_IDS[0] if _ALLOWED_CHAT_IDS else "")
+MGMT_DIGEST_TIME = (os.environ.get("MGMT_DIGEST_TIME", "20:00") or "").strip()
+MGMT_DIGEST_WEEKLY_DAY = (os.environ.get("MGMT_DIGEST_WEEKLY_DAY", "Mon") or "Mon").strip()
+MGMT_ALERT_DAILY_LOSS_USD = float(os.environ.get("MGMT_ALERT_DAILY_LOSS_USD", "500") or 0)
+MGMT_ALERT_DRAWDOWN_PCT = float(os.environ.get("MGMT_ALERT_DRAWDOWN_PCT", "10") or 0)
+_TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_INGEST_BOT_TOKEN") or "").strip()
+
+_ALERT_COOLDOWN_SEC = 6 * 3600
+_MGMT_LOOP_SEC = 60
 
 
 def _allowed_hosts() -> set[str]:
@@ -481,6 +509,7 @@ def summary(days: int = 7) -> dict:
             "avg_rating": round(sum(ratings) / len(ratings), 1) if ratings else None,
             "emotions": EMOTIONS,
         },
+        "risk": risk_panel(days),
     }
 
 
@@ -614,6 +643,638 @@ def _parse_days(path: str) -> int:
     except ValueError:
         d = 7
     return max(1, min(120, d))
+
+
+# ---------------------------------------------------------------------------
+# Management reporting — backed by the SQLite trade store (_tradestore.py,
+# .local-stack\\execrelay.db). All queries go through ts.query(), which never
+# raises (returns [] on any DB error), so these helpers are safe to call even
+# if the store is missing/locked/corrupt -- callers just see empty sections.
+# ---------------------------------------------------------------------------
+
+
+def _cutoff_iso(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _channel_label(channel: str | None) -> str:
+    c = (channel or "").strip()
+    return c if c else "direct"
+
+
+def scorecard(days: int = 30) -> dict:
+    """Per-channel signal->order->closed-trade funnel. Real Telegram channels
+    come from signals.channel (joined to orders via signals.trace_ids ->
+    orders.trace_id); a synthetic "tradingview" row covers orders.source=
+    "tradingview" (those never go through the signals table), and a synthetic
+    "other EAs" row covers closed_trades.source="other" so the section totals
+    reconcile against the whole account, not just the signal-driven slice.
+
+    Order -> closed-trade join is a heuristic: orders.broker_order_id ==
+    closed_trades.position_id, which only resolves once MT5 reports a market
+    fill's close. Pending orders (limits not yet triggered) or very recent
+    fills the closed-trade backfill/live recorder hasn't caught up to show as
+    "open/pending" rather than wins/losses.
+    """
+    cutoff = _cutoff_iso(days)
+    sig_rows = ts.query("SELECT channel, outcome, trace_ids FROM signals WHERE ts >= ?", (cutoff,))
+    order_rows = ts.query(
+        "SELECT trace_id, source, status, requested_risk, broker_order_id FROM orders WHERE ts >= ?", (cutoff,)
+    )
+    orders_by_trace = {r["trace_id"]: r for r in order_rows if r["trace_id"]}
+    closed_rows = ts.query("SELECT position_id, profit, source FROM closed_trades WHERE close_ts >= ?", (cutoff,))
+    closed_by_pos = {r["position_id"]: r for r in closed_rows}
+
+    channels: dict[str, dict] = {}
+
+    def bucket(name: str) -> dict:
+        return channels.setdefault(
+            name,
+            {
+                "channel": name, "received": 0, "posted": 0, "rejected": 0,
+                "orders_executed": 0, "orders_open_pending": 0,
+                "wins": 0, "losses": 0, "net_pl": 0.0, "r_values": [],
+            },
+        )
+
+    def _apply_order(b: dict, o: dict) -> None:
+        if o.get("status") not in ("filled", "placed"):
+            return
+        b["orders_executed"] += 1
+        pos = o.get("broker_order_id")
+        closed = closed_by_pos.get(pos) if pos else None
+        if closed is None:
+            b["orders_open_pending"] += 1
+            return
+        profit = closed.get("profit") or 0.0
+        if profit >= 0:
+            b["wins"] += 1
+        else:
+            b["losses"] += 1
+        b["net_pl"] += profit
+        risk = o.get("requested_risk")
+        if risk:
+            b["r_values"].append(profit / risk)
+
+    for s in sig_rows:
+        b = bucket(_channel_label(s.get("channel")))
+        b["received"] += 1
+        outcome = s.get("outcome")
+        if outcome == "posted":
+            b["posted"] += 1
+        elif outcome == "rejected":
+            b["rejected"] += 1
+        try:
+            trace_ids = json.loads(s.get("trace_ids") or "[]")
+            if not isinstance(trace_ids, list):
+                trace_ids = []
+        except json.JSONDecodeError:
+            trace_ids = []
+        for tid in trace_ids:
+            o = orders_by_trace.get(tid)
+            if o:
+                _apply_order(b, o)
+
+    tv = bucket("tradingview")
+    for o in order_rows:
+        if o.get("source") == "tradingview":
+            _apply_order(tv, o)
+
+    other = bucket("other EAs")
+    for c in closed_rows:
+        if c.get("source") != "other":
+            continue
+        profit = c.get("profit") or 0.0
+        if profit >= 0:
+            other["wins"] += 1
+        else:
+            other["losses"] += 1
+        other["net_pl"] += profit
+
+    rows = []
+    for name, b in channels.items():
+        avg_r = round(sum(b["r_values"]) / len(b["r_values"]), 2) if b["r_values"] else None
+        rows.append(
+            {
+                "channel": b["channel"],
+                "received": b["received"],
+                "posted": b["posted"],
+                "rejected": b["rejected"],
+                "orders_executed": b["orders_executed"],
+                "orders_open_pending": b["orders_open_pending"],
+                "wins": b["wins"],
+                "losses": b["losses"],
+                "net_pl": round(b["net_pl"], 2),
+                "avg_r": avg_r,
+            }
+        )
+    # Real signal channels first (alphabetical), synthetic reconciliation
+    # rows last in a fixed order.
+    _synthetic_order = {"tradingview": 1, "other EAs": 2}
+    rows.sort(key=lambda r: (_synthetic_order.get(r["channel"], 0), r["channel"]))
+    return {
+        "days": days,
+        "rows": rows,
+        "note": (
+            "orders are matched to closed trades via broker_order_id == position_id "
+            "(market fills only); unmatched executed orders show as open/pending "
+            "until MT5 reports the close"
+        ),
+    }
+
+
+# --- risk & exposure ---------------------------------------------------
+
+
+def _equity_curve(days: int) -> dict:
+    cutoff = _cutoff_iso(days)
+    snaps = ts.query(
+        "SELECT ts, balance, equity, margin, margin_free, floating FROM equity_snapshots "
+        "WHERE ts >= ? ORDER BY ts ASC",
+        (cutoff,),
+    )
+    estimated = len(snaps) < 2
+    if not estimated:
+        curve = [{"ts": s["ts"], "equity": s["equity"]} for s in snaps]
+    else:
+        # Fewer than 2 real snapshots in the window (e.g. ea_shim hasn't been
+        # running long) -- fall back to a synthetic curve: start from the
+        # current balance and reverse-cumulate each day's realized closed
+        # P/L to back out what equity "would have been" on prior days. This
+        # ignores floating P/L on still-open positions and any deposits/
+        # withdrawals, so it's an approximation -- callers must label it.
+        balance_now = None
+        if _ensure_mt5():
+            acct = mt5.account_info()
+            if acct is not None:
+                balance_now = acct.balance
+        if balance_now is None and snaps:
+            balance_now = snaps[-1]["balance"]
+        if balance_now is None:
+            balance_now = 0.0
+
+        closed = ts.query("SELECT close_ts, profit FROM closed_trades WHERE close_ts >= ?", (cutoff,))
+        daily: dict[str, float] = {}
+        for c in closed:
+            d = (c.get("close_ts") or "")[:10]
+            if d:
+                daily[d] = daily.get(d, 0.0) + (c.get("profit") or 0.0)
+
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=days - 1)
+        day_keys = []
+        cur = start
+        while cur <= end:
+            day_keys.append(cur.isoformat())
+            cur += timedelta(days=1)
+
+        cum_after = 0.0
+        eq_by_day: dict[str, float] = {}
+        for d in reversed(day_keys):
+            eq_by_day[d] = round(balance_now - cum_after, 2)
+            cum_after += daily.get(d, 0.0)
+        curve = [{"ts": d, "equity": eq_by_day[d]} for d in day_keys]
+
+    max_dd = 0.0
+    cur_dd = 0.0
+    if curve:
+        peak = curve[0]["equity"]
+        for pt in curve:
+            eq = pt["equity"]
+            if eq > peak:
+                peak = eq
+            if peak:
+                dd = (peak - eq) / peak * 100
+                if dd > max_dd:
+                    max_dd = dd
+        last_eq = curve[-1]["equity"]
+        cur_dd = ((peak - last_eq) / peak * 100) if peak else 0.0
+
+    return {
+        "estimated": estimated,
+        "points": curve,
+        "max_drawdown_pct": round(max_dd, 2),
+        "current_drawdown_pct": round(cur_dd, 2),
+    }
+
+
+def _live_risk() -> dict:
+    if not _ensure_mt5():
+        return {"available": False}
+    acct = mt5.account_info()
+    if acct is None:
+        _mt5_reset()
+        return {"available": False}
+    positions = mt5.positions_get() or []
+    return {
+        "available": True,
+        "margin": round(acct.margin, 2),
+        "margin_free": round(acct.margin_free, 2),
+        "margin_level": round(acct.margin_level, 2) if acct.margin_level else acct.margin_level,
+        "open_lots": round(sum(p.volume for p in positions), 4) if positions else 0.0,
+    }
+
+
+def _compliance(days: int) -> dict:
+    cutoff = _cutoff_iso(days)
+    risk_orders = ts.query(
+        "SELECT trace_id, ts, symbol, requested_risk, status FROM orders "
+        "WHERE requested_risk IS NOT NULL AND ts >= ? ORDER BY ts DESC",
+        (cutoff,),
+    )
+    rejections = ts.query(
+        "SELECT trace_id, ts, symbol, error FROM orders "
+        "WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ? ORDER BY ts DESC",
+        (cutoff,),
+    )
+    max_risk = max((r["requested_risk"] for r in risk_orders), default=None)
+    return {
+        "cap_usd": EA_SHIM_RISK_USD,
+        "risk_sized_orders": {"count": len(risk_orders), "rows": risk_orders[:50]},
+        "risk_cap_rejections": {"count": len(rejections), "rows": rejections[:50]},
+        "max_single_order_risk": max_risk,
+        "max_vs_cap_pct": round(max_risk / EA_SHIM_RISK_USD * 100, 1) if (max_risk and EA_SHIM_RISK_USD) else None,
+    }
+
+
+def risk_panel(days: int = 30) -> dict:
+    return {
+        "days": days,
+        "equity_curve": _equity_curve(days),
+        "live": _live_risk(),
+        "compliance": _compliance(days),
+    }
+
+
+# --- monthly P/L calendar -----------------------------------------------
+
+
+def calendar_month(month: str, stack_only: bool = True) -> dict:
+    now = datetime.now(timezone.utc)
+    try:
+        year_s, mon_s = month.split("-", 1)
+        year, mon = int(year_s), int(mon_s)
+        if not (1 <= mon <= 12):
+            raise ValueError
+    except (ValueError, AttributeError):
+        year, mon = now.year, now.month
+    start = datetime(year, mon, 1, tzinfo=timezone.utc)
+    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) if mon == 12 else datetime(year, mon + 1, 1, tzinfo=timezone.utc)
+
+    rows = ts.query(
+        "SELECT close_ts, profit, source FROM closed_trades WHERE close_ts >= ? AND close_ts < ?",
+        (start.isoformat(), end.isoformat()),
+    )
+    if stack_only:
+        rows = [r for r in rows if r.get("source") != "other"]
+
+    daily: dict[str, dict] = {}
+    for r in rows:
+        d = (r.get("close_ts") or "")[:10]
+        if not d:
+            continue
+        b = daily.setdefault(d, {"net": 0.0, "count": 0})
+        b["net"] += r.get("profit") or 0.0
+        b["count"] += 1
+
+    days = []
+    cur = start
+    while cur < end:
+        key = cur.date().isoformat()
+        b = daily.get(key, {"net": 0.0, "count": 0})
+        days.append({"date": key, "weekday": cur.weekday(), "net": round(b["net"], 2), "count": b["count"]})
+        cur += timedelta(days=1)
+
+    prev_ref = start - timedelta(days=1)
+    return {
+        "month": f"{year:04d}-{mon:02d}",
+        "days": days,
+        "total": round(sum(d["net"] for d in days), 2),
+        "prev": f"{prev_ref.year:04d}-{prev_ref.month:02d}",
+        "next": f"{end.year:04d}-{end.month:02d}",
+        "stack_only": stack_only,
+    }
+
+
+# --- digest text -----------------------------------------------------------
+
+
+def _digest_period(days: int) -> dict:
+    cutoff = _cutoff_iso(days)
+    received = len(ts.query("SELECT 1 FROM signals WHERE ts >= ?", (cutoff,)))
+    order_rows = ts.query("SELECT status FROM orders WHERE ts >= ?", (cutoff,))
+    executed = sum(1 for o in order_rows if o.get("status") in ("filled", "placed"))
+    closed_rows = ts.query("SELECT profit, source FROM closed_trades WHERE close_ts >= ?", (cutoff,))
+    wins = sum(1 for c in closed_rows if (c.get("profit") or 0) >= 0)
+    losses = len(closed_rows) - wins
+    net = round(sum(c.get("profit") or 0 for c in closed_rows), 2)
+    by_source: dict[str, float] = {}
+    for c in closed_rows:
+        s = c.get("source") or "other"
+        by_source[s] = round(by_source.get(s, 0.0) + (c.get("profit") or 0.0), 2)
+    rej = ts.query(
+        "SELECT COUNT(*) AS n FROM orders WHERE status='rejected' AND error LIKE 'risk sizing%' AND ts >= ?",
+        (cutoff,),
+    )
+    risk_cap_events = rej[0]["n"] if rej else 0
+
+    equity_now = None
+    floating = None
+    margin_level = None
+    if _ensure_mt5():
+        acct = mt5.account_info()
+        if acct is not None:
+            equity_now = acct.equity
+            margin_level = round(acct.margin_level, 2) if acct.margin_level else acct.margin_level
+            positions = mt5.positions_get() or []
+            floating = round(sum(p.profit for p in positions), 2) if positions else 0.0
+        else:
+            _mt5_reset()
+
+    snaps = ts.query(
+        "SELECT equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC LIMIT 1", (cutoff,)
+    )
+    if snaps:
+        equity_start = snaps[0]["equity"]
+    elif equity_now is not None:
+        equity_start = round(equity_now - net, 2)
+    else:
+        equity_start = None
+
+    return {
+        "days": days, "received": received, "executed": executed,
+        "wins": wins, "losses": losses, "net": net, "by_source": by_source,
+        "floating": floating, "equity_now": equity_now, "equity_start": equity_start,
+        "margin_level": margin_level, "risk_cap_events": risk_cap_events,
+    }
+
+
+def _fmt_signed(v: float) -> str:
+    return f"{'+' if v >= 0 else ''}{v:.2f}"
+
+
+def build_digest_text(days: int, weekly: bool) -> str:
+    """Plain-text digest (no markdown -- goes straight into a Telegram
+    message). Pure function of the store's current state; callers decide
+    whether/where to send it."""
+    d = _digest_period(days)
+    period_label = "Weekly (7-day)" if weekly else f"{days}-day"
+    lines = [
+        f"Rey Capital trade digest — {period_label} — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Signals received: {d['received']} | executed: {d['executed']}",
+        f"Trades closed: {d['wins']}W / {d['losses']}L | Net P/L: {_fmt_signed(d['net'])} USD",
+    ]
+    if d["by_source"]:
+        parts = ", ".join(f"{k}: {_fmt_signed(v)}" for k, v in sorted(d["by_source"].items()))
+        lines.append(f"By source: {parts}")
+    if d["floating"] is not None:
+        lines.append(f"Floating P/L now: {_fmt_signed(d['floating'])} USD")
+    if d["equity_now"] is not None:
+        eq_start_s = f"{d['equity_start']:.2f}" if d["equity_start"] is not None else "n/a"
+        lines.append(f"Equity now: {d['equity_now']:.2f} USD (period start: {eq_start_s})")
+    else:
+        lines.append("Equity now: MT5 unavailable")
+    if d["margin_level"] is not None:
+        lines.append(f"Margin level: {d['margin_level']:.1f}%")
+    lines.append(f"Risk-cap rejections this period: {d['risk_cap_events']}")
+    return "\n".join(lines)
+
+
+# --- Telegram send + meta persistence ---------------------------------
+
+
+def _send_telegram(chat_id: str, text: str) -> bool:
+    """Best-effort send via the ingest bot's API. Never raises -- a failed
+    send (bad token, network blip, chat not reachable) just logs and returns
+    False; the caller still records last-sent so a persistently failing send
+    doesn't retry-storm."""
+    if not _TELEGRAM_BOT_TOKEN or not chat_id:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"[mgmt] telegram send failed: {exc!r}", file=sys.stderr)
+        return False
+    except Exception as exc:  # noqa: BLE001 - background thread must never die
+        print(f"[mgmt] telegram send failed (unexpected): {exc!r}", file=sys.stderr)
+        return False
+
+
+def _meta_get(key: str) -> str | None:
+    conn = ts.get_conn()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _meta_set(key: str, value: str) -> None:
+    conn = ts.get_conn()
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# --- background thread: daily/weekly digest + loss/drawdown alerts ------
+
+
+def _check_digest(now: datetime | None = None) -> None:
+    if not MGMT_DIGEST_TIME:
+        return
+    try:
+        hh, mm = (int(x) for x in MGMT_DIGEST_TIME.split(":", 1))
+    except ValueError:
+        return
+    now = now or datetime.now(timezone.utc)
+    if now.hour != hh or now.minute != mm:
+        return
+    today_key = now.date().isoformat()
+    if _meta_get("mgmt_digest_last_sent") == today_key:
+        return
+    is_weekly = now.strftime("%a") == MGMT_DIGEST_WEEKLY_DAY
+    text = build_digest_text(7 if is_weekly else 1, is_weekly)
+    if MGMT_CHAT_ID:
+        _send_telegram(MGMT_CHAT_ID, text)
+    _meta_set("mgmt_digest_last_sent", today_key)
+
+
+def _cooldown_ok(key: str) -> bool:
+    last = _meta_get(key)
+    if not last:
+        return True
+    try:
+        return (time.time() - float(last)) >= _ALERT_COOLDOWN_SEC
+    except ValueError:
+        return True
+
+
+def _maybe_alert(kind: str, text: str) -> None:
+    key = f"mgmt_alert_last_{kind}"
+    if not _cooldown_ok(key):
+        return
+    if MGMT_CHAT_ID:
+        _send_telegram(MGMT_CHAT_ID, text)
+    _meta_set(key, str(time.time()))
+
+
+def _check_alerts() -> None:
+    if not _ensure_mt5():
+        return
+    acct = mt5.account_info()
+    if acct is None:
+        _mt5_reset()
+        return
+    equity_now = acct.equity
+    now = datetime.now(timezone.utc)
+
+    if MGMT_ALERT_DAILY_LOSS_USD > 0:
+        today_start = now.strftime("%Y-%m-%dT00:00:00")
+        snaps = ts.query(
+            "SELECT equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC LIMIT 1", (today_start,)
+        )
+        if snaps:
+            baseline = snaps[0]["equity"]
+        else:
+            closed_today = ts.query("SELECT profit FROM closed_trades WHERE close_ts >= ?", (today_start,))
+            today_net = sum(c.get("profit") or 0 for c in closed_today)
+            baseline = acct.balance - today_net
+        loss = baseline - equity_now
+        if loss > MGMT_ALERT_DAILY_LOSS_USD:
+            _maybe_alert(
+                "daily_loss",
+                f"DAILY LOSS ALERT: equity {equity_now:.2f} vs today's baseline {baseline:.2f} "
+                f"= loss {loss:.2f} USD, exceeds cap {MGMT_ALERT_DAILY_LOSS_USD:.2f} USD. "
+                f"(formula: baseline - equity_now; baseline = first equity snapshot today, "
+                f"else balance - today's closed net)",
+            )
+
+    if MGMT_ALERT_DRAWDOWN_PCT > 0:
+        cutoff = _cutoff_iso(90)
+        snaps = ts.query("SELECT equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC", (cutoff,))
+        peak = max((s["equity"] for s in snaps), default=equity_now)
+        if equity_now > peak:
+            peak = equity_now
+        if peak:
+            dd_pct = (peak - equity_now) / peak * 100
+            if dd_pct > MGMT_ALERT_DRAWDOWN_PCT:
+                _maybe_alert(
+                    "drawdown",
+                    f"DRAWDOWN ALERT: equity {equity_now:.2f} vs 90-day peak {peak:.2f} "
+                    f"= drawdown {dd_pct:.2f}%, exceeds cap {MGMT_ALERT_DRAWDOWN_PCT:.2f}%. "
+                    f"(formula: (peak - equity_now) / peak * 100; peak from 90-day "
+                    f"equity_snapshots, else current equity)",
+                )
+
+
+def _mgmt_thread_loop() -> None:
+    while True:
+        try:
+            _check_digest()
+        except Exception as exc:  # noqa: BLE001 - must never take the thread down
+            print(f"[mgmt-thread] digest check failed: {exc!r}", file=sys.stderr)
+        try:
+            _check_alerts()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[mgmt-thread] alert check failed: {exc!r}", file=sys.stderr)
+        time.sleep(_MGMT_LOOP_SEC)
+
+
+# --- weekly XLSX export --------------------------------------------------
+
+
+def build_weekly_xlsx(days: int = 7) -> bytes | None:
+    """Returns None if openpyxl isn't installed -- caller responds 501."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return None
+
+    d = _digest_period(days)
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["Rey Capital — Weekly Management Report"])
+    ws.append(["Period (days)", days])
+    ws.append(["Generated (UTC)", datetime.now(timezone.utc).isoformat()])
+    ws.append([])
+    ws.append(["Signals received", d["received"]])
+    ws.append(["Orders executed", d["executed"]])
+    ws.append(["Trades closed — wins", d["wins"]])
+    ws.append(["Trades closed — losses", d["losses"]])
+    ws.append(["Net P/L (period)", d["net"]])
+    for src, val in sorted(d["by_source"].items()):
+        ws.append([f"Net P/L — {src}", val])
+    ws.append(["Floating P/L now", d["floating"]])
+    ws.append(["Equity now", d["equity_now"]])
+    ws.append(["Equity at period start", d["equity_start"]])
+    ws.append(["Margin level (%)", d["margin_level"]])
+    ws.append(["Risk-cap rejections", d["risk_cap_events"]])
+
+    cutoff = _cutoff_iso(days)
+    closed_rows = ts.query(
+        "SELECT position_id, close_ts, symbol, side, volume, entry_price, close_price, "
+        "profit, magic, comment, source FROM closed_trades WHERE close_ts >= ? ORDER BY close_ts DESC",
+        (cutoff,),
+    )
+    ws2 = wb.create_sheet("Closed Trades")
+    ct_header = [
+        "position_id", "close_ts", "symbol", "side", "volume", "entry_price",
+        "close_price", "profit", "magic", "comment", "source",
+    ]
+    ws2.append(ct_header)
+    for r in closed_rows:
+        ws2.append([r.get(h) for h in ct_header])
+
+    sc = scorecard(days)
+    ws3 = wb.create_sheet("Scorecard")
+    sc_header = [
+        "channel", "received", "posted", "rejected", "orders_executed",
+        "orders_open_pending", "wins", "losses", "net_pl", "avg_r",
+    ]
+    ws3.append(sc_header)
+    for r in sc["rows"]:
+        ws3.append([r.get(h) for h in sc_header])
+
+    snaps = ts.query(
+        "SELECT ts, balance, equity, margin, margin_free, floating FROM equity_snapshots "
+        "WHERE ts >= ? ORDER BY ts ASC",
+        (cutoff,),
+    )
+    ws4 = wb.create_sheet("Equity")
+    eq_header = ["ts", "balance", "equity", "margin", "margin_free", "floating"]
+    ws4.append(eq_header)
+    for r in snaps:
+        ws4.append([r.get(h) for h in eq_header])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +1468,31 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .btn-ghost { background: transparent; border: 1px solid var(--color-border); color: var(--color-text-dim); border-radius: var(--radius-sm); padding: 0.45rem 1rem; font-size: 0.8rem; cursor: pointer; }
 .checkline { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.8rem; font-size: 0.8rem; color: var(--color-text-dim); }
 #meta { color: var(--color-text-muted); font-size: 0.72rem; margin: 2.5rem 0 1rem; }
+
+.compliance-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
+.compliance-strip .stat-card.bad-cap { border-color: var(--color-loss); box-shadow: 0 0 0 1px var(--color-loss) inset; }
+.cal-controls { display: flex; align-items: center; gap: 0.6rem; }
+.cal-controls button.navbtn {
+  background: transparent; border: 1px solid var(--color-border-light); color: var(--color-primary);
+  border-radius: var(--radius-sm); padding: 0.15rem 0.55rem; font-size: 0.75rem; cursor: pointer;
+}
+.cal-controls button.navbtn:hover { background: var(--color-primary-glow); }
+.cal-controls .cal-label { font-size: 0.78rem; color: var(--color-text-dim); min-width: 6.5em; text-align: center; }
+.cal-grid {
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 0.4rem;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--color-surface-2) 60%, var(--color-surface)), var(--color-surface));
+  border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 0.85rem;
+}
+.cal-dow { font-size: 0.65rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); text-align: center; padding-bottom: 0.15rem; }
+.cal-cell {
+  min-height: 58px; border-radius: var(--radius-sm); border: 1px solid var(--color-border);
+  padding: 0.3rem 0.4rem; font-size: 0.72rem; background: var(--color-surface);
+}
+.cal-cell.empty { border: none; background: transparent; }
+.cal-cell.win { background: var(--color-profit-dim); border-color: color-mix(in srgb, var(--color-profit) 35%, var(--color-border)); }
+.cal-cell.loss { background: var(--color-loss-dim); border-color: color-mix(in srgb, var(--color-loss) 35%, var(--color-border)); }
+.cal-cell .d { color: var(--color-text-muted); font-size: 0.68rem; }
+.cal-cell .amt { font-weight: 600; margin-top: 0.15rem; }
 </style></head><body>
 <header>
   <div class="brand">
@@ -842,6 +1528,28 @@ button.jbtn:hover { background: var(--color-primary-glow); }
   <h2>Daily P/L</h2>
   <div class="chart-card"><div id="chart-daily"></div></div>
 
+  <h2>Channel scorecard <span class="chip" id="chip-scorecard"></span></h2>
+  <div class="tablewrap"><table id="tbl-scorecard"></table></div>
+
+  <h2>Risk &amp; exposure <span class="chip" id="chip-risk"></span></h2>
+  <div class="cards" id="risk-cards" style="margin-bottom:1rem"></div>
+  <div class="chart-card"><div id="chart-equity"></div></div>
+  <div class="compliance-strip" id="compliance-strip"></div>
+  <div class="tablewrap" id="wrap-risk-rejections"><table id="tbl-risk-rejections"></table></div>
+
+  <h2>Monthly P/L calendar <span class="chip" id="chip-calendar"></span>
+    <span class="cal-controls">
+      <button type="button" class="navbtn" id="cal-prev">&#8592;</button>
+      <span class="cal-label" id="cal-label">—</span>
+      <button type="button" class="navbtn" id="cal-next">&#8594;</button>
+    </span>
+    <span class="seg" id="seg-cal-source">
+      <button type="button" data-source="stack" class="active">Stack only</button>
+      <button type="button" data-source="all">All sources</button>
+    </span>
+  </h2>
+  <div id="cal-grid" class="cal-grid"></div>
+
   <h2>Closed trades &amp; journal <span class="chip" id="chip-journal"></span>
     <span class="seg" id="seg-days">
       <button type="button" data-days="7" class="active">7d</button>
@@ -849,7 +1557,7 @@ button.jbtn:hover { background: var(--color-primary-glow); }
       <button type="button" data-days="90">90d</button>
     </span>
     <span class="exports">
-      <a id="export-trades" href="/api/export/trades.csv">Export trades CSV</a><a id="export-journal" href="/api/export/journal.csv">Export journal CSV</a>
+      <a id="export-trades" href="/api/export/trades.csv">Export trades CSV</a><a id="export-journal" href="/api/export/journal.csv">Export journal CSV</a><a id="export-weekly-xlsx" href="/api/export/weekly.xlsx">Export weekly XLSX</a>
     </span>
   </h2>
   <div class="review-strip" id="review-strip" style="display:none"></div>
@@ -910,6 +1618,10 @@ function table(id, header, rows, footer) {
 }
 
 async function refresh() {
+  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar()]);
+}
+
+async function refreshSummary() {
   const res = await fetch(withToken("/api/summary?days=" + currentDays), { headers: authHeaders() });
   if (!res.ok) { $("meta").textContent = "refresh failed: " + res.status + " " + (await res.text()); return; }
   const s = await res.json();
@@ -968,6 +1680,7 @@ async function refresh() {
     card("Other EA / manual", money(bySrc.other || 0), cls(bySrc.other || 0), `net over ${currentDays}d`);
 
   renderChart(c.daily || []);
+  renderRisk(s.risk);
 
   const rq = (c.review_queue || []).slice(0, 8);
   if (rq.length) {
@@ -995,8 +1708,126 @@ async function refresh() {
 
   $("export-trades").href = withToken("/api/export/trades.csv?days=" + currentDays);
   $("export-journal").href = withToken("/api/export/journal.csv");
+  $("export-weekly-xlsx").href = withToken("/api/export/weekly.xlsx?days=7");
 
   $("meta").textContent = "updated " + s.updated + " — auto-refreshes every 10s — journal entries are stored locally and mirror the ReyLens schema";
+}
+
+function renderScorecard(sc) {
+  $("chip-scorecard").textContent = `${sc.days}d window`;
+  table("tbl-scorecard",
+    ["channel","received","posted","rejected","orders executed","open/pending","wins","losses","net P/L","avg R"],
+    (sc.rows || []).map(r =>
+      `<tr><td>${esc(r.channel)}</td><td class="number">${r.received}</td><td class="number">${r.posted}</td>
+       <td class="number">${r.rejected}</td><td class="number">${r.orders_executed}</td>
+       <td class="number muted">${r.orders_open_pending}</td>
+       <td class="number pos">${r.wins}</td><td class="number neg">${r.losses}</td>
+       <td class="number ${cls(r.net_pl)}">${money(r.net_pl)}</td>
+       <td class="number">${(r.avg_r === null || r.avg_r === undefined) ? "—" : r.avg_r.toFixed(2)}</td></tr>`));
+}
+
+async function refreshScorecard() {
+  const res = await fetch(withToken("/api/scorecard?days=" + currentDays), { headers: authHeaders() });
+  if (!res.ok) return;
+  renderScorecard(await res.json());
+}
+
+function renderRisk(risk) {
+  if (!risk) return;
+  const live = risk.live || {};
+  const eqc = risk.equity_curve || { points: [], estimated: true, max_drawdown_pct: 0, current_drawdown_pct: 0 };
+  const comp = risk.compliance || {};
+
+  $("chip-risk").textContent = `${risk.days}d window` + (eqc.estimated ? " · equity curve estimated" : "");
+
+  $("risk-cards").innerHTML =
+    card("Margin used", live.available ? "$" + live.margin.toFixed(2) : "—", "", live.available ? `free $${live.margin_free.toFixed(2)}` : "MT5 offline") +
+    card("Margin level", (live.available && live.margin_level != null) ? live.margin_level.toFixed(1) + "%" : "—") +
+    card("Open lots", live.available ? live.open_lots : "—") +
+    card("Max drawdown", eqc.max_drawdown_pct.toFixed(2) + "%", eqc.max_drawdown_pct > 0 ? "neg" : "") +
+    card("Current drawdown", eqc.current_drawdown_pct.toFixed(2) + "%", eqc.current_drawdown_pct > 0 ? "neg" : "");
+
+  renderEquityCurve(eqc.points || [], eqc.estimated);
+
+  const rejCount = (comp.risk_cap_rejections || {}).count || 0;
+  const overCap = comp.max_single_order_risk != null && comp.cap_usd && comp.max_single_order_risk > comp.cap_usd;
+  $("compliance-strip").innerHTML =
+    card("Risk cap", comp.cap_usd ? "$" + comp.cap_usd.toFixed(2) : "—", "", "EA_SHIM_RISK_USD") +
+    card("Risk-sized orders", (comp.risk_sized_orders || {}).count ?? 0) +
+    card("Risk-cap rejections", rejCount, rejCount ? "neg" : "") +
+    card("Max single-order risk", comp.max_single_order_risk != null ? "$" + comp.max_single_order_risk.toFixed(2) : "—",
+      overCap ? "neg" : "", comp.max_vs_cap_pct != null ? `${comp.max_vs_cap_pct}% of cap` : "");
+
+  const rej = (comp.risk_cap_rejections || {}).rows || [];
+  table("tbl-risk-rejections", ["time (UTC)","symbol","trace id","rejection reason"], rej.map(r =>
+    `<tr><td class="muted number">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${esc(r.symbol)}</td>
+     <td class="muted">${esc((r.trace_id||"").slice(0,10))}…</td><td class="neg">${esc(r.error)}</td></tr>`));
+}
+
+function renderEquityCurve(points, estimated) {
+  const el = $("chart-equity");
+  if (!points.length) { el.innerHTML = '<span class="muted">no data</span>'; return; }
+  const w = 1000, h = 120, padB = 18, padT = 10, padL = 2, padR = 2;
+  const vals = points.map(p => p.equity);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = (max - min) || 1;
+  const n = points.length;
+  const stepX = n > 1 ? (w - padL - padR) / (n - 1) : 0;
+  const yOf = v => padT + (h - padT - padB) * (1 - (v - min) / range);
+  let path = "";
+  points.forEach((p, i) => {
+    const x = padL + i * stepX;
+    path += (i === 0 ? "M" : "L") + x.toFixed(1) + "," + yOf(p.equity).toFixed(1) + " ";
+  });
+  const area = path + `L${(padL + (n - 1) * stepX).toFixed(1)},${(h - padB).toFixed(1)} L${padL},${(h - padB).toFixed(1)} Z`;
+  const tickEvery = Math.max(1, Math.ceil(n / 8));
+  let labels = "";
+  points.forEach((p, i) => {
+    if (i % tickEvery === 0 || i === n - 1) {
+      const x = padL + i * stepX;
+      labels += `<text x="${x.toFixed(1)}" y="${h-4}" font-size="9" text-anchor="middle" fill="var(--color-text-muted)">${esc((p.ts||"").slice(5,10))}</text>`;
+    }
+  });
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Equity curve${estimated ? ' (estimated)' : ''}">
+    <path d="${area}" fill="var(--color-primary-glow)" stroke="none"/>
+    <path d="${path}" fill="none" stroke="var(--color-primary)" stroke-width="2"/>
+    ${labels}
+  </svg>` + (estimated
+    ? '<div class="muted" style="font-size:0.68rem;margin-top:0.35rem">estimated: balance now minus reverse-cumulated daily closed P/L (fewer than 2 live equity snapshots in this window)</div>'
+    : '');
+}
+
+let calMonth = null, calStackOnly = true, lastCalendar = null;
+
+function calQuery() {
+  return "?stack_only=" + (calStackOnly ? "1" : "0") + (calMonth ? "&month=" + encodeURIComponent(calMonth) : "");
+}
+
+async function refreshCalendar() {
+  const res = await fetch(withToken("/api/calendar" + calQuery()), { headers: authHeaders() });
+  if (!res.ok) { $("cal-grid").innerHTML = '<span class="muted">calendar failed to load</span>'; return; }
+  const data = await res.json();
+  calMonth = data.month;
+  lastCalendar = data;
+  renderCalendar(data);
+}
+
+function renderCalendar(data) {
+  $("cal-label").textContent = data.month;
+  $("chip-calendar").textContent = money(data.total) + (data.stack_only ? " · stack only" : " · all sources");
+  const days = data.days || [];
+  const dow = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  let html = dow.map(d => `<div class="cal-dow">${d}</div>`).join("");
+  const leading = days.length ? days[0].weekday : 0;
+  for (let i = 0; i < leading; i++) html += '<div class="cal-cell empty"></div>';
+  days.forEach(d => {
+    const cellCls = d.count === 0 ? "" : (d.net >= 0 ? "win" : "loss");
+    const dayNum = parseInt(d.date.slice(8, 10), 10);
+    html += `<div class="cal-cell ${cellCls}"><div class="d">${dayNum}</div>` +
+      (d.count ? `<div class="amt ${cls(d.net)}">${money(d.net)}</div><div class="muted" style="font-size:0.62rem">${d.count} trade${d.count===1?"":"s"}</div>` : "") +
+      `</div>`;
+  });
+  $("cal-grid").innerHTML = html;
 }
 
 function renderChart(daily) {
@@ -1078,6 +1909,17 @@ document.addEventListener("click", e => {
     currentDays = parseInt(segBtn.getAttribute("data-days"), 10);
     document.querySelectorAll("#seg-days button").forEach(b => b.classList.toggle("active", b === segBtn));
     refresh();
+    return;
+  }
+  const calPrev = e.target.closest("#cal-prev");
+  if (calPrev) { calMonth = lastCalendar ? lastCalendar.prev : null; refreshCalendar(); return; }
+  const calNext = e.target.closest("#cal-next");
+  if (calNext) { calMonth = lastCalendar ? lastCalendar.next : null; refreshCalendar(); return; }
+  const calSrcBtn = e.target.closest("#seg-cal-source button");
+  if (calSrcBtn) {
+    calStackOnly = calSrcBtn.getAttribute("data-source") === "stack";
+    document.querySelectorAll("#seg-cal-source button").forEach(b => b.classList.toggle("active", b === calSrcBtn));
+    refreshCalendar();
   }
 });
 
@@ -1143,11 +1985,38 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/summary":
             days = _parse_days(self.path)
             self._send(200, json.dumps(summary(days), default=str).encode(), "application/json")
+        elif path == "/api/scorecard":
+            days = _parse_days(self.path)
+            self._send(200, json.dumps(scorecard(days), default=str).encode(), "application/json")
+        elif path == "/api/risk":
+            days = _parse_days(self.path)
+            self._send(200, json.dumps(risk_panel(days), default=str).encode(), "application/json")
+        elif path == "/api/calendar":
+            qs = parse_qs(urlsplit(self.path).query)
+            month = (qs.get("month") or [""])[0]
+            stack_only = (qs.get("stack_only") or ["1"])[0].lower() not in ("0", "false", "")
+            self._send(200, json.dumps(calendar_month(month, stack_only), default=str).encode(), "application/json")
         elif path == "/api/export/trades.csv":
             days = _parse_days(self.path)
             self._send_csv(trades_csv(days), "trades.csv")
         elif path == "/api/export/journal.csv":
             self._send_csv(journal_csv(), "journal.csv")
+        elif path == "/api/export/weekly.xlsx":
+            days = _parse_days(self.path)
+            xbytes = build_weekly_xlsx(days)
+            if xbytes is None:
+                self._send(
+                    501,
+                    b"openpyxl is not installed on the server; run: "
+                    b"python -m pip install openpyxl",
+                    "text/plain",
+                )
+            else:
+                self._send_file(
+                    xbytes,
+                    "weekly-report.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
         elif path == "/assets/favicon.png":
             try:
                 self._send(200, (ASSETS / "favicon.png").read_bytes(), "image/png")
@@ -1199,16 +2068,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, body: bytes, filename: str, ctype: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, _fmt: str, *_args: object) -> None:
         pass
 
 
 def main() -> None:
+    threading.Thread(target=_mgmt_thread_loop, daemon=True, name="mgmt-digest-alerts").start()
     host, port = ADDR.rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), Handler)
     print(time.strftime("%H:%M:%S"), f"trade dashboard listening on http://{ADDR}", flush=True)
     server.serve_forever()
 
 
+def _cli_digest_now() -> None:
+    period_days = 7
+    if "--period-days" in sys.argv:
+        idx = sys.argv.index("--period-days")
+        if idx + 1 < len(sys.argv):
+            try:
+                period_days = int(sys.argv[idx + 1])
+            except ValueError:
+                pass
+    weekly = period_days >= 7
+    text = build_digest_text(period_days, weekly)
+    print(text)
+    if os.environ.get("MGMT_DIGEST_SEND") == "1":
+        if MGMT_CHAT_ID:
+            sent = _send_telegram(MGMT_CHAT_ID, text)
+            print(f"[sent={sent} chat_id={MGMT_CHAT_ID}]", file=sys.stderr)
+        else:
+            print("[not sent: no MGMT_CHAT_ID/TELEGRAM_INGEST_ALLOWED_CHAT_IDS configured]", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    main()
+    if "--digest-now" in sys.argv:
+        _cli_digest_now()
+    else:
+        main()

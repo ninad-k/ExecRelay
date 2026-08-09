@@ -18,7 +18,12 @@
 # Services: nats (4222), ml-predictor (8080), ingress (8081), bridge (8082),
 # ea-shim (MT5 execution, no HTTP port), telegram-ingest (8089),
 # telegram-forwarder (personal-account channel relay, no HTTP port),
-# trade-dashboard (8090, localhost-only trade summary UI).
+# trade-dashboard (8090, localhost-only trade summary UI -- now also serves
+# management reporting: channel scorecard, risk/exposure panel, monthly P/L
+# calendar, and a weekly XLSX export backed by .local-stack\execrelay.db,
+# see docs/development/windows-local-stack.md "Management reporting").
+# The XLSX export needs the openpyxl package (not required for the rest of
+# the dashboard): python -m pip install openpyxl
 #
 # Public hosting (-Public): TradingView only delivers webhooks to ports 80 and
 # 443, so ingress (8081) is reached through a Windows portproxy on port 80.
