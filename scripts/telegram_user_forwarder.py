@@ -129,6 +129,72 @@ async def _resolve_all(c: TelegramClient, spec: str, label: str) -> list[tuple[i
     return out
 
 
+# Held for the process lifetime; the OS releases it when we exit (even on a
+# hard kill), so a stale lock file can never wedge the next start.
+_instance_lock_handle = None
+
+
+def acquire_single_instance_lock() -> None:
+    """Refuse to start a second relay against the same Telethon session.
+
+    Two processes sharing one .session file corrupt each other: SQLite
+    reports "database is locked", and the loser can read the session as
+    unauthorized and drop into the interactive phone prompt — where, with no
+    console attached, it hangs forever, relaying nothing while the
+    supervisor still reports it "running". That failure silently swallowed a
+    live channel signal on 2026-08-10, so it is now impossible by
+    construction.
+    """
+    global _instance_lock_handle
+    lock_path = Path(f"{SESSION}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")  # noqa: SIM115 - must outlive this function
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        print(
+            f"another forwarder already holds {lock_path} — refusing to start a "
+            "second relay on the same Telegram session (they would corrupt it "
+            "and drop this one into a login prompt).\n"
+            "Stop the other instance first: .\\stop.ps1, or check for a stray "
+            "python scripts/telegram_user_forwarder.py process.",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+    _instance_lock_handle = handle
+
+
+async def connect_authorized(c: TelegramClient) -> None:
+    """Connect with an EXISTING session, or exit non-zero with an actionable
+    message.
+
+    Never falls through to Telethon's interactive phone prompt: under the
+    stack supervisor stdin is not a console, so `client.start()` blocks
+    forever on that prompt — the process stays alive, relays nothing, and
+    `local-stack status` still calls it "running". A revoked session must
+    fail loudly instead (the supervisor then reports it DOWN)."""
+    await c.connect()
+    if not await c.is_user_authorized():
+        print(
+            f"session {SESSION}.session is not authorized (revoked, expired, or "
+            "never created) — no messages can be relayed.\n"
+            "Re-authorize interactively, then restart the stack:\n"
+            "    python scripts/telegram_user_forwarder.py qrlogin",
+            file=sys.stderr,
+        )
+        await c.disconnect()
+        sys.exit(3)
+
+
 async def cmd_login() -> None:
     c = client()
     # Interactive: phone + login code prompts. A configured phone skips one.
@@ -139,7 +205,9 @@ async def cmd_login() -> None:
 
 
 async def cmd_chats() -> None:
-    async with client() as c:
+    c = client()
+    await connect_authorized(c)
+    async with c:
         async for d in c.iter_dialogs():
             kind = "channel" if d.is_channel else "group" if d.is_group else "user"
             print(f"{d.id:>15}  {kind:<7}  {d.name}")
@@ -148,7 +216,7 @@ async def cmd_chats() -> None:
 async def cmd_resolve() -> None:
     """Dry run of `run`'s lookup step — no messages are relayed."""
     c = client()
-    await c.start()
+    await connect_authorized(c)
     async with c:
         await _resolve_all(c, SOURCE_CHAT, "source")
         await _resolve_all(c, TARGET_CHAT, "target")
@@ -200,8 +268,9 @@ async def cmd_run() -> None:
     if not SOURCE_CHAT or not TARGET_CHAT:
         print("TG_FORWARDER_SOURCE_CHAT and TG_FORWARDER_TARGET_CHAT are required", file=sys.stderr)
         sys.exit(2)
+    acquire_single_instance_lock()
     c = client()
-    await c.start()  # errors out (rather than prompting) if not logged in
+    await connect_authorized(c)
 
     sources = await _resolve_all(c, SOURCE_CHAT, "source")
     targets = await _resolve_all(c, TARGET_CHAT, "target")
