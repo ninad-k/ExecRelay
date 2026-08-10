@@ -1,4 +1,6 @@
-# ExecRelay — main entry point. Builds and starts the full stack (nats,
+# ExecRelay — C:\ExecRelay
+#
+# Main entry point. Builds and starts the full stack (nats,
 # ml-predictor, ingress, bridge, ea-shim, telegram-ingest, telegram-forwarder,
 # trade-dashboard), prints the public TradingView webhook URL, the Rey Capital
 # trade dashboard link and the Telegram bot link, then STAYS ATTACHED,
@@ -22,6 +24,11 @@
 # megabytes of binary. The log FILES always keep everything; -AllLogs shows
 # the unfiltered stream.
 #
+# Unlike the sibling projects (AccountManagementSystem, TradingAgents), this
+# stack deliberately has NO Cloudflare quick tunnel: the TradingView webhook is
+# served straight off this host's public IP, and a tunnel hostname that changes
+# every run would break the webhook URL already configured in TradingView.
+#
 # Implementation lives in scripts\local-stack.ps1 (start/stop/status).
 
 param(
@@ -32,6 +39,7 @@ param(
 )
 
 $APP_NAME = "ExecRelay"
+$APP_ROOT = $PSScriptRoot
 
 $stack = Join-Path $PSScriptRoot "scripts\local-stack.ps1"
 $logDir = Join-Path $PSScriptRoot ".local-stack\logs"
@@ -40,7 +48,19 @@ $pidDir = Join-Path $PSScriptRoot ".local-stack\pids"
 # Name the console window so several stacks running side by side are
 # tellable apart at a glance (taskbar included).
 function Set-WindowTitle { param([string]$State) $Host.UI.RawUI.WindowTitle = "$APP_NAME - $State" }
+
+# Same banner in every project's run.ps1, so which stack a console belongs to
+# is readable from the scrollback as well as the title bar.
+function Write-Banner {
+    Write-Host ''
+    Write-Host "  $APP_NAME" -ForegroundColor White
+    Write-Host "  $('-' * $APP_NAME.Length)" -ForegroundColor DarkGray
+    Write-Host "  $APP_ROOT" -ForegroundColor DarkGray
+    Write-Host ''
+}
+
 Set-WindowTitle "starting..."
+Write-Banner
 
 # --- console log filter ----------------------------------------------------
 $MaxLineChars = 400
@@ -115,7 +135,7 @@ if (-not $ownsMutex) {
     & $stack -Command start -Public:(-not $LocalOnly)
 }
 
-if ($NoFollow) { return }
+if ($NoFollow) { Set-WindowTitle "running (detached)"; return }
 
 $palette = @("Cyan", "Green", "Yellow", "Magenta", "Blue", "DarkCyan", "DarkYellow", "DarkGreen", "Gray", "White")
 $colors = @{}
