@@ -47,7 +47,7 @@ DB_PATH = Path(
 )
 LOG_DIR = Path(__file__).resolve().parent.parent / ".local-stack" / "logs" / "transactions"
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 _SCHEMA_SQL = (
     """
@@ -150,12 +150,34 @@ _SCHEMA_SQL = (
         refreshed_ts  TEXT
     )
     """,
+    # resubmits: audit ledger for the dashboard's operator-triggered
+    # "resubmit"/"submit manually" action (schema v3) -- see
+    # trade_dashboard.py's resubmit_signal(). One row per attempt (never
+    # updated in place), so the history of what an operator did/when is
+    # never lost even if they resubmit the same signal twice with force.
+    # commands/http_statuses/trace_ids are JSON arrays, index-aligned with
+    # each other; commands are ALWAYS secret-redacted before being stored
+    # here (never the raw webhook body).
+    """
+    CREATE TABLE IF NOT EXISTS resubmits (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts             TEXT,
+        signal_id      INTEGER,
+        source         TEXT CHECK(source IN ('signal', 'manual')),
+        commands       TEXT,
+        http_statuses  TEXT,
+        trace_ids      TEXT,
+        ok             INTEGER,
+        note           TEXT
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals(outcome)",
     "CREATE INDEX IF NOT EXISTS idx_signals_channel ON signals(channel)",
     "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
     "CREATE INDEX IF NOT EXISTS idx_orders_source ON orders(source)",
     "CREATE INDEX IF NOT EXISTS idx_closed_trades_close_ts ON closed_trades(close_ts)",
     "CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_resubmits_signal_id ON resubmits(signal_id)",
 )
 
 # Env vars this module reads directly (not via the Telethon-authenticated
@@ -241,17 +263,35 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         current = int(row["value"]) if row and row["value"] is not None else 1
     except (TypeError, ValueError):
         current = 1
+
+    # Staged, idempotent migrations -- each block is gated on the version it
+    # brings the DB to, so re-running _ensure_schema (every get_conn() call)
+    # against an already-migrated DB is always a no-op past this point.
+    # Table creation itself is handled unconditionally above via the
+    # `CREATE TABLE IF NOT EXISTS` statements in _SCHEMA_SQL; these blocks
+    # only carry one-time *data* migrations plus the version bump.
     if current < 2:
         try:
             _migrate_v2_seed_channels(conn)
         except Exception as exc:  # noqa: BLE001 - migration must never crash a caller
             _warn(f"schema v2 channel seed failed: {exc!r}")
         conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (SCHEMA_VERSION,),
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '2') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         )
         conn.commit()
+        current = 2
+
+    if current < 3:
+        # No data migration needed -- the `resubmits` table is brand new
+        # (created empty by the CREATE TABLE IF NOT EXISTS above) and has no
+        # prior rows to backfill. Just record the version bump.
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '3') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
+        current = 3
 
 
 def get_conn() -> sqlite3.Connection | None:
@@ -557,6 +597,101 @@ def record_equity(
         conn.commit()
     except Exception as exc:  # noqa: BLE001
         _warn(f"record_equity failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def record_resubmit(
+    signal_id: int | None,
+    source: str,
+    commands: list,
+    http_statuses: list,
+    trace_ids: list,
+    ok: bool,
+    note: str | None = None,
+) -> None:
+    """Append one row to the resubmit audit ledger -- called exactly once per
+    operator-triggered resubmit/manual-submit attempt (trade_dashboard.py's
+    resubmit_signal()). Never updates an existing row: every attempt, even a
+    forced re-attempt of the same signal, gets its own row so the history is
+    never lost. `commands` must already be secret-redacted by the caller --
+    this module makes no attempt to redact on the way in."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        conn.execute(
+            """
+            INSERT INTO resubmits (ts, signal_id, source, commands, http_statuses, trace_ids, ok, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _utcnow_iso(),
+                signal_id,
+                source,
+                json.dumps(commands),
+                json.dumps(http_statuses),
+                json.dumps(trace_ids),
+                1 if ok else 0,
+                note,
+            ),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"record_resubmit failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def latest_resubmit_for_signal(signal_id: int) -> dict | None:
+    """Most recent resubmit attempt for one signal, or None if it was never
+    resubmitted. Used for the idempotency check in resubmit_signal()."""
+    rows = query(
+        "SELECT id, ts, source, commands, http_statuses, trace_ids, ok, note "
+        "FROM resubmits WHERE signal_id = ? ORDER BY id DESC LIMIT 1",
+        (signal_id,),
+    )
+    return rows[0] if rows else None
+
+
+def resubmits_for_signals(signal_ids: list) -> dict:
+    """Latest resubmit attempt per signal_id, batched into one query for the
+    "Signals not placed" table (avoids one query per row). Returns
+    {signal_id: row}; signals never resubmitted are simply absent. Empty
+    dict on no ids given or any DB failure -- never raises."""
+    ids = [i for i in signal_ids if i is not None]
+    if not ids:
+        return {}
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id, ts, signal_id, source, commands, http_statuses, trace_ids, ok, note "
+            f"FROM resubmits WHERE signal_id IN ({placeholders}) ORDER BY id ASC",
+            tuple(ids),
+        ).fetchall()
+        out: dict = {}
+        for row in rows:
+            # ORDER BY id ASC + plain dict assignment -> later (higher id)
+            # rows overwrite earlier ones, so each signal_id ends up mapped
+            # to its most recent attempt.
+            out[row["signal_id"]] = dict(row)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"resubmits_for_signals failed: {exc!r}")
+        return {}
     finally:
         if conn is not None:
             try:

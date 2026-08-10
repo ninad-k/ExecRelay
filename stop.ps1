@@ -2,4 +2,7 @@
 #
 #   .\stop.ps1
 
+$Host.UI.RawUI.WindowTitle = "ExecRelay - stopping..."
 & "$PSScriptRoot\scripts\local-stack.ps1" -Command stop
+
+$Host.UI.RawUI.WindowTitle = "ExecRelay - stopped"

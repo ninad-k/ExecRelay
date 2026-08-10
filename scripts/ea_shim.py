@@ -74,6 +74,16 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+def short_exc(exc, limit=200):
+    """One-line, bounded exception text. repr() on library errors can carry
+    huge payloads (websocket frames, MTProto buffers) that flood the log and
+    the console tailing it."""
+    text = " ".join(str(exc).split())
+    if len(text) > limit:
+        text = text[:limit] + f"… (+{len(text) - limit} chars)"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def die(msg):
     log("FATAL:", msg)
     sys.exit(1)
@@ -144,7 +154,7 @@ def tg_notify(text):
         with urllib.request.urlopen(req, timeout=10):
             pass
     except Exception as e:
-        log(f"telegram notify failed: {e!r}")
+        log(f"telegram notify failed: {short_exc(e)}")
 
 
 def _fmt_position(p):
@@ -267,7 +277,7 @@ def position_monitor():
                 meta_set("hb_ea_shim", datetime.now(timezone.utc).isoformat())
                 meta_set("hb_ea_shim_state", json.dumps(hb_state))
         except Exception as e:
-            log(f"position monitor error: {e!r}")
+            log(f"position monitor error: {short_exc(e)}")
         time.sleep(POSITION_POLL_SECS)
 
 
@@ -589,7 +599,7 @@ async def main():
             await run_session()
             log("connection closed cleanly; reconnecting in 3s")
         except Exception as e:
-            log(f"session error: {e!r}; reconnecting in 3s")
+            log(f"session error: {short_exc(e)}; reconnecting in 3s")
         await asyncio.sleep(3)
 
 

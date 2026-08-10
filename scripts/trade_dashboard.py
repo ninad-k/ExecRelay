@@ -54,11 +54,24 @@ except ImportError:  # dashboard still works log-only
     mt5 = None
 
 import _tradestore as ts
+from _txnlog import get_txn_logger, log_txn
 
 ADDR = os.environ.get("DASHBOARD_ADDR", "127.0.0.1:8090")
 MAGIC = int(os.environ.get("EA_SHIM_MAGIC", "20240101"))
 DASHBOARD_TOKEN = (os.environ.get("DASHBOARD_TOKEN") or "").strip()
 ROOT = Path(__file__).resolve().parent.parent
+
+# Reuse telegram-ingest's own signal grammar / command builder rather than
+# duplicating it -- see "Signals not placed" / preview / resubmit below.
+# Importing is side-effect-free (main(), the poll loop and the health-server
+# thread are all guarded by `if __name__ == "__main__"`); the only things
+# that run at import time are plain env-var reads and logger setup, same as
+# this file's own top-level constants.
+_INGEST_APP_DIR = ROOT / "apps" / "telegram-ingest"
+if str(_INGEST_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_INGEST_APP_DIR))
+import app as _ingest  # noqa: E402
+
 TXN_DIR = ROOT / ".local-stack" / "logs" / "transactions"
 JOURNAL_PATH = ROOT / ".local-stack" / "journal.json"
 ASSETS = Path(__file__).resolve().parent / "dashboard-assets"
@@ -106,6 +119,20 @@ def _env_bool(name: str, default: str = "false") -> bool:
 
 INGEST_DRY_RUN = _env_bool("TELEGRAM_INGEST_DRY_RUN", "true")
 _HB_STALE_AFTER_SEC = 90.0
+
+# ---------------------------------------------------------------------------
+# Resubmit -- operator-triggered order placement for signals that never
+# reached MT5. This is the ONLY place in this file that ever POSTs to
+# ingress; see resubmit_signal() below for the full set of safety gates.
+# INGRESS_PORT is independently configurable (default 8081, matching
+# local-stack.ps1's $IngressPort) so tests can point it at a local stub
+# server without touching the real ingress.
+# ---------------------------------------------------------------------------
+
+INGRESS_PORT = (os.environ.get("INGRESS_PORT") or "8081").strip() or "8081"
+INGRESS_PERIMETER_TOKEN = (os.environ.get("INGRESS_PERIMETER_TOKEN") or "").strip()
+_INGRESS_WEBHOOK_URL = f"http://127.0.0.1:{INGRESS_PORT}/webhook"
+RESUBMIT_TXN_LOG = get_txn_logger("dashboard-resubmit")
 
 
 def _allowed_hosts() -> set[str]:
@@ -1446,6 +1473,393 @@ def add_channel(payload: dict) -> dict:
     return {"chat_id": chat_id, "title": title, "pending_resolution": pending}
 
 
+# ---------------------------------------------------------------------------
+# "Signals not placed" + preview/resubmit -- signals that never became an
+# MT5 order, and the operator-triggered control to re-send them (or a
+# pasted signal the relay missed entirely). This is the only part of the
+# dashboard that ever POSTs to ingress; see resubmit_signal() for the full
+# set of safety gates. All grammar/command-building is delegated to the
+# telegram-ingest module (`_ingest`, imported above) so this can never drift
+# from what the live poll loop would actually send.
+# ---------------------------------------------------------------------------
+
+_UNPOSTED_REASON = {
+    "rejected": "grammar rejected",
+    "channel_disabled": "channel disabled",
+    "dry_run": "dry-run — not sent",
+    "webhook_error": "webhook error",
+}
+_NO_EXEC_CONFIRMED_AFTER_SEC = 5 * 60
+
+
+def _age_seconds(ts_str: str | None) -> float | None:
+    if not ts_str:
+        return None
+    try:
+        stamp = datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
+
+
+def _reparse_rejection_detail(raw: str | None) -> str:
+    """The `signals` table only stores the outcome, not the SignalError
+    message that produced it -- best-effort recover the actual rejection
+    reason for display by re-running the stored (possibly-truncated) raw
+    text through the same grammar that rejected it. Never raises; returns
+    "" if the text no longer reproduces a rejection (e.g. truncation ate
+    the part that mattered, or the text simply isn't available)."""
+    if not raw:
+        return ""
+    try:
+        _ingest.parse_signal(raw)
+    except _ingest.SignalError as exc:
+        return str(exc)
+    except Exception:  # noqa: BLE001 - this is a display nicety, never fatal
+        return ""
+    return ""
+
+
+def unposted_signals(days: int = 7) -> dict:
+    """Signals that, within the window, never resulted in a confirmed MT5
+    order. A signal qualifies when, within `days`:
+      (a) outcome in (rejected, webhook_error, channel_disabled, dry_run)
+      (b) outcome=posted but an order for one of its trace_ids came back
+          status=rejected (e.g. the risk-cap check, error LIKE 'risk sizing%')
+      (c) outcome=posted, an order was accepted, but none of its trace_ids
+          ever reported status filled/placed, and the signal is more than
+          _NO_EXEC_CONFIRMED_AFTER_SEC old (grace period for the fill to
+          come back over the normal async path before flagging it)
+    Every row also carries its latest resubmit-ledger entry, if any, so the
+    UI can show "already resubmitted" instead of the action buttons.
+    """
+    cutoff = _cutoff_iso(days)
+    sig_rows = ts.query(
+        "SELECT id, ts, channel, outcome, symbol, side, entry, sl, tp, trace_ids, raw FROM signals "
+        "WHERE ts >= ? ORDER BY ts DESC",
+        (cutoff,),
+    )
+
+    parsed: list[tuple[dict, list[str]]] = []
+    trace_ids_all: set[str] = set()
+    for s in sig_rows:
+        try:
+            tids = json.loads(s.get("trace_ids") or "[]")
+            if not isinstance(tids, list):
+                tids = []
+        except json.JSONDecodeError:
+            tids = []
+        parsed.append((s, tids))
+        trace_ids_all.update(t for t in tids if t)
+
+    orders_by_trace: dict[str, dict] = {}
+    if trace_ids_all:
+        placeholders = ",".join("?" for _ in trace_ids_all)
+        order_rows = ts.query(
+            f"SELECT trace_id, status, error FROM orders WHERE trace_id IN ({placeholders})",
+            tuple(trace_ids_all),
+        )
+        orders_by_trace = {r["trace_id"]: r for r in order_rows}
+
+    out_rows: list[dict] = []
+    for s, tids in parsed:
+        outcome = s.get("outcome")
+        reason = None
+        detail = ""
+        if outcome in _UNPOSTED_REASON:
+            reason = _UNPOSTED_REASON[outcome]
+            if outcome == "rejected":
+                detail = _reparse_rejection_detail(s.get("raw"))
+            elif outcome == "channel_disabled":
+                detail = f"channel '{_channel_label(s.get('channel'))}' is disabled in the registry"
+            elif outcome == "dry_run":
+                detail = "TELEGRAM_INGEST_DRY_RUN was true when this signal arrived"
+            elif outcome == "webhook_error":
+                detail = "the webhook POST to ingress raised a transport error (see telegram-ingest logs)"
+        elif outcome == "posted":
+            orders = [orders_by_trace[t] for t in tids if t in orders_by_trace]
+            rejected = [o for o in orders if o.get("status") == "rejected"]
+            if rejected:
+                err = rejected[0].get("error") or ""
+                reason = "risk cap rejected" if err.lower().startswith("risk sizing") else "order rejected"
+                detail = err
+            else:
+                has_accepted = any(o.get("status") == "accepted" for o in orders)
+                has_filled = any(o.get("status") in ("filled", "placed") for o in orders)
+                if has_accepted and not has_filled:
+                    age = _age_seconds(s.get("ts"))
+                    if age is not None and age > _NO_EXEC_CONFIRMED_AFTER_SEC:
+                        reason = "no execution confirmed"
+                        detail = f"order accepted {int(age // 60)} min ago, no fill/placement reported yet"
+        if reason is None:
+            continue
+        out_rows.append(
+            {
+                "signal_id": s.get("id"),
+                "ts": s.get("ts"),
+                "channel": _channel_label(s.get("channel")),
+                "source": "telegram",  # the signals table is telegram-only by construction
+                "symbol": s.get("symbol"),
+                "side": s.get("side"),
+                "entry": s.get("entry"),
+                "sl": s.get("sl"),
+                "tp": s.get("tp"),
+                "outcome": outcome,
+                "reason": reason,
+                "detail": detail,
+            }
+        )
+
+    resubmit_map = ts.resubmits_for_signals([r["signal_id"] for r in out_rows])
+    for r in out_rows:
+        rs = resubmit_map.get(r["signal_id"])
+        if rs is None:
+            r["resubmit"] = None
+            continue
+        try:
+            statuses = json.loads(rs.get("http_statuses") or "[]")
+        except json.JSONDecodeError:
+            statuses = []
+        try:
+            trids = json.loads(rs.get("trace_ids") or "[]")
+        except json.JSONDecodeError:
+            trids = []
+        r["resubmit"] = {
+            "ts": rs.get("ts"),
+            "ok": bool(rs.get("ok")),
+            "http_statuses": statuses,
+            "trace_ids": trids,
+            "note": rs.get("note"),
+        }
+
+    return {"days": days, "count": len(out_rows), "rows": out_rows}
+
+
+def _fetch_signal_row(signal_id: int) -> dict | None:
+    rows = ts.query(
+        "SELECT id, ts, chat_id, message_id, channel, outcome, raw FROM signals WHERE id = ?",
+        (signal_id,),
+    )
+    return rows[0] if rows else None
+
+
+def _derive_commands(signal_id: int | None = None, text: str | None = None) -> dict:
+    """Core of preview/resubmit: re-parse a stored or pasted signal with
+    telegram-ingest's own grammar and re-render its webhook command bodies
+    WITHOUT sending anything. Returns RAW (unredacted) commands -- callers
+    that expose this to the network (derive_preview) must redact before
+    responding; resubmit_signal() needs the raw form to actually POST.
+    """
+    warnings: list[str] = []
+    errors: list[str] = []
+    channel_name: str | None = None
+    raw_text = ""
+    truncated_hint = False
+    sig_row: dict | None = None
+
+    if signal_id is not None:
+        sig_row = _fetch_signal_row(int(signal_id))
+        if sig_row is None:
+            return {"ok": False, "commands": [], "warnings": [], "errors": [f"signal {signal_id} not found"], "channel": None}
+        raw_text = sig_row.get("raw") or ""
+        channel_name = sig_row.get("channel")
+        truncated_hint = len(raw_text) >= 500  # signals.raw is stored truncated at 500 chars
+        age_sec = _age_seconds(sig_row.get("ts"))
+        if age_sec is not None and age_sec >= 3600:
+            warnings.append(f"signal is {age_sec / 3600:.1f} hours old — prices may have moved")
+    else:
+        channel_name, raw_text = _ingest.strip_source_tag(text or "")
+
+    if channel_name is not None and not ts.is_channel_enabled(channel_name):
+        warnings.append("channel is currently disabled")
+    if INGEST_DRY_RUN:
+        warnings.append("system is in DRY-RUN")
+
+    try:
+        sig = _ingest.parse_signal(raw_text)
+    except _ingest.SignalError as exc:
+        errors.append(str(exc))
+        if truncated_hint:
+            warnings.append("stored text was truncated at 500 chars")
+        return {"ok": False, "commands": [], "warnings": warnings, "errors": errors, "channel": channel_name}
+    if sig is None:
+        errors.append("text is not a recognized signal")
+        if truncated_hint:
+            warnings.append("stored text was truncated at 500 chars")
+        return {"ok": False, "commands": [], "warnings": warnings, "errors": errors, "channel": channel_name}
+
+    comment = f"tg-{_ingest.channel_initials(channel_name)}" if channel_name else None
+    commands = _ingest.build_commands(sig, comment=comment)
+    return {
+        "ok": True,
+        "commands": commands,
+        "warnings": warnings,
+        "errors": errors,
+        "channel": channel_name,
+        "signal": {
+            "symbol": sig.get("symbol"), "side": sig.get("side"), "entry": sig.get("entry"),
+            "sl": sig.get("sl"), "tp": sig.get("tp"),
+        },
+    }
+
+
+def derive_preview(signal_id: int | None = None, text: str | None = None) -> dict:
+    """Network-facing preview: same as _derive_commands but with the webhook
+    secret redacted out of every command body. Nothing is ever sent."""
+    d = _derive_commands(signal_id=signal_id, text=text)
+    out = dict(d)
+    out["commands"] = [_ingest._redact_secret(c) for c in d["commands"]]
+    return out
+
+
+def _post_to_ingress(body: str) -> tuple[int, str, str]:
+    """POST one already-built webhook command body to ingress. The ONLY
+    function in this file that talks to ingress -- INGRESS_PORT is
+    independently configurable so tests can redirect it to a local stub
+    without ever touching the real service. Returns (http_status,
+    response_text, trace_id); trace_id is "" if the response wasn't the
+    expected {"trace_id": ...} JSON shape."""
+    url = _INGRESS_WEBHOOK_URL
+    if INGRESS_PERIMETER_TOKEN:
+        url += f"?token={INGRESS_PERIMETER_TOKEN}"
+    req = urllib.request.Request(
+        url, data=body.encode(), headers={"Content-Type": "text/plain"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+            raw = resp.read().decode(errors="replace")[:500]
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read().decode(errors="replace")[:500]
+    trace_id = ""
+    try:
+        trace_id = json.loads(raw).get("trace_id", "") or ""
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return status, raw, trace_id
+
+
+def resubmit_signal(payload: dict) -> tuple[int, dict]:
+    """Operator-triggered order placement. Returns (http_status, body). Every
+    safety gate described in the PLAN lives here, in this order:
+
+      1. confirm must be the JSON boolean `true`, exactly -- anything else
+         (missing, false, "true" the string, 1) is refused with 400 and the
+         preview payload instead of being sent. A stray click can never
+         place an order.
+      2. TELEGRAM_INGEST_DRY_RUN=true refuses with 409 -- the operator
+         deliberately put the system in dry-run; this control must not be
+         able to bypass that.
+      3. A disabled source channel is ALLOWED but was already flagged as a
+         warning in the preview (and must have been shown in the confirm
+         modal) -- an explicit operator override is legitimate.
+      4. Idempotency: a signal already resubmitted (any prior ledger row for
+         its signal_id) is refused with 409 naming the earlier attempt,
+         unless the caller passes force=true.
+      5. Only after all of the above does anything get POSTed to ingress --
+         one POST per command, each result recorded individually.
+      6. Every attempt (successful or not, once step 5 is reached) is
+         written to the `resubmits` audit table AND the JSONL txn log,
+         secrets redacted in both.
+    """
+    signal_id = payload.get("signal_id")
+    text = payload.get("text")
+    confirm = payload.get("confirm")
+    force = bool(payload.get("force"))
+
+    if signal_id is None and not text:
+        return 400, {"ok": False, "error": "signal_id or text is required"}
+
+    try:
+        signal_id_int = int(signal_id) if signal_id is not None else None
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "error": "signal_id must be an integer"}
+
+    derived = _derive_commands(signal_id=signal_id_int, text=text)
+    preview = dict(derived)
+    preview["commands"] = [_ingest._redact_secret(c) for c in derived["commands"]]
+
+    # Gate 1: confirm must be exactly boolean true.
+    if confirm is not True:
+        body = dict(preview)
+        body["error"] = "confirm must be true"
+        return 400, body
+
+    # Gate 2: dry-run refuses outright, before any idempotency/order-building
+    # work -- the operator's dry-run switch always wins.
+    if INGEST_DRY_RUN:
+        return 409, {
+            "ok": False,
+            "error": "system is in DRY-RUN (TELEGRAM_INGEST_DRY_RUN=true) — resubmit refused",
+            "preview": preview,
+        }
+
+    if not derived["ok"]:
+        body = dict(preview)
+        body["error"] = "cannot resubmit: the signal does not parse (see errors)"
+        return 400, body
+
+    source = "signal" if signal_id_int is not None else "manual"
+
+    # Gate 4: idempotency -- only meaningful for a stored signal (a pasted
+    # manual signal has no natural dedupe key).
+    if signal_id_int is not None and not force:
+        prior = ts.latest_resubmit_for_signal(signal_id_int)
+        if prior is not None:
+            return 409, {
+                "ok": False,
+                "error": (
+                    f"signal {signal_id_int} was already resubmitted at {prior.get('ts')} "
+                    f"(ok={bool(prior.get('ok'))}); pass force:true to resubmit again"
+                ),
+            }
+
+    # Gate 5: the actual sends. `derived["commands"]` are the RAW bodies
+    # (secret included) -- this is the only place they're used unredacted.
+    results = []
+    http_statuses = []
+    trace_ids = []
+    all_ok = True
+    for body_raw in derived["commands"]:
+        try:
+            status, resp_text, trace_id = _post_to_ingress(body_raw)
+        except Exception as exc:  # noqa: BLE001 - a network hiccup must not crash the handler
+            status, resp_text, trace_id = 0, str(exc), ""
+        ok_one = status == 200
+        all_ok = all_ok and ok_one
+        http_statuses.append(status)
+        trace_ids.append(trace_id)
+        results.append({"http_status": status, "trace_id": trace_id, "response": resp_text[:300]})
+
+    # Gate 6: audit, always, redacted.
+    redacted_commands = preview["commands"]
+    note = ("warnings: " + "; ".join(preview["warnings"])) if preview.get("warnings") else None
+    ts.record_resubmit(
+        signal_id=signal_id_int,
+        source=source,
+        commands=redacted_commands,
+        http_statuses=http_statuses,
+        trace_ids=trace_ids,
+        ok=all_ok,
+        note=note,
+    )
+    log_txn(
+        RESUBMIT_TXN_LOG,
+        signal_id=signal_id_int,
+        source=source,
+        channel=preview.get("channel"),
+        commands=redacted_commands,
+        http_statuses=http_statuses,
+        trace_ids=trace_ids,
+        ok=all_ok,
+        warnings=preview.get("warnings"),
+    )
+    return 200, {"ok": all_ok, "results": results, "warnings": preview.get("warnings", [])}
+
+
 # --- background thread: daily/weekly digest + loss/drawdown alerts ------
 
 
@@ -1912,6 +2326,24 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .addchannel-form .hint { font-size: 0.7rem; color: var(--color-warning); align-self: center; }
 .unregistered-row { border-left: 3px solid var(--color-warning); }
 .btn-danger { background: linear-gradient(135deg, var(--color-loss), #a4152b); color: #fff; border: 0; border-radius: var(--radius-sm); padding: 0.45rem 1.1rem; font-weight: 600; font-size: 0.8rem; cursor: pointer; }
+
+.empty-state {
+  padding: 1.35rem 1rem; text-align: center; color: var(--color-text-dim); font-size: 0.82rem;
+  border: 1px dashed var(--color-border-light); border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--color-surface-2) 40%, var(--color-surface)), var(--color-surface));
+}
+.manual-signal-box { margin-top: 1.25rem; }
+.manual-signal-box h3 { font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-dim); margin: 0 0 0.4rem; }
+.manual-signal-box textarea {
+  width: 100%; min-height: 90px; background: var(--color-background); color: var(--color-text);
+  border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 0.55rem 0.7rem;
+  font-size: 0.8rem; font-family: ui-monospace, Consolas, monospace; resize: vertical;
+}
+button.actbtn {
+  background: transparent; border: 1px solid var(--color-border-light); color: var(--color-primary);
+  border-radius: var(--radius-sm); padding: 0.18rem 0.6rem; font-size: 0.72rem; cursor: pointer; margin-right: 0.3rem;
+}
+button.actbtn:hover { background: var(--color-primary-glow); }
 </style></head><body>
 <div class="topbar">
 <header>
@@ -1952,6 +2384,7 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 <main>
   <div class="cards" id="cards"></div>
 
+  <section id="section-channels">
   <h2>Signal channels <span class="chip" id="chip-channels"></span></h2>
   <div id="unregistered-warnings" class="review-strip"></div>
   <form class="addchannel-form" id="add-channel-form">
@@ -1971,6 +2404,24 @@ button.jbtn:hover { background: var(--color-primary-glow); }
     <span class="hint" id="ch-dialogs-hint"></span>
   </form>
   <div class="tablewrap"><table id="tbl-channels"></table></div>
+  </section>
+
+  <section id="section-unposted">
+    <h2>Signals not placed <span class="chip" id="chip-unposted"></span></h2>
+    <div id="unposted-empty" class="empty-state" style="display:none"></div>
+    <div class="tablewrap" id="wrap-unposted"><table id="tbl-unposted"></table></div>
+    <div class="manual-signal-box">
+      <h3>Submit a signal manually</h3>
+      <p class="muted" style="font-size:0.76rem;margin:0 0 .5rem">
+        Paste the raw channel text (including a leading "[SRC:&lt;channel&gt;]" header, if the message had one)
+        for a signal the relay missed entirely. Preview it before sending — nothing is placed until you confirm.
+      </p>
+      <textarea id="manual-signal-text" placeholder="[SRC:Example Channel]&#10;XAUUSD SELL @ 4099&#10;SL @ 4119&#10;TP @ 4089"></textarea>
+      <div class="modal-actions" style="justify-content:flex-start;margin-top:.6rem">
+        <button class="btn-primary" type="button" id="manual-preview-btn">Preview</button>
+      </div>
+    </div>
+  </section>
 
   <h2>Performance</h2>
   <div class="grid2">
@@ -2065,6 +2516,20 @@ button.jbtn:hover { background: var(--color-primary-glow); }
   </div>
 </div>
 
+<div id="resubmit-scrim" style="position:fixed;inset:0;background:rgb(0 0 0 / 0.55);display:none;align-items:center;justify-content:center;z-index:60">
+  <div style="width:min(640px,94vw);max-height:88vh;overflow:auto;background:linear-gradient(180deg,var(--color-surface-2),var(--color-surface));border:1px solid var(--color-border-light);border-radius:var(--radius-lg);padding:1.5rem">
+    <h3 style="margin:0 0 .75rem;font-size:0.95rem" id="resubmit-title">Place order(s)?</h3>
+    <div id="resubmit-warnings"></div>
+    <label style="display:block;font-size:0.7rem;color:var(--color-text-muted);margin:0.7rem 0 0.25rem;text-transform:uppercase;letter-spacing:0.06em">Exact commands (secret redacted)</label>
+    <pre id="resubmit-commands" style="margin:0;padding:0.75rem;white-space:pre-wrap;word-break:break-all;font-size:0.74rem;font-family:ui-monospace,Consolas,monospace;background:var(--color-background);border:1px solid var(--color-border);border-radius:var(--radius-sm);max-height:220px;overflow:auto"></pre>
+    <div id="resubmit-results" style="margin-top:0.75rem;font-size:0.8rem"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" type="button" id="resubmit-cancel">Cancel</button>
+      <button class="btn-danger" type="button" id="resubmit-confirm" disabled>Place these orders</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const money = (v, c) => (v >= 0 ? "+" : "\u2212") + "$" + Math.abs(v).toFixed(2);
@@ -2138,7 +2603,7 @@ function table(id, header, rows, footer) {
 }
 
 async function refresh() {
-  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshChannels()]);
+  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshChannels(), refreshUnposted()]);
 }
 
 // --- pipeline status banner --------------------------------------------
@@ -2188,6 +2653,10 @@ function channelRow(c) {
 }
 
 async function refreshChannels() {
+  // "Signal channels" is Telegram-specific (channels are Telegram chats) --
+  // hide it for TradingView/Other, same rule as #section-signals below.
+  $("section-channels").style.display = (currentSource === "tradingview" || currentSource === "other") ? "none" : "";
+
   const res = await fetch(withToken("/api/channels"), { headers: authHeaders() });
   if (!res.ok) return;
   const d = await res.json();
@@ -2209,6 +2678,134 @@ async function refreshChannels() {
      <button type="button" class="ch-add-unregistered" data-spec="${esc(u.channel)}">Add to registry</button></div>`
   ).join("") : "";
 }
+
+// --- "Signals not placed" + preview/resubmit -----------------------------
+
+let lastUnposted = null;
+
+function unpostedRow(r) {
+  const rs = r.resubmit;
+  let action;
+  if (rs) {
+    action = `<span class="badge ${rs.ok ? "ok" : "bad"}">${rs.ok ? "resubmitted" : "resubmit failed"}</span> <span class="muted">${esc((rs.ts || "").slice(5, 19).replace("T", " "))}</span>`;
+  } else {
+    action = `<button type="button" class="actbtn preview-btn" data-signal-id="${r.signal_id}">Preview</button>` +
+              `<button type="button" class="actbtn resubmit-btn" data-signal-id="${r.signal_id}">Resubmit</button>`;
+  }
+  return `<tr>
+    <td class="muted number">${esc((r.ts || "").slice(5, 19).replace("T", " "))}</td>
+    <td>${esc(r.channel)}</td>
+    <td>${esc(r.symbol || "")}</td>
+    <td>${r.side ? sideBadge(r.side) : ""}</td>
+    <td class="number">${r.entry ?? ""}</td>
+    <td class="number">${r.sl ?? ""}</td>
+    <td class="number">${r.tp ?? ""}</td>
+    <td><span class="badge bad">${esc(r.reason)}</span></td>
+    <td class="muted" style="white-space:normal;max-width:280px">${esc(r.detail || "")}</td>
+    <td style="white-space:nowrap">${action}</td>
+  </tr>`;
+}
+
+async function refreshUnposted() {
+  const res = await fetch(withToken("/api/unposted?days=" + currentDays), { headers: authHeaders() });
+  if (!res.ok) return;
+  const d = await res.json();
+  lastUnposted = d;
+  // Every row here is inherently Telegram-sourced (the signals table only
+  // ever holds Telegram signals) -- the section itself stays visible for
+  // every source (TradingView signals can fail too, just not tracked here
+  // yet), but its rows are filtered to the active source, same principle as
+  // #section-signals/#section-channels.
+  const rows = (currentSource && currentSource !== "telegram") ? [] : (d.rows || []);
+  $("chip-unposted").textContent = `${rows.length} pending`;
+  if (rows.length) {
+    $("wrap-unposted").style.display = "";
+    $("unposted-empty").style.display = "none";
+    table("tbl-unposted",
+      ["time (UTC)", "channel", "symbol", "side", "entry", "SL", "TP", "reason", "detail", "action"],
+      rows.map(unpostedRow));
+  } else {
+    $("wrap-unposted").style.display = "none";
+    $("unposted-empty").style.display = "block";
+    $("unposted-empty").textContent = (currentSource && currentSource !== "telegram")
+      ? "No Telegram-sourced signals to show for this source filter."
+      : "Nothing pending — every signal in this window reached MT5.";
+  }
+}
+
+let pendingResubmit = null; // { signal_id, text }
+
+function renderResubmitModal(d) {
+  const n = (d.commands || []).length;
+  $("resubmit-title").textContent = d.ok ? `Place ${n} order${n === 1 ? "" : "s"}?` : "Cannot place order";
+  const warnEls = (d.warnings || []).map(w => `<div class="neg" style="margin:.2rem 0">${esc(w)}</div>`).join("");
+  const errEls = (d.errors || []).map(w => `<div class="neg" style="margin:.2rem 0">${esc(w)}</div>`).join("");
+  $("resubmit-warnings").innerHTML = warnEls + errEls;
+  $("resubmit-commands").textContent = n ? d.commands.join("\n") : "(no commands -- see errors above)";
+  $("resubmit-results").innerHTML = "";
+  const btn = $("resubmit-confirm");
+  btn.disabled = !d.ok;
+  btn.textContent = d.ok ? `Place these ${n} order${n === 1 ? "" : "s"}` : "Place orders";
+  $("resubmit-scrim").style.display = "flex";
+}
+
+async function openPreview(signalId, text) {
+  pendingResubmit = { signal_id: signalId ?? null, text: text ?? null };
+  const body = signalId != null ? { signal_id: signalId } : { text };
+  try {
+    const res = await fetch(withToken("/api/signals/preview"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body),
+    });
+    renderResubmitModal(await res.json());
+  } catch (e) {
+    renderResubmitModal({ ok: false, commands: [], warnings: [], errors: ["preview request failed: " + e] });
+  }
+}
+
+async function confirmResubmit() {
+  if (!pendingResubmit) return;
+  const body = Object.assign(
+    { confirm: true },
+    pendingResubmit.signal_id != null ? { signal_id: pendingResubmit.signal_id } : { text: pendingResubmit.text }
+  );
+  const btn = $("resubmit-confirm");
+  btn.disabled = true;
+  try {
+    const res = await fetch(withToken("/api/signals/resubmit"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body),
+    });
+    const d = await res.json();
+    if (res.ok) {
+      $("resubmit-results").innerHTML = (d.results || []).map(r =>
+        `<div>${r.http_status === 200 ? '<span class="badge ok">sent</span>' : '<span class="badge bad">failed</span>'} trace ${esc(r.trace_id || "-")} (HTTP ${r.http_status})</div>`
+      ).join("") || `<div class="${d.ok ? "pos" : "neg"}">${d.ok ? "sent" : "not sent"}</div>`;
+      await refreshUnposted();
+    } else {
+      $("resubmit-results").innerHTML = `<div class="neg">${esc(d.error || ("HTTP " + res.status))}</div>`;
+      btn.disabled = false;
+    }
+  } catch (e) {
+    $("resubmit-results").innerHTML = `<div class="neg">resubmit request failed: ${esc(String(e))}</div>`;
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const pbtn = e.target.closest(".preview-btn");
+  if (pbtn) { openPreview(parseInt(pbtn.dataset.signalId, 10), null); return; }
+  const rbtn = e.target.closest(".resubmit-btn");
+  if (rbtn) { openPreview(parseInt(rbtn.dataset.signalId, 10), null); return; }
+  const manualBtn = e.target.closest("#manual-preview-btn");
+  if (manualBtn) {
+    const t = $("manual-signal-text").value;
+    if (t.trim()) openPreview(null, t);
+    return;
+  }
+  const rcancel = e.target.closest("#resubmit-cancel");
+  if (rcancel) { $("resubmit-scrim").style.display = "none"; pendingResubmit = null; return; }
+});
+$("resubmit-confirm").addEventListener("click", confirmResubmit);
+$("resubmit-scrim").addEventListener("click", e => { if (e.target.id === "resubmit-scrim") { $("resubmit-scrim").style.display = "none"; pendingResubmit = null; } });
 
 document.addEventListener("change", async (e) => {
   if (!e.target.classList.contains("ch-toggle")) return;
@@ -2679,7 +3276,11 @@ async function saveJournal() {
   if (res.ok) { closeModal(); refresh(); } else { alert("save failed: " + await res.text()); }
 }
 
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  closeModal();
+  $("resubmit-scrim").style.display = "none"; pendingResubmit = null;
+});
 $("modal-scrim").addEventListener("click", e => { if (e.target.id === "modal-scrim") closeModal(); });
 $("j-cancel").addEventListener("click", closeModal);
 $("j-save").addEventListener("click", saveJournal);
@@ -2812,6 +3413,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(pipeline_status(), default=str).encode(), "application/json")
         elif path == "/api/channels":
             self._send(200, json.dumps(channels_snapshot(), default=str).encode(), "application/json")
+        elif path == "/api/unposted":
+            days = _parse_days(self.path)
+            self._send(200, json.dumps(unposted_signals(days), default=str).encode(), "application/json")
         elif path == "/api/export/weekly.xlsx":
             days = _parse_days(self.path)
             source = _parse_source(self.path)
@@ -2843,6 +3447,7 @@ class Handler(BaseHTTPRequestHandler):
 
     _JSON_POST_ROUTES = (
         "/api/journal", "/api/channels", "/api/channels/toggle", "/api/channels/delete",
+        "/api/signals/preview", "/api/signals/resubmit",
     )
 
     def do_POST(self) -> None:
@@ -2882,6 +3487,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("chat_id is required")
                 ts.delete_channel(chat_id)
                 self._send(200, json.dumps({"ok": True}).encode(), "application/json")
+            elif path == "/api/signals/preview":
+                result = derive_preview(signal_id=payload.get("signal_id"), text=payload.get("text"))
+                self._send(200, json.dumps(result, default=str).encode(), "application/json")
+            elif path == "/api/signals/resubmit":
+                status, body = resubmit_signal(payload)
+                self._send(status, json.dumps(body, default=str).encode(), "application/json")
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(400, str(exc).encode(), "text/plain")
 

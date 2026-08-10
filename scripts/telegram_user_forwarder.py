@@ -86,6 +86,21 @@ def log(*a) -> None:
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+def short_exc(exc: BaseException, limit: int = 200) -> str:
+    """One-line, bounded description of an exception.
+
+    Never log Telethon errors with repr(): TypeNotFoundError embeds the
+    entire remaining MTProto buffer in its message, so a single logged
+    exception dumps megabytes of binary into the log (and the console that
+    tails it). Telegram adds constructors Telethon doesn't know yet, so this
+    fires routinely on iter_dialogs.
+    """
+    text = " ".join(str(exc).split())
+    if len(text) > limit:
+        text = text[:limit] + f"… (+{len(text) - limit} chars)"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def client() -> TelegramClient:
     if not API_ID or not API_HASH:
         print(
@@ -168,7 +183,7 @@ def load_channel_rows() -> list[dict] | None:
         ).fetchall()
         return [dict(r) for r in rows]
     except Exception as exc:  # noqa: BLE001
-        log(f"channel registry read failed: {exc!r}")
+        log(f"channel registry read failed: {short_exc(exc)}")
         return None
     finally:
         try:
@@ -249,7 +264,7 @@ async def _refresh_tg_dialogs(c: TelegramClient) -> None:
         ts.replace_tg_dialogs(dialogs)
         log(f"tg_dialogs refreshed: {len(dialogs)} dialog(s)")
     except Exception as exc:  # noqa: BLE001
-        log(f"tg_dialogs refresh failed: {exc!r}")
+        log(f"tg_dialogs refresh failed: {short_exc(exc)}")
 
 
 # Held for the process lifetime; the OS releases it when we exit (even on a
@@ -443,7 +458,7 @@ async def cmd_run() -> None:
                 watch_list = await refresh_enabled_channels(c, watch_list)
                 watched = {row["chat_id"]: row["title"] for row in watch_list}
             except Exception as exc:  # noqa: BLE001 - background task must never die
-                log(f"enabled-channel refresh failed: {exc!r}")
+                log(f"enabled-channel refresh failed: {short_exc(exc)}")
 
     async def _dialog_refresh_loop() -> None:
         while True:
@@ -456,7 +471,7 @@ async def cmd_run() -> None:
                 ts.meta_set("hb_forwarder", _utcnow_iso())
                 ts.meta_set("hb_forwarder_channels", str(len(watched)))
             except Exception as exc:  # noqa: BLE001
-                log(f"heartbeat write failed: {exc!r}")
+                log(f"heartbeat write failed: {short_exc(exc)}")
             await asyncio.sleep(_HEARTBEAT_SEC)
 
     names = ", ".join(f"{name} ({cid})" for cid, name in watched.items())
