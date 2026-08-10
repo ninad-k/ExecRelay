@@ -117,8 +117,85 @@ def _env_bool(name: str, default: str = "false") -> bool:
     return (os.environ.get(name, default) or "").strip().lower() in ("true", "1", "yes", "on")
 
 
-INGEST_DRY_RUN = _env_bool("TELEGRAM_INGEST_DRY_RUN", "true")
+_DRY_RUN_ENV_DEFAULT = _env_bool("TELEGRAM_INGEST_DRY_RUN", "true")
 _HB_STALE_AFTER_SEC = 90.0
+
+
+def effective_dry_run() -> bool:
+    """The dry-run state actually in force right now.
+
+    The operator can flip dry-run from this dashboard (POST /api/dryrun), which
+    persists to the trade store's `meta` table; telegram-ingest re-reads the
+    same value on its message path. The env var is only the default for a store
+    that has never been written to, so never branch on _DRY_RUN_ENV_DEFAULT
+    directly -- always ask here."""
+    return ts.get_dry_run(_DRY_RUN_ENV_DEFAULT)
+
+
+def set_dry_run_mode(payload: dict) -> tuple[int, dict]:
+    """Flip the dry-run switch. Returns (http_status, body).
+
+    Gates, mirroring resubmit_signal()'s posture -- the two are the only
+    controls in this dashboard that can change whether real orders reach the
+    broker:
+
+      1. `enabled` must be the JSON boolean true/false, exactly. Anything
+         else (missing, "false" the string, 0) is a 400 -- a malformed call
+         must never be read as "go live".
+      2. Turning dry-run OFF (going live) additionally requires
+         `confirm: true`, so a stray click or a replayed request cannot arm
+         live trading. Turning it ON is the safe direction and needs no
+         confirmation.
+      3. Going live also re-runs telegram-ingest's own startup precondition:
+         TELEGRAM_INGEST_LICENSE_ID must be set, because it prefixes every
+         command built for the broker. That check used to run only at boot,
+         when dry-run could not change afterwards -- this switch can, so the
+         guarantee has to be re-established here or the switch would be a way
+         around it.
+      4. Every accepted change is written to the control audit log and
+         announced to the management chat -- going live is exactly the event
+         an operator wants a receipt for.
+    """
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return 400, {"ok": False, "error": "enabled must be true or false"}
+
+    if enabled is False and payload.get("confirm") is not True:
+        return 400, {
+            "ok": False,
+            "error": "confirm must be true to turn dry-run off (this arms live trading)",
+            "dry_run": effective_dry_run(),
+        }
+
+    if enabled is False and not getattr(_ingest, "LICENSE_ID", ""):
+        return 409, {
+            "ok": False,
+            "error": "TELEGRAM_INGEST_LICENSE_ID is not set — it prefixes every broker "
+                     "command, so going live would emit malformed orders. Set it in .env "
+                     "and restart the stack before switching off dry-run.",
+            "dry_run": effective_dry_run(),
+        }
+
+    before = effective_dry_run()
+    ts.set_dry_run(enabled)
+    after = effective_dry_run()
+
+    log_txn(
+        CONTROL_TXN_LOG,
+        action="dry_run",
+        before=before,
+        after=after,
+        requested=enabled,
+        ok=(after == enabled),
+    )
+    if after != before and MGMT_CHAT_ID:
+        _send_telegram(
+            MGMT_CHAT_ID,
+            ("🟡 DRY-RUN ON — signals are parsed but no orders reach the broker."
+             if after else
+             "🔴 DRY-RUN OFF — the stack is LIVE, signals now place real orders."),
+        )
+    return 200, {"ok": after == enabled, "dry_run": after}
 
 # ---------------------------------------------------------------------------
 # Resubmit -- operator-triggered order placement for signals that never
@@ -133,6 +210,9 @@ INGRESS_PORT = (os.environ.get("INGRESS_PORT") or "8081").strip() or "8081"
 INGRESS_PERIMETER_TOKEN = (os.environ.get("INGRESS_PERIMETER_TOKEN") or "").strip()
 _INGRESS_WEBHOOK_URL = f"http://127.0.0.1:{INGRESS_PORT}/webhook"
 RESUBMIT_TXN_LOG = get_txn_logger("dashboard-resubmit")
+# Operator control actions that change how the stack trades (currently just the
+# dry-run switch) get their own audit trail, separate from resubmits.
+CONTROL_TXN_LOG = get_txn_logger("dashboard-control")
 
 
 def _allowed_hosts() -> set[str]:
@@ -1348,13 +1428,19 @@ def pipeline_status() -> dict:
             "account": None, "demo": None,
         })
 
-    if INGEST_DRY_RUN:
-        components.append({
-            "name": "dry-run", "state": "warn",
-            "detail": "signals are parsed but NOT sent to the broker",
-        })
-    else:
-        components.append({"name": "dry-run", "state": "ok", "detail": "live — signals are sent to the broker"})
+    # The dry-run component doubles as the model for the banner's dry-run
+    # switch, so it carries the raw flag and its provenance, not just prose.
+    dry_meta = ts.get_dry_run_meta(_DRY_RUN_ENV_DEFAULT)
+    dry_on = bool(dry_meta.get("dry_run"))
+    components.append({
+        "name": "dry-run",
+        "state": "warn" if dry_on else "ok",
+        "detail": ("signals are parsed but NOT sent to the broker" if dry_on
+                   else "live — signals are sent to the broker"),
+        "dry_run": dry_on,
+        "source": dry_meta.get("source"),
+        "updated_ts": dry_meta.get("updated_ts"),
+    })
 
     chans = ts.list_channels()
     enabled_n = sum(1 for c in chans if c.get("enabled"))
@@ -1370,7 +1456,7 @@ def pipeline_status() -> dict:
     by_name = {c["name"]: c for c in components}
     blocking = ("forwarder", "telegram-ingest", "ingress", "bridge", "ea-shim", "mt5")
     reasons = [f"{name} down" for name in blocking if by_name[name]["state"] == "down"]
-    if INGEST_DRY_RUN:
+    if dry_on:
         reasons.append("dry-run is on")
     if enabled_n == 0:
         reasons.append("0 channels enabled")
@@ -1451,6 +1537,149 @@ def channels_snapshot() -> dict:
         if (r.get("channel") or "").strip().lower() not in registered_titles
     ]
     return {"channels": channels, "dialogs": dialogs, "unregistered": unregistered}
+
+
+# ---------------------------------------------------------------------------
+# Message ledger -- the two operator pages that answer "what did the app pass
+# over?" and "what did it actually do?".
+#
+# The two sources record different things, so each page draws from whichever
+# table actually holds the truth for that source:
+#   * Telegram messages land in `signals` (telegram-ingest writes one row per
+#     message it sees, including the ones it ignores).
+#   * TradingView/other arrive as webhooks and only exist here once ingress has
+#     accepted them and issued a trace_id -- so `orders` is their ledger.
+# ---------------------------------------------------------------------------
+
+_IGNORED_REASON = {
+    "ignored": "not a signal — nothing tradeable in it",
+    "rejected": "grammar rejected",
+    "webhook_error": "webhook error — never reached ingress",
+    "dry_run": "dry-run — not sent to the broker",
+    "tp_update_dry_run": "TP amendment — dry-run, not sent",
+    "tp_update_noop": "TP amendment — nothing open to amend",
+}
+_ACTIONED_STATUSES = ("accepted", "placed", "filled")
+_ACTION_LABEL = {
+    "newsltplong": "TP/SL amended on open longs",
+    "newsltpshort": "TP/SL amended on open shorts",
+    "closelong": "closed longs",
+    "closeshort": "closed shorts",
+    "closelongopenshort": "reversed long → short",
+    "closeshortopenlong": "reversed short → long",
+}
+
+
+def _ledger_window(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def ignored_messages(days: int = 7, source: str | None = None, limit: int = 500) -> dict:
+    """Messages that arrived and produced NO order at the broker.
+
+    Telegram rows are restricted to channels that are currently ENABLED --
+    including channels with no registry row at all, which telegram-ingest
+    treats as enabled (see is_channel_enabled's fail-open contract). Only an
+    explicit enabled=0 row is filtered out, so the page matches what the relay
+    would actually act on today."""
+    cutoff = _ledger_window(days)
+    rows: list[dict] = []
+
+    if source in (None, "", "telegram"):
+        marks = ",".join("?" * len(_IGNORED_REASON))
+        for r in ts.query(
+            f"SELECT ts, channel, outcome, symbol, raw FROM signals s "
+            f"WHERE ts >= ? AND outcome IN ({marks}) "
+            f"AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.enabled = 0 AND ("
+            f"    (s.channel IS NULL AND c.chat_id = 'direct') "
+            f" OR (c.title = s.channel COLLATE NOCASE))) "
+            f"ORDER BY ts DESC LIMIT ?",
+            (cutoff, *_IGNORED_REASON.keys(), limit),
+        ):
+            rows.append({
+                "ts": r.get("ts"),
+                "source": "telegram",
+                "origin": r.get("channel") or "direct",
+                "reason": _IGNORED_REASON.get(r.get("outcome") or "", r.get("outcome") or ""),
+                "symbol": r.get("symbol") or "",
+                "text": r.get("raw") or "",
+            })
+
+    if source in (None, "", "tradingview", "other"):
+        where = ["ts >= ?", "(status = 'rejected' OR (error IS NOT NULL AND error != ''))"]
+        params: list = [cutoff]
+        if source:
+            where.append("source = ?")
+            params.append(source)
+        else:
+            where.append("source != 'telegram'")
+        params.append(limit)
+        for r in ts.query(
+            "SELECT ts, source, command, symbol, status, error, comment FROM orders "
+            f"WHERE {' AND '.join(where)} ORDER BY ts DESC LIMIT ?",
+            tuple(params),
+        ):
+            rows.append({
+                "ts": r.get("ts"),
+                "source": r.get("source") or "other",
+                "origin": r.get("comment") or "webhook",
+                "reason": r.get("error") or "rejected at the broker",
+                "symbol": r.get("symbol") or "",
+                "text": f"{r.get('command') or ''} {r.get('symbol') or ''}".strip(),
+            })
+
+    rows.sort(key=lambda r: r.get("ts") or "", reverse=True)
+    return {
+        "rows": rows[:limit],
+        "days": days,
+        "source": source or "",
+        "truncated": len(rows) > limit,
+        # TradingView alerts malformed enough for ingress to refuse outright
+        # never receive a trace_id, so they are not in this store at all --
+        # say so rather than implying the list is exhaustive.
+        "note": (
+            "TradingView alerts rejected by ingress before a trace_id was issued "
+            "are not recorded here — see the ingress log for those."
+            if source in (None, "", "tradingview", "other") else ""
+        ),
+    }
+
+
+def actioned_messages(days: int = 7, source: str | None = None, limit: int = 500) -> dict:
+    """Everything this app actually did at MT5 -- one row per order/amendment
+    that reached the broker path, newest first."""
+    cutoff = _ledger_window(days)
+    where = ["ts >= ?", "status IN (%s)" % ",".join("?" * len(_ACTIONED_STATUSES))]
+    params: list = [cutoff, *_ACTIONED_STATUSES]
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    params.append(limit)
+
+    rows = []
+    for r in ts.query(
+        "SELECT ts, trace_id, source, command, symbol, volume, entry, sl, tp, "
+        "status, broker_order_id, comment FROM orders "
+        f"WHERE {' AND '.join(where)} ORDER BY ts DESC LIMIT ?",
+        tuple(params),
+    ):
+        cmd = (r.get("command") or "").lower()
+        rows.append({
+            "ts": r.get("ts"),
+            "source": r.get("source") or "other",
+            "origin": r.get("comment") or "",
+            "action": _ACTION_LABEL.get(cmd, f"{cmd} order placed" if cmd else "order"),
+            "command": cmd,
+            "symbol": r.get("symbol") or "",
+            "volume": r.get("volume"),
+            "entry": r.get("entry"),
+            "sl": r.get("sl"),
+            "tp": r.get("tp"),
+            "status": r.get("status") or "",
+            "broker_order_id": r.get("broker_order_id") or "",
+            "trace_id": r.get("trace_id") or "",
+        })
+    return {"rows": rows, "days": days, "source": source or ""}
 
 
 def add_channel(payload: dict) -> dict:
@@ -1674,7 +1903,7 @@ def _derive_commands(signal_id: int | None = None, text: str | None = None) -> d
 
     if channel_name is not None and not ts.is_channel_enabled(channel_name):
         warnings.append("channel is currently disabled")
-    if INGEST_DRY_RUN:
+    if effective_dry_run():
         warnings.append("system is in DRY-RUN")
 
     try:
@@ -1750,9 +1979,11 @@ def resubmit_signal(payload: dict) -> tuple[int, dict]:
          (missing, false, "true" the string, 1) is refused with 400 and the
          preview payload instead of being sent. A stray click can never
          place an order.
-      2. TELEGRAM_INGEST_DRY_RUN=true refuses with 409 -- the operator
-         deliberately put the system in dry-run; this control must not be
-         able to bypass that.
+      2. Dry-run being ON refuses with 409 -- the operator deliberately put
+         the system in dry-run (via the banner switch or
+         TELEGRAM_INGEST_DRY_RUN); this control must not be able to bypass
+         that. Read live via effective_dry_run(), so a resubmit racing a
+         just-flipped switch sees the new value, not the boot-time one.
       3. A disabled source channel is ALLOWED but was already flagged as a
          warning in the preview (and must have been shown in the confirm
          modal) -- an explicit operator override is legitimate.
@@ -1790,10 +2021,10 @@ def resubmit_signal(payload: dict) -> tuple[int, dict]:
 
     # Gate 2: dry-run refuses outright, before any idempotency/order-building
     # work -- the operator's dry-run switch always wins.
-    if INGEST_DRY_RUN:
+    if effective_dry_run():
         return 409, {
             "ok": False,
-            "error": "system is in DRY-RUN (TELEGRAM_INGEST_DRY_RUN=true) — resubmit refused",
+            "error": "system is in DRY-RUN — resubmit refused (turn dry-run off in the pipeline bar to place orders)",
             "preview": preview,
         }
 
@@ -2308,6 +2539,26 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .pipeline-chip.ok { color: var(--color-profit); }
 .pipeline-chip.warn { color: var(--color-warning); }
 .pipeline-chip.down { color: var(--color-loss); }
+.dryrun-control { display: inline-flex; align-items: center; gap: 0.55rem; margin-left: auto; padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--color-border-light); background: var(--color-surface-2); }
+.dryrun-control[hidden] { display: none; }
+.dryrun-control .dryrun-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); }
+.dryrun-control .dryrun-state { font-size: 0.72rem; font-weight: 700; white-space: nowrap; }
+.dryrun-control.on .dryrun-state { color: var(--color-warning); }
+.dryrun-control.off .dryrun-state { color: var(--color-gold); }
+.dryrun-control.busy { opacity: 0.55; pointer-events: none; }
+
+.page-tabs { display: flex; gap: 0.25rem; padding: 0 1.5rem; border-bottom: 1px solid var(--color-border); background: color-mix(in srgb, var(--color-surface) 92%, transparent); }
+.page-tabs button { appearance: none; background: none; border: none; border-bottom: 2px solid transparent; color: var(--color-text-muted); font-size: 0.8rem; font-weight: 600; letter-spacing: 0.02em; padding: 0.7rem 1rem; cursor: pointer; }
+.page-tabs button:hover { color: var(--color-text); }
+.page-tabs button.active { color: var(--color-accent, var(--color-text)); border-bottom-color: currentColor; }
+/* Page switching is CSS-only so it never fights the inline display rules the
+   overview's own refreshes set (e.g. hiding Telegram-specific sections for a
+   TradingView source) -- switching back reveals exactly what they left. */
+main[data-page="overview"] > .ledger-page { display: none !important; }
+main[data-page="ignored"]  > *:not(#page-ignored)  { display: none !important; }
+main[data-page="actioned"] > *:not(#page-actioned) { display: none !important; }
+.ledger-text { white-space: pre-wrap; word-break: break-word; max-width: 46ch; font-size: 0.76rem; color: var(--color-text-dim); }
+.ledger-reason { white-space: normal; max-width: 24ch; }
 .badge.live { background: color-mix(in srgb, var(--color-gold) 22%, transparent); color: var(--color-gold); font-weight: 700; }
 .badge.demo { background: var(--color-surface-2); color: var(--color-text-dim); }
 
@@ -2380,8 +2631,18 @@ button.actbtn:hover { background: var(--color-primary-glow); }
 <div class="pipeline-banner">
   <div class="pipeline-pill" id="pipeline-pill">checking pipeline…</div>
   <div class="pipeline-chips" id="pipeline-chips"></div>
+  <div class="dryrun-control" id="dryrun-control" hidden>
+    <span class="dryrun-label">Dry run</span>
+    <label class="toggle-switch"><input type="checkbox" id="dryrun-toggle" aria-label="Dry run mode"><span class="toggle-slider"></span></label>
+    <span class="dryrun-state" id="dryrun-state"></span>
+  </div>
 </div>
-<main>
+<nav class="page-tabs" id="page-tabs">
+  <button type="button" data-page="overview" class="active">Overview</button>
+  <button type="button" data-page="ignored">Ignored messages</button>
+  <button type="button" data-page="actioned">Actioned in MT5</button>
+</nav>
+<main data-page="overview">
   <div class="cards" id="cards"></div>
 
   <section id="section-channels">
@@ -2487,6 +2748,25 @@ button.actbtn:hover { background: var(--color-primary-glow); }
   <div class="tablewrap"><table id="tbl-closed"></table></div>
 
   <div id="meta"></div>
+  <section class="ledger-page" id="page-ignored">
+    <h2>Ignored messages <span class="chip" id="chip-ignored"></span></h2>
+    <p class="muted" style="font-size:0.8rem;margin:0 0 .75rem">
+      Everything that arrived from an <b>enabled</b> source and produced no order at the broker.
+      A channel disabled in the registry is not listed — it is not being read at all.
+    </p>
+    <div id="ignored-note" class="review-strip"></div>
+    <div class="tablewrap"><table id="tbl-ignored"></table></div>
+    <p class="muted" id="ignored-empty" style="font-size:0.8rem"></p>
+  </section>
+
+  <section class="ledger-page" id="page-actioned">
+    <h2>Actioned in MT5 <span class="chip" id="chip-actioned"></span></h2>
+    <p class="muted" style="font-size:0.8rem;margin:0 0 .75rem">
+      Every order and amendment this app actually sent to the broker, newest first.
+    </p>
+    <div class="tablewrap"><table id="tbl-actioned"></table></div>
+    <p class="muted" id="actioned-empty" style="font-size:0.8rem"></p>
+  </section>
 </main>
 
 <div id="modal-scrim"><div id="modal">
@@ -2512,6 +2792,18 @@ button.actbtn:hover { background: var(--color-primary-glow); }
     <div class="modal-actions">
       <button class="btn-ghost" type="button" id="ch-delete-cancel">Cancel</button>
       <button class="btn-danger" type="button" id="ch-delete-confirm">Remove</button>
+    </div>
+  </div>
+</div>
+
+<div id="dryrun-scrim" style="position:fixed;inset:0;background:rgb(0 0 0 / 0.55);display:none;align-items:center;justify-content:center;z-index:70">
+  <div style="width:min(460px,92vw);background:linear-gradient(180deg,var(--color-surface-2),var(--color-surface));border:1px solid var(--color-border-light);border-radius:var(--radius-lg);padding:1.5rem">
+    <h3 style="margin:0 0 .75rem;font-size:0.95rem">Turn dry-run OFF?</h3>
+    <p class="muted" style="font-size:0.82rem;margin:0 0 .5rem">Every signal from the next message onward will place <b>real orders</b> on the connected account. The change reaches telegram-ingest within about 15 seconds — no restart needed.</p>
+    <p style="font-size:0.85rem;font-weight:600" id="dryrun-acct"></p>
+    <div class="modal-actions">
+      <button class="btn-ghost" type="button" id="dryrun-cancel">Cancel</button>
+      <button class="btn-danger" type="button" id="dryrun-confirm">Turn dry-run off</button>
     </div>
   </div>
 </div>
@@ -2603,8 +2895,86 @@ function table(id, header, rows, footer) {
 }
 
 async function refresh() {
-  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshChannels(), refreshUnposted()]);
+  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshChannels(), refreshUnposted(), refreshLedger()]);
 }
+
+// --- ledger pages: "Ignored messages" / "Actioned in MT5" ----------------
+// Both follow the SOURCE dropdown and the day window, exactly like the
+// overview: pick TradingView and only TradingView rows remain.
+
+let currentPage = "overview";
+
+function showPage(name) {
+  currentPage = name;
+  document.querySelector("main").dataset.page = name;
+  for (const b of document.querySelectorAll("#page-tabs button")) {
+    b.classList.toggle("active", b.dataset.page === name);
+  }
+  try { localStorage.setItem("execrelay-dashboard-page", name); } catch (e) {}
+  refreshLedger();
+}
+
+function ledgerTime(ts) { return esc((ts || "").slice(0, 19).replace("T", " ")) || "—"; }
+
+function sourceBadge(s) {
+  const label = s === "tradingview" ? "TradingView" : (s === "telegram" ? "Telegram" : "Other");
+  return `<span class="badge neutral">${esc(label)}</span>`;
+}
+
+async function refreshIgnored() {
+  const res = await fetch(withToken("/api/ignored?days=" + currentDays + sourceQS()), { headers: authHeaders() });
+  if (!res.ok) return;
+  const d = await res.json();
+  const rows = d.rows || [];
+  $("chip-ignored").textContent = `${rows.length}${d.truncated ? "+" : ""} over ${currentDays}d`;
+  $("ignored-note").innerHTML = d.note ? `<div class="muted" style="font-size:0.76rem">${esc(d.note)}</div>` : "";
+  $("ignored-empty").textContent = rows.length ? "" : "Nothing was ignored in this window.";
+  table("tbl-ignored", ["When", "Source", "From", "Why it was ignored", "Symbol", "Message"], rows.map(r => `<tr>
+    <td class="muted number">${ledgerTime(r.ts)}</td>
+    <td>${sourceBadge(r.source)}</td>
+    <td>${esc(r.origin || "—")}</td>
+    <td class="ledger-reason">${esc(r.reason || "")}</td>
+    <td>${esc(r.symbol || "—")}</td>
+    <td class="ledger-text">${esc(r.text || "")}</td>
+  </tr>`));
+}
+
+async function refreshActioned() {
+  const res = await fetch(withToken("/api/actioned?days=" + currentDays + sourceQS()), { headers: authHeaders() });
+  if (!res.ok) return;
+  const d = await res.json();
+  const rows = d.rows || [];
+  $("chip-actioned").textContent = `${rows.length} over ${currentDays}d`;
+  $("actioned-empty").textContent = rows.length ? "" : "Nothing has been sent to the broker in this window.";
+  const num = v => (v === null || v === undefined || v === "") ? "—" : esc(String(v));
+  table("tbl-actioned", ["When", "Source", "Action", "Symbol", "Lots", "Entry", "SL", "TP", "Status", "Broker ID", "Tag"], rows.map(r => `<tr>
+    <td class="muted number">${ledgerTime(r.ts)}</td>
+    <td>${sourceBadge(r.source)}</td>
+    <td>${esc(r.action || "")}</td>
+    <td>${esc(r.symbol || "—")}</td>
+    <td class="number">${num(r.volume)}</td>
+    <td class="number">${num(r.entry)}</td>
+    <td class="number">${num(r.sl)}</td>
+    <td class="number">${num(r.tp)}</td>
+    <td>${esc(r.status || "")}</td>
+    <td class="muted number">${esc(r.broker_order_id || "—")}</td>
+    <td class="muted">${esc(r.origin || "—")}</td>
+  </tr>`));
+}
+
+async function refreshLedger() {
+  // Only fetch the page actually on screen -- these are the widest queries in
+  // the dashboard, and the overview does not show either of them.
+  try {
+    if (currentPage === "ignored") await refreshIgnored();
+    else if (currentPage === "actioned") await refreshActioned();
+  } catch (e) {}
+}
+
+document.getElementById("page-tabs").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-page]");
+  if (btn) showPage(btn.dataset.page);
+});
 
 // --- pipeline status banner --------------------------------------------
 
@@ -2626,8 +2996,69 @@ async function refreshPipeline() {
     pill.className = "pipeline-pill " + p.verdict;
     pill.textContent = p.headline + (p.reasons && p.reasons.length ? " — " + p.reasons.join("; ") : "");
     $("pipeline-chips").innerHTML = p.components.map(pipelineChip).join("");
+    renderDryRun(p.components.find(c => c.name === "dry-run"));
+    const mt5 = p.components.find(c => c.name === "mt5");
+    $("dryrun-acct").textContent = (mt5 && mt5.account)
+      ? "Account #" + mt5.account + (mt5.demo === false ? " — REAL MONEY" : (mt5.demo ? " (demo account)" : ""))
+      : "";
   } catch (e) {}
 }
+
+// --- dry-run switch ------------------------------------------------------
+// The actionable version of the banner's dry-run chip. Turning dry-run OFF
+// arms live trading, so that direction is held back behind a confirm modal
+// and sends confirm:true -- the server refuses the change without it.
+
+let dryRunApplying = false;
+
+function renderDryRun(c) {
+  const wrap = $("dryrun-control");
+  if (!c) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  const on = !!c.dry_run;
+  wrap.className = "dryrun-control " + (on ? "on" : "off");
+  $("dryrun-toggle").checked = on;
+  $("dryrun-state").textContent = on ? "ON — nothing reaches the broker" : "OFF — LIVE";
+  wrap.title = c.source === "env"
+    ? "Following TELEGRAM_INGEST_DRY_RUN — no operator override set yet"
+    : "Operator override" + (c.updated_ts ? ", set " + c.updated_ts.slice(0, 19).replace("T", " ") : "");
+}
+
+async function postDryRun(enabled, confirm) {
+  dryRunApplying = true;
+  $("dryrun-control").classList.add("busy");
+  try {
+    const body = confirm ? { enabled: enabled, confirm: true } : { enabled: enabled };
+    const res = await fetch(withToken("/api/dryrun"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || ("could not change dry-run (HTTP " + res.status + ")"));
+    }
+  } catch (e) {
+    alert("could not change dry-run: " + e);
+  } finally {
+    dryRunApplying = false;
+    $("dryrun-control").classList.remove("busy");
+    await refreshPipeline();
+  }
+}
+
+$("dryrun-toggle").addEventListener("change", (e) => {
+  if (dryRunApplying) return;
+  if (e.target.checked) { postDryRun(true, false); return; }
+  // Going live: revert the visual and let the modal decide.
+  e.target.checked = true;
+  $("dryrun-scrim").style.display = "flex";
+});
+$("dryrun-cancel").addEventListener("click", () => { $("dryrun-scrim").style.display = "none"; });
+$("dryrun-scrim").addEventListener("click", (e) => { if (e.target.id === "dryrun-scrim") $("dryrun-scrim").style.display = "none"; });
+$("dryrun-confirm").addEventListener("click", () => {
+  $("dryrun-scrim").style.display = "none";
+  postDryRun(false, true);
+});
 
 // --- channel manager -----------------------------------------------------
 
@@ -2741,7 +3172,7 @@ function renderResubmitModal(d) {
   const warnEls = (d.warnings || []).map(w => `<div class="neg" style="margin:.2rem 0">${esc(w)}</div>`).join("");
   const errEls = (d.errors || []).map(w => `<div class="neg" style="margin:.2rem 0">${esc(w)}</div>`).join("");
   $("resubmit-warnings").innerHTML = warnEls + errEls;
-  $("resubmit-commands").textContent = n ? d.commands.join("\n") : "(no commands -- see errors above)";
+  $("resubmit-commands").textContent = n ? d.commands.join("\\n") : "(no commands -- see errors above)";
   $("resubmit-results").innerHTML = "";
   const btn = $("resubmit-confirm");
   btn.disabled = !d.ok;
@@ -3337,6 +3768,10 @@ function toggleTheme() {
 })();
 
 loadState();
+try {
+  const savedPage = localStorage.getItem("execrelay-dashboard-page");
+  if (["overview", "ignored", "actioned"].includes(savedPage)) showPage(savedPage);
+} catch (e) {}
 $("source-filter").value = currentSource;
 document.querySelectorAll("#seg-days button").forEach(b => b.classList.toggle("active", parseInt(b.getAttribute("data-days"), 10) === currentDays));
 persistState();
@@ -3391,6 +3826,14 @@ class Handler(BaseHTTPRequestHandler):
             # comparison (see scorecard() docstring / PLAN item 1).
             days = _parse_days(self.path)
             self._send(200, json.dumps(scorecard(days), default=str).encode(), "application/json")
+        elif path == "/api/ignored":
+            days = _parse_days(self.path)
+            source = _parse_source(self.path)
+            self._send(200, json.dumps(ignored_messages(days, source), default=str).encode(), "application/json")
+        elif path == "/api/actioned":
+            days = _parse_days(self.path)
+            source = _parse_source(self.path)
+            self._send(200, json.dumps(actioned_messages(days, source), default=str).encode(), "application/json")
         elif path == "/api/risk":
             days = _parse_days(self.path)
             source = _parse_source(self.path)
@@ -3447,7 +3890,7 @@ class Handler(BaseHTTPRequestHandler):
 
     _JSON_POST_ROUTES = (
         "/api/journal", "/api/channels", "/api/channels/toggle", "/api/channels/delete",
-        "/api/signals/preview", "/api/signals/resubmit",
+        "/api/signals/preview", "/api/signals/resubmit", "/api/dryrun",
     )
 
     def do_POST(self) -> None:
@@ -3492,6 +3935,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(result, default=str).encode(), "application/json")
             elif path == "/api/signals/resubmit":
                 status, body = resubmit_signal(payload)
+                self._send(status, json.dumps(body, default=str).encode(), "application/json")
+            elif path == "/api/dryrun":
+                status, body = set_dry_run_mode(payload)
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(400, str(exc).encode(), "text/plain")

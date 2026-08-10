@@ -402,6 +402,93 @@ async def cmd_qrlogin() -> None:
     await c.disconnect()
 
 
+# Telegram's servers speak a newer TL layer than any released Telethon knows,
+# so an ordinary post in ANY channel this account can see may contain a
+# constructor the client cannot decode. That raises TypeNotFoundError deep in
+# Telethon's receive loop, and it used to unwind straight out of
+# run_until_disconnected() and kill this process -- with nothing to restart it.
+#
+# Worse, it repeated: the session stores a per-chat catch-up point (pts), so on
+# reconnect the client asks for the same difference, gets the same undecodable
+# message, and dies again. Restarting alone never escapes that.
+#
+# So: survive the error, and if it keeps happening, drop the account-wide
+# catch-up point that keeps replaying it. That trades the missed backlog for a
+# relay that stays up -- the deliberate choice for a signal relay, where a
+# stale signal is worth little and a dead relay is worth nothing.
+_DECODE_RESET_AFTER = 2
+_SUPERVISE_BACKOFF_SEC = (2, 5, 15, 30, 60)
+
+
+def _reset_catchup_point() -> bool:
+    """Forget the account-wide update state so Telethon stops re-requesting the
+    batch it cannot parse. Auth lives in other tables and is untouched -- this
+    does not log the session out. Returns True if a row was actually cleared."""
+    import sqlite3
+
+    path = SESSION if SESSION.endswith(".session") else f"{SESSION}.session"
+    try:
+        conn = sqlite3.connect(path, timeout=5.0)
+        try:
+            cur = conn.execute("DELETE FROM update_state WHERE id = 0")
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - recovery must never raise
+        log(f"could not clear catch-up point: {short_exc(exc)}")
+        return False
+
+
+async def _supervised_run(c) -> None:
+    """Keep the relay running across decode failures instead of exiting."""
+    decode_failures = 0
+    attempt = 0
+    while True:
+        try:
+            await c.run_until_disconnected()
+            log("disconnected cleanly -- stopping")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - staying up is the whole point
+            name = type(exc).__name__
+            is_decode = name == "TypeNotFoundError"
+            if is_decode:
+                decode_failures += 1
+                log(
+                    f"undecodable update from Telegram ({decode_failures}"
+                    f"/{_DECODE_RESET_AFTER}): {short_exc(exc)}"
+                )
+                if decode_failures >= _DECODE_RESET_AFTER:
+                    cleared = _reset_catchup_point()
+                    log(
+                        "cleared the account-wide catch-up point -- resuming from now; "
+                        "messages posted during the gap are skipped"
+                        if cleared else
+                        "no catch-up point to clear; retrying"
+                    )
+                    decode_failures = 0
+            else:
+                log(f"relay error: {short_exc(exc)}")
+
+            try:
+                ts.meta_set("hb_forwarder_last_error", f"{name}: {short_exc(exc, 120)}")
+            except Exception:  # noqa: BLE001
+                pass
+
+            delay = _SUPERVISE_BACKOFF_SEC[min(attempt, len(_SUPERVISE_BACKOFF_SEC) - 1)]
+            attempt += 1
+            log(f"reconnecting in {delay}s")
+            await asyncio.sleep(delay)
+            try:
+                if not c.is_connected():
+                    await c.connect()
+                attempt = 0  # reconnected: forget the backoff, keep the decode count
+            except Exception as exc:  # noqa: BLE001
+                log(f"reconnect failed: {short_exc(exc)}")
+
+
 async def cmd_run() -> None:
     if not SOURCE_CHAT or not TARGET_CHAT:
         print("TG_FORWARDER_SOURCE_CHAT and TG_FORWARDER_TARGET_CHAT are required", file=sys.stderr)
@@ -481,7 +568,7 @@ async def cmd_run() -> None:
     asyncio.create_task(_enabled_refresh_loop())
     asyncio.create_task(_dialog_refresh_loop())
     asyncio.create_task(_heartbeat_loop())
-    await c.run_until_disconnected()
+    await _supervised_run(c)
 
 
 def main() -> None:

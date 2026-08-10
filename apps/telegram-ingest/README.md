@@ -101,7 +101,7 @@ XAUUSD Sell Trigger only Below 4792 📉
 | `TELEGRAM_INGEST_ENTRY_MODE` | no | `limit` | `limit` = first leg rests at the stated entry price; `market` = first leg executes immediately. Ignored by trigger-format signals |
 | `TELEGRAM_INGEST_TP_MODE` | no | `first` | Which target of a ladder to trade: `first`, `last`, or `ladder` (one order each) |
 | `TELEGRAM_INGEST_SYMBOL_MAP` | no | — | Channel jargon → canonical name, e.g. `GOLD=XAUUSD` (per-broker suffixes belong in the EA's `InpSymbolMap`) |
-| `TELEGRAM_INGEST_DRY_RUN` | no | **`true`** | Log commands instead of POSTing them |
+| `TELEGRAM_INGEST_DRY_RUN` | no | **`true`** | Log commands instead of POSTing them. Boot default only — the trade dashboard's pipeline-bar switch overrides it at runtime (stored in the trade store, re-read here every ~10s), and that override wins until cleared |
 | `TELEGRAM_INGEST_COMMENT` | no | `tg-ingest` | Strategy tag on every order |
 
 ## Go-live checklist

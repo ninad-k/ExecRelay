@@ -31,7 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"
 from _txnlog import get_txn_logger, log_txn  # noqa: E402
 from _tradestore import (  # noqa: E402
     append_signal_trace,
+    get_dry_run,
     is_channel_enabled,
+    recent_symbols_for_channel,
     record_order,
     record_signal,
 )
@@ -94,7 +96,10 @@ ENTRY_MODE = os.environ.get("TELEGRAM_INGEST_ENTRY_MODE", "limit").lower()
 #   ladder — one order per target, each at the fixed lot (N x exposure)
 TP_MODE = os.environ.get("TELEGRAM_INGEST_TP_MODE", "first").lower()
 
-# Safety default: log what WOULD be sent, send nothing.
+# Safety default: log what WOULD be sent, send nothing. This is only the
+# BOOT-TIME fallback -- the effective switch is _dry_run_cached() below, which
+# lets the dashboard flip dry-run at runtime. Never branch on DRY_RUN directly
+# on the message path.
 DRY_RUN = os.environ.get("TELEGRAM_INGEST_DRY_RUN", "true").lower() in (
     "true",
     "1",
@@ -253,6 +258,76 @@ def channel_initials(name: str, max_len: int = 6) -> str:
     -> "VGTA". Used to tag trade comments with their originating channel."""
     letters = [w[0].upper() for w in name.split() if w[:1].isalnum()]
     return "".join(letters)[:max_len] or "TG"
+
+
+# --- follow-up "amend the trades already running" messages -----------------
+# A channel does not only post new signals; it also amends live ones ("Tp set
+# @ 4346 for both trade"). These carry a price but no side, entry or symbol,
+# so parse_signal() correctly refuses them -- they are not signals. They are
+# matched here instead, and only AFTER parse_signal has declined, so a real
+# signal can never be swallowed by this path.
+#
+# Deliberately narrow: the verb (set/change/move/...) must be present next to
+# the TP keyword. Plain "TP @ 4089" is a LINE OF A SIGNAL, not an amendment,
+# and must not match -- which is why a bare keyword+price is not accepted.
+# How far back to look for the instruments an amendment should address. A
+# channel amending a trade it opened weeks ago is not a case worth guessing at.
+_TP_UPDATE_LOOKBACK_DAYS = 7
+
+_TP_UPDATE_RES = (
+    re.compile(
+        r"\b(?:tp|take\s*profit|target)\b[\s:@-]{0,6}"
+        r"\b(?:set|chang(?:e|ed)|updat(?:e|ed)|revis(?:e|ed)|mov(?:e|ed)|shift(?:ed)?|now|to)\b"
+        r"[\s:@to-]{0,8}(\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:set|chang(?:e|ed)|updat(?:e|ed)|revis(?:e|ed)|mov(?:e|ed)|shift(?:ed)?)\b"
+        r"[\s:@-]{0,6}\b(?:tp|take\s*profit|target)\b"
+        r"[\s:@to-]{0,8}(\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def parse_tp_update(text: str) -> float | None:
+    """Extract the new take-profit from an amendment message, or None if this
+    is not one. Never raises -- an unrecognised message is simply not an
+    amendment, and the caller falls through to its normal handling."""
+    if not text:
+        return None
+    for pattern in _TP_UPDATE_RES:
+        m = pattern.search(text)
+        if m:
+            try:
+                tp = float(m.group(1))
+            except (TypeError, ValueError):
+                return None
+            return tp if tp > 0 else None
+    return None
+
+
+def build_tp_update_commands(tp: float, symbols: list[str], comment: str | None = None) -> list[str]:
+    """Render a TP amendment as modify commands -- one per (symbol, side).
+
+    Both sides are emitted for every symbol because the message never says
+    which way the running trades face. That is safe: ea_shim matches
+    positions by side AND by this comment, so the side that does not exist
+    (and any position belonging to a different channel) is simply a no-op.
+    The comment is what scopes the change to THIS channel's trades.
+
+    No volume is sent -- these commands do not open exposure, and the parser
+    only requires an SL or a TP on a modify."""
+    secret = f",secret={SECRET}" if SECRET else ""
+    comment = comment or COMMENT
+    cmds: list[str] = []
+    for raw_symbol in symbols:
+        symbol = resolve_symbol(raw_symbol)
+        for side in ("newsltplong", "newsltpshort"):
+            cmds.append(
+                f"{LICENSE_ID},{side},{symbol},tp={_fmt(tp)},comment={comment}{secret}"
+            )
+    return cmds
 
 
 def _blank_signal(symbol: str, side: str, entry: float) -> dict:
@@ -650,6 +725,39 @@ def _channel_enabled_cached(channel_name: str | None) -> bool:
     return enabled
 
 
+# Dry-run is an operator switch the dashboard can flip at runtime (persisted in
+# the trade store's `meta` table), so it is re-read here rather than trusted
+# from the boot-time env var. Same ~10s cache as the channel registry above, so
+# a flip takes effect within ~15s without restarting the stack. DRY_RUN (env)
+# is only the fallback for a store that has never been written to, and
+# get_dry_run() fails safe back to it -- see its docstring.
+_DRY_RUN_CACHE_TTL_SEC = 10.0
+_dry_run_cache: tuple[float, bool] | None = None
+
+
+def _dry_run_cached() -> bool:
+    global _dry_run_cache
+    now = time.time()
+    if _dry_run_cache is not None and (now - _dry_run_cache[0]) < _DRY_RUN_CACHE_TTL_SEC:
+        return _dry_run_cache[1]
+    effective = get_dry_run(DRY_RUN)
+    # Backstop: LICENSE_ID prefixes every command built for the broker, and the
+    # startup check enforcing it could only ever run at boot -- back when
+    # dry-run was fixed for the life of the process. A runtime override must
+    # not become a way around it, so an override that says "live" without a
+    # license id is refused HERE, the point every message passes through. The
+    # dashboard rejects the same combination up front; this is what makes it
+    # unbypassable.
+    if not effective and not LICENSE_ID:
+        logger.error(
+            "dry-run override says LIVE but TELEGRAM_INGEST_LICENSE_ID is empty -- "
+            "staying in DRY-RUN (commands would be malformed)"
+        )
+        effective = True
+    _dry_run_cache = (now, effective)
+    return effective
+
+
 def _mark_seen(key: tuple[int, int]) -> bool:
     """Returns False if already seen."""
     if key in _seen:
@@ -658,6 +766,103 @@ def _mark_seen(key: tuple[int, int]) -> bool:
     _seen_order.append(key)
     if len(_seen_order) > _SEEN_MAX:
         _seen.discard(_seen_order.pop(0))
+    return True
+
+
+def _handle_tp_update(
+    chat_id: int, message_id: int, channel_name: str | None, text: str
+) -> bool:
+    """Amend the take-profit on the trades this channel already has running.
+
+    Returns True if the message WAS an amendment (handled here; the caller
+    stops), False if it was not (the caller carries on with its normal
+    not-a-signal / rejected handling).
+
+    Scoping is what makes this safe: every command carries this channel's
+    comment tag, and ea_shim only touches positions whose comment matches, so
+    one channel's amendment can never move another channel's TP -- nor that of
+    a trade placed by hand."""
+    tp = parse_tp_update(text)
+    if tp is None:
+        return False
+
+    comment = f"tg-{channel_initials(channel_name)}" if channel_name else COMMENT
+    symbols = recent_symbols_for_channel(channel_name, days=_TP_UPDATE_LOOKBACK_DAYS)
+    if not symbols:
+        # Nothing traded recently -> nothing to amend. Recorded rather than
+        # dropped, so the dashboard shows the amendment arrived and why it
+        # did nothing.
+        logger.info(
+            "chat %s msg %s: TP amendment to %s from %r, but this channel has traded "
+            "nothing in the last %s day(s) -- nothing to amend",
+            chat_id, message_id, _fmt(tp), channel_name or "direct", _TP_UPDATE_LOOKBACK_DAYS,
+        )
+        record_signal(
+            chat_id=chat_id, message_id=message_id, channel=channel_name,
+            outcome="tp_update_noop", tp=tp, n_commands=0,
+            raw=_redact_secret(text)[:500],
+        )
+        return True
+
+    commands = build_tp_update_commands(tp, symbols, comment=comment)
+    dry_run = _dry_run_cached()
+    logger.info(
+        "chat %s msg %s: TP amendment -> %s on %s (scope %s)",
+        chat_id, message_id, _fmt(tp), ", ".join(symbols), comment,
+    )
+    # Deliberately NOT the plain "dry_run" outcome: that one feeds the
+    # dashboard's "signals not placed" panel, which offers a resubmit -- and
+    # resubmitting an amendment would run it back through parse_signal and
+    # fail, since it was never a signal. Its own outcome keeps it out.
+    record_signal(
+        chat_id=chat_id, message_id=message_id, channel=channel_name,
+        outcome="tp_update_dry_run" if dry_run else "tp_update",
+        symbol=symbols[0], tp=tp, n_commands=len(commands),
+        raw=_redact_secret(text)[:500],
+    )
+
+    posted = 0
+    for body in commands:
+        if dry_run:
+            logger.info("DRY-RUN would POST: %s", _redact_secret(body))
+            log_txn(
+                TXN_LOG, chat_id=chat_id, message_id=message_id, channel=channel_name,
+                outcome="dry_run", command=_redact_secret(body),
+            )
+            continue
+        try:
+            status, resp = post_webhook(body)
+        except Exception as exc:
+            logger.error("webhook POST failed: %s (body: %s)", exc, _redact_secret(body))
+            log_txn(
+                TXN_LOG, chat_id=chat_id, message_id=message_id, channel=channel_name,
+                outcome="webhook_error", command=_redact_secret(body), error=str(exc),
+            )
+            continue
+        (logger.info if status == 200 else logger.error)(
+            "webhook %s -> %d %s", body.split(",", 3)[1], status, resp
+        )
+        log_txn(
+            TXN_LOG, chat_id=chat_id, message_id=message_id, channel=channel_name,
+            outcome="posted", command=_redact_secret(body),
+            http_status=status, response=resp,
+        )
+        if status == 200:
+            posted += 1
+            try:
+                trace_id = json.loads(resp).get("trace_id", "")
+            except (json.JSONDecodeError, AttributeError):
+                trace_id = ""
+            if trace_id:
+                append_signal_trace(chat_id, message_id, trace_id)
+
+    if posted and not dry_run:
+        send_notification(
+            chat_id,
+            f"✏️ TP amended to {_fmt(tp)}\n"
+            f"Applied to open {', '.join(symbols)} trade(s)"
+            + (f"\nSource: {channel_name}" if channel_name else ""),
+        )
     return True
 
 
@@ -701,6 +906,11 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
     try:
         sig = parse_signal(text)
     except SignalError as exc:
+        # An amendment ("Tp set @ 4346 for both trade") is not a signal, so
+        # parse_signal is right to refuse it. Give it its own path before
+        # writing the message off as rejected.
+        if _handle_tp_update(chat_id, message_id, channel_name, text):
+            return
         logger.warning(
             "chat %s msg %s: signal REJECTED (%s): %r", chat_id, message_id, exc, text[:200]
         )
@@ -723,16 +933,35 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         )
         return
     if sig is None:
+        if _handle_tp_update(chat_id, message_id, channel_name, text):
+            return
+        # Recorded, not just dropped: the dashboard's "Ignored messages" page
+        # is how an operator checks that nothing tradeable was passed over.
+        # A channel posts far more chatter than signals, so this is the
+        # highest-volume outcome by some margin -- raw stays truncated and
+        # secret-redacted like every other row.
         logger.debug("chat %s msg %s: not a signal", chat_id, message_id)
+        record_signal(
+            chat_id=chat_id,
+            message_id=message_id,
+            channel=channel_name,
+            outcome="ignored",
+            n_commands=0,
+            raw=_redact_secret(text)[:500],
+        )
         return
 
     comment = f"tg-{channel_initials(channel_name)}" if channel_name else None
     commands = build_commands(sig, comment=comment)
+    # Read the switch ONCE for the whole message: the outcome recorded below
+    # and the per-command branch further down must agree even if the operator
+    # flips dry-run (or the cache expires) midway through handling this one.
+    dry_run = _dry_run_cached()
     record_signal(
         chat_id=chat_id,
         message_id=message_id,
         channel=channel_name,
-        outcome="dry_run" if DRY_RUN else "posted",
+        outcome="dry_run" if dry_run else "posted",
         symbol=sig.get("symbol"),
         side=sig.get("side"),
         entry=sig.get("entry"),
@@ -742,7 +971,7 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         raw=_redact_secret(text)[:500],
     )
     for body in commands:
-        if DRY_RUN:
+        if dry_run:
             logger.info("DRY-RUN would POST: %s", _redact_secret(body))
             log_txn(
                 TXN_LOG,
@@ -810,7 +1039,7 @@ def poll_loop() -> None:
     offset: int | None = None
     logger.info(
         "ingest loop started (dry_run=%s, chats=%s, lot=%s, entry_mode=%s, tp_mode=%s)",
-        DRY_RUN,
+        _dry_run_cached(),
         sorted(ALLOWED_CHAT_IDS),
         FIXED_LOT,
         ENTRY_MODE,
@@ -917,10 +1146,11 @@ def main() -> None:
             logger.error(e)
         raise SystemExit(2)
 
-    if DRY_RUN:
+    if _dry_run_cached():
         logger.warning(
             "running in DRY-RUN mode: commands are logged, nothing is traded. "
-            "Set TELEGRAM_INGEST_DRY_RUN=false to go live."
+            "Turn the dry-run switch off in the trade dashboard's pipeline bar "
+            "(or set TELEGRAM_INGEST_DRY_RUN=false) to go live."
         )
 
     start_health_server(HTTP_ADDR)

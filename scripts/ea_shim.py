@@ -370,6 +370,44 @@ def close_positions(symbol, pos_type):
     return closed, None
 
 
+def modify_positions_sltp(symbol, pos_type, tp, sl, comment_scope):
+    """Set TP (and optionally SL) on shim-owned positions of the given type.
+    Returns (tickets, err).
+
+    `comment_scope` narrows the change to one signal channel: only positions
+    whose MT5 comment starts with it are touched, which is how a "TP set @ X"
+    from one channel avoids moving another channel's trades. startswith (not
+    equality) because the pending->market fallback tags its comment "<c>_M".
+    An empty scope means every shim-owned position of that type -- callers
+    that mean "one channel" must always pass one.
+
+    A field left at 0 is carried over from the position rather than sent as 0:
+    MT5 reads 0 as "remove this level", so a TP-only amendment must re-send
+    the existing SL or it would silently strip the stop loss."""
+    changed = []
+    for p in mt5.positions_get(symbol=symbol) or []:
+        if p.magic != MAGIC or p.type != pos_type:
+            continue
+        if comment_scope and not (p.comment or "").startswith(comment_scope):
+            continue
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "position": p.ticket,
+            "sl": sl if sl > 0 else p.sl,
+            "tp": tp if tp > 0 else p.tp,
+            "magic": MAGIC,
+        }
+        res = mt5.order_send(req)
+        if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
+            return (
+                changed,
+                f"modify {p.ticket} failed: {res.retcode if res else mt5.last_error()}",
+            )
+        changed.append(str(p.ticket))
+    return changed, None
+
+
 # pending command -> (pending order type, market fallback order type)
 _PENDING_TYPES = {
     "buylimit": ("ORDER_TYPE_BUY_LIMIT", "ORDER_TYPE_BUY"),
@@ -474,6 +512,22 @@ def execute(trace_id, command, symbol, params):
             return "filled", ",".join(orders), err, volume
         res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment, sl, tp)
         return "filled", ",".join(orders + ([str(res.order)] if res else [])), err, volume
+    if cmd in ("newsltplong", "newsltpshort"):
+        if tp <= 0 and sl <= 0:
+            return "rejected", "", "newsltp requires sl and/or tp", volume
+        ptype = mt5.POSITION_TYPE_BUY if cmd == "newsltplong" else mt5.POSITION_TYPE_SELL
+        scope = params.get("comment") or ""
+        tickets, err = modify_positions_sltp(symbol, ptype, tp, sl, scope)
+        if err:
+            return "rejected", ",".join(tickets), err, volume
+        if not tickets:
+            # Nothing of this side/scope is open. Expected: amendments are
+            # sent for both sides because the message never says which way
+            # the running trades face.
+            log(f"{cmd} {symbol}: no open positions matching scope {scope!r} -- no-op")
+            return "filled", "", None, volume
+        log(f"{cmd} {symbol}: set tp={tp:g} on {len(tickets)} position(s) scope={scope!r}")
+        return "filled", ",".join(tickets), None, volume
     return "rejected", "", f"unknown command {command}", volume
 
 

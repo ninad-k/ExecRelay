@@ -589,7 +589,53 @@ void ExecuteSignal(const string traceID, const string cmd,
     }
     if(cmd == "cancel") { CancelPending(traceID, sym); return; }
 
+    if(cmd == "newsltplong" || cmd == "newsltpshort")
+    {
+        if(sl == 0.0 && tp == 0.0)
+        {
+            SendFill(traceID, "rejected", "", "PARAM_MISSING", "newsltp requires sl and/or tp");
+            return;
+        }
+        ENUM_POSITION_TYPE want = (cmd == "newsltplong") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+        // Scope on the RAW comment, not cmt: cmt defaults to "ExecRelay" when
+        // absent, and an absent scope must mean "every position of this side",
+        // not "positions literally commented ExecRelay".
+        ModifySLTP(traceID, sym, want, sl, tp, JGetStr(params, "comment"));
+        return;
+    }
+
     SendFill(traceID, "rejected", "", "UNKNOWN_CMD", "unhandled command: " + cmd);
+}
+
+// Amend SL/TP on open positions, optionally narrowed to one signal channel by
+// comment prefix -- a "TP set @ X" posted by one channel must never move
+// another channel's trades. Prefix rather than equality because the
+// pending->market fallback tags its comment "<c>_M".
+//
+// A level passed as 0 is carried over from the position rather than sent on:
+// MT5 reads 0 as "remove this level", so a TP-only amendment that forwarded
+// the 0 would silently strip the stop loss off a live trade.
+void ModifySLTP(const string traceID, const string sym, const ENUM_POSITION_TYPE want,
+                const double newSL, const double newTP, const string scope)
+{
+    int changed = 0, errors = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+        if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+        if(PositionGetInteger(POSITION_MAGIC)  != InpMagicNumber) continue;
+        if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != want) continue;
+        if(scope != "" && StringFind(PositionGetString(POSITION_COMMENT), scope) != 0) continue;
+
+        double useSL = (newSL > 0.0) ? newSL : PositionGetDouble(POSITION_SL);
+        double useTP = (newTP > 0.0) ? newTP : PositionGetDouble(POSITION_TP);
+        if(g_trade.PositionModify(ticket, useSL, useTP)) changed++;
+        else errors++;
+    }
+    string status = (errors == 0) ? "filled" : "error";
+    SendFill(traceID, status, "", "",
+             "modified=" + IntegerToString(changed) + " errors=" + IntegerToString(errors));
 }
 
 void ClosePositions(const string traceID, const string sym, const string cmd)

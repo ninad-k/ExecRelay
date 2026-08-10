@@ -935,6 +935,109 @@ def is_channel_enabled(channel_name: str | None) -> bool:
     return bool(rows[0].get("enabled"))
 
 
+def recent_symbols_for_channel(channel_name: str | None, days: int = 7) -> list[str]:
+    """Distinct symbols this channel has actually traded in the last `days`.
+
+    Follow-up messages ("TP set @ 4346 for both trade") name a new price but no
+    instrument, so the instrument has to come from what the channel already has
+    working. Ordered most-recently-traded first; empty list on any failure,
+    which callers must treat as "address nothing" rather than "address
+    everything"."""
+    if not channel_name:
+        rows = query(
+            "SELECT symbol, MAX(ts) AS last_ts FROM signals "
+            "WHERE channel IS NULL AND outcome IN ('posted', 'dry_run') "
+            "AND symbol IS NOT NULL AND symbol != '' AND ts >= ? "
+            "GROUP BY symbol ORDER BY last_ts DESC",
+            ((datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),),
+        )
+    else:
+        rows = query(
+            "SELECT symbol, MAX(ts) AS last_ts FROM signals "
+            "WHERE channel = ? COLLATE NOCASE AND outcome IN ('posted', 'dry_run') "
+            "AND symbol IS NOT NULL AND symbol != '' AND ts >= ? "
+            "GROUP BY symbol ORDER BY last_ts DESC",
+            (channel_name, (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()),
+        )
+    return [str(r["symbol"]) for r in rows if r.get("symbol")]
+
+
+# ---------------------------------------------------------------------------
+# Runtime settings -- operator switches that must take effect without a stack
+# restart. Stored in the `meta` kv table, so there is no schema change here:
+# `meta` predates schema v1 and a new key is a row, not a migration.
+#
+# Currently just the dry-run kill switch: the dashboard writes it, and
+# telegram-ingest re-reads it on its hot path (cached ~10s) instead of
+# trusting the TELEGRAM_INGEST_DRY_RUN value it booted with.
+# ---------------------------------------------------------------------------
+
+_DRY_RUN_KEY = "dry_run"
+_DRY_RUN_TS_KEY = "dry_run_updated_ts"
+
+_TRUEISH = ("1", "true", "yes", "on")
+_FALSEISH = ("0", "false", "no", "off")
+
+
+def get_dry_run(default: bool) -> bool:
+    """Effective dry-run state: the operator's stored override if one has ever
+    been set, otherwise `default` (the caller's TELEGRAM_INGEST_DRY_RUN value).
+
+    Fail-SAFE, deliberately unlike is_channel_enabled()'s fail-open: any store
+    problem (missing row, unreadable DB, junk value) falls back to `default`,
+    and that env default is itself `true`. A broken store can therefore only
+    ever leave the stack in dry-run -- never silently put it live."""
+    rows = query("SELECT value FROM meta WHERE key=?", (_DRY_RUN_KEY,))
+    if not rows:
+        return default
+    val = str(rows[0].get("value") or "").strip().lower()
+    if val in _TRUEISH:
+        return True
+    if val in _FALSEISH:
+        return False
+    return default
+
+
+def get_dry_run_meta(default: bool) -> dict:
+    """get_dry_run() plus provenance for the dashboard: whether the effective
+    value came from a stored override or the env default, and when the
+    operator last changed it."""
+    rows = query("SELECT value FROM meta WHERE key=?", (_DRY_RUN_KEY,))
+    ts_rows = query("SELECT value FROM meta WHERE key=?", (_DRY_RUN_TS_KEY,))
+    return {
+        "dry_run": get_dry_run(default),
+        "source": "override" if rows else "env",
+        "updated_ts": (ts_rows[0].get("value") if ts_rows else None),
+    }
+
+
+def set_dry_run(enabled: bool) -> None:
+    """Persist the operator's dry-run choice. Takes effect on telegram-ingest's
+    next cache expiry (~10s) -- no restart, same as a channel toggle."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        conn.executemany(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                (_DRY_RUN_KEY, "1" if enabled else "0"),
+                (_DRY_RUN_TS_KEY, _utcnow_iso()),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"set_dry_run failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # tg_dialogs -- forwarder-populated cache backing the dashboard's "add
 # channel" picker. Written only by telegram_user_forwarder.py (it's the only
