@@ -81,8 +81,11 @@ _ALLOWED_CHAT_IDS = [
 MGMT_CHAT_ID = (os.environ.get("MGMT_CHAT_ID") or "").strip() or (_ALLOWED_CHAT_IDS[0] if _ALLOWED_CHAT_IDS else "")
 MGMT_DIGEST_TIME = (os.environ.get("MGMT_DIGEST_TIME", "20:00") or "").strip()
 MGMT_DIGEST_WEEKLY_DAY = (os.environ.get("MGMT_DIGEST_WEEKLY_DAY", "Mon") or "Mon").strip()
-MGMT_ALERT_DAILY_LOSS_USD = float(os.environ.get("MGMT_ALERT_DAILY_LOSS_USD", "500") or 0)
-MGMT_ALERT_DRAWDOWN_PCT = float(os.environ.get("MGMT_ALERT_DRAWDOWN_PCT", "10") or 0)
+# Loss/drawdown alerts are OFF by default (owner's call, 2026-08-10): they are
+# account-wide, so unrelated EAs trading the same terminal kept tripping them.
+# Set a positive threshold in .env to re-enable either one.
+MGMT_ALERT_DAILY_LOSS_USD = float(os.environ.get("MGMT_ALERT_DAILY_LOSS_USD", "0") or 0)
+MGMT_ALERT_DRAWDOWN_PCT = float(os.environ.get("MGMT_ALERT_DRAWDOWN_PCT", "0") or 0)
 _TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_INGEST_BOT_TOKEN") or "").strip()
 
 _ALERT_COOLDOWN_SEC = 6 * 3600
