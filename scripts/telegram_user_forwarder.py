@@ -42,6 +42,7 @@ import asyncio
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -49,6 +50,11 @@ try:
 except ImportError:  # pragma: no cover
     print("telethon is required: pip install telethon", file=sys.stderr)
     sys.exit(2)
+
+# Same directory as _tradestore.py, so a plain import resolves it without
+# any sys.path surgery (unlike apps/telegram-ingest/app.py, which lives
+# elsewhere and inserts scripts/ explicitly).
+import _tradestore as ts
 
 
 def _load_dotenv() -> None:
@@ -127,6 +133,123 @@ async def _resolve_all(c: TelegramClient, spec: str, label: str) -> list[tuple[i
         log(f"{label}: {part!r} -> {hit[1]} ({hit[0]})")
         out.append(hit)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Channel registry -- source of truth for WHICH channels are watched, so the
+# dashboard's enable/disable toggle and "add channel" form take effect
+# without restarting this process. See scripts/_tradestore.py `channels`
+# table + docs/... The registry is polled every _ENABLED_REFRESH_SEC by
+# cmd_run's background task; this module is the only writer of tg_dialogs
+# and the only resolver of pending (non-numeric) channel specs, since it's
+# the only process holding a Telethon session.
+# ---------------------------------------------------------------------------
+
+_ENABLED_REFRESH_SEC = 30
+_DIALOG_REFRESH_SEC = 600
+_HEARTBEAT_SEC = 30
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_channel_rows() -> list[dict] | None:
+    """Read every row of the `channels` table. Returns None specifically
+    when the store itself is unreachable (get_conn() failed) -- distinct
+    from a reachable store legitimately returning zero rows -- so callers
+    can tell "SQLite hiccup" apart from "operator disabled everything"."""
+    conn = ts.get_conn()
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT chat_id, title, spec, enabled, note FROM channels"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        log(f"channel registry read failed: {exc!r}")
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+async def refresh_enabled_channels(
+    c: TelegramClient | None, last_good: list[dict]
+) -> list[dict]:
+    """Compute the current watch set: [{"chat_id": int, "title": str}, ...]
+    for every ENABLED, Telethon-watchable channel row (the 'direct'
+    pseudo-channel is never watchable here -- it means "no [SRC:] tag", not
+    a chat this account listens to).
+
+    Resolution: a row whose chat_id isn't purely numeric is "pending" (added
+    via free-text spec, e.g. from the dashboard, or seeded from a title-
+    fragment TG_FORWARDER_SOURCE_CHAT entry); a row missing its title only
+    needs a title backfill. Both are resolved here via Telethon (`c`) and
+    written back to the store (resolve_channel / mark_channel_resolution_error)
+    so the dashboard can show real titles and clear the "resolving..." state.
+    When `c` is None (used by the offline unit test, or if called before the
+    client is ready) pending/title-less rows are skipped rather than guessed.
+
+    Fallback contract: returns `last_good` unchanged if the store is
+    unreachable -- a SQLite hiccup must mean "keep relaying whatever we were
+    already relaying", never "relay nothing" and never "relay everything".
+    """
+    rows = load_channel_rows()
+    if rows is None:
+        log("channel registry unreachable; keeping last known-good channel set")
+        return last_good
+
+    resolved: list[dict] = []
+    for row in rows:
+        if not row.get("enabled"):
+            continue
+        chat_id = str(row.get("chat_id") or "")
+        if chat_id == "direct" or not chat_id:
+            continue  # not a Telethon chat -- represents "no [SRC:] tag"
+        title = (row.get("title") or "").strip()
+        is_numeric = chat_id.lstrip("-").isdigit()
+
+        if is_numeric and title:
+            resolved.append({"chat_id": int(chat_id), "title": title})
+            continue
+
+        if c is None:
+            continue  # can't resolve right now; drop until a real refresh can
+
+        spec = row.get("spec") or chat_id
+        hit = await _resolve(c, spec)
+        if hit is None:
+            log(f"channel registry: could not resolve {spec!r} — are you subscribed to it?")
+            ts.mark_channel_resolution_error(
+                chat_id, f"could not resolve {spec!r} — not subscribed, or the channel/spec is wrong"
+            )
+            continue
+        new_id, new_title = hit
+        ts.resolve_channel(pending_chat_id=chat_id, resolved_chat_id=str(new_id), resolved_title=new_title)
+        log(f"channel registry: resolved {spec!r} -> {new_title} ({new_id})")
+        resolved.append({"chat_id": int(new_id), "title": new_title})
+
+    return resolved
+
+
+async def _refresh_tg_dialogs(c: TelegramClient) -> None:
+    """Repopulate tg_dialogs from the account's current dialog list, so the
+    dashboard's "add channel" picker offers real titles/ids. Best-effort:
+    Telethon errors are logged, not raised (this must never take the relay
+    loop down)."""
+    try:
+        dialogs: list[tuple[str, str, str]] = []
+        async for d in c.iter_dialogs():
+            kind = "channel" if d.is_channel else "group" if d.is_group else "user"
+            dialogs.append((str(d.id), d.name or "", kind))
+        ts.replace_tg_dialogs(dialogs)
+        log(f"tg_dialogs refreshed: {len(dialogs)} dialog(s)")
+    except Exception as exc:  # noqa: BLE001
+        log(f"tg_dialogs refresh failed: {exc!r}")
 
 
 # Held for the process lifetime; the OS releases it when we exit (even on a
@@ -272,9 +395,14 @@ async def cmd_run() -> None:
     c = client()
     await connect_authorized(c)
 
-    sources = await _resolve_all(c, SOURCE_CHAT, "source")
+    # Resolved once at startup from the env list -- this is the fallback
+    # baseline used whenever the channel-registry store is unreachable, so a
+    # SQLite hiccup can never mean "relay nothing" (nor "relay everything").
+    # It is NOT what decides what's watched during normal operation once the
+    # store is reachable; see refresh_enabled_channels().
+    env_sources = await _resolve_all(c, SOURCE_CHAT, "source")
     targets = await _resolve_all(c, TARGET_CHAT, "target")
-    if not sources or not targets:
+    if not env_sources or not targets:
         print("nothing to relay: source or target did not resolve", file=sys.stderr)
         await c.disconnect()
         sys.exit(1)
@@ -284,10 +412,17 @@ async def cmd_run() -> None:
         sys.exit(2)
     target = targets[0][0]
 
-    names_by_id = {cid: name for cid, name in sources}
+    last_good: list[dict] = [{"chat_id": cid, "title": name} for cid, name in env_sources]
+    # Resolve pending/title-less registry rows synchronously before we start
+    # "watching" so the very first relayed message already carries the right
+    # [SRC:<title>] tag -- no behavior change vs. the old fixed-list startup.
+    watch_list = await refresh_enabled_channels(c, last_good)
+    watched: dict[int, str] = {row["chat_id"]: row["title"] for row in watch_list}
 
-    @c.on(events.NewMessage(chats=[cid for cid, _ in sources]))
+    @c.on(events.NewMessage())
     async def _on_message(event) -> None:
+        if event.chat_id not in watched:
+            return  # not in the current enabled set -- registry-filtered
         text = event.message.message or ""
         if not text.strip():
             return  # media-only posts carry nothing the parser can use
@@ -295,13 +430,42 @@ async def cmd_run() -> None:
         # the trade comment (and notifications) with where it came from —
         # the bot otherwise only ever sees this relay chat, never the
         # source channel itself.
-        name = names_by_id.get(event.chat_id, "")
+        name = watched.get(event.chat_id, "")
         tagged = f"[SRC:{name}]\n{text}" if name else text
         await c.send_message(target, tagged)
         log(f"relayed message {event.message.id}: {text[:60].replace(chr(10), ' / ')}")
 
-    names = ", ".join(f"{name} ({cid})" for cid, name in sources)
-    log(f"watching {names}, relaying text posts to {targets[0][1]} — Ctrl+C to stop")
+    async def _enabled_refresh_loop() -> None:
+        nonlocal watched, watch_list
+        while True:
+            await asyncio.sleep(_ENABLED_REFRESH_SEC)
+            try:
+                watch_list = await refresh_enabled_channels(c, watch_list)
+                watched = {row["chat_id"]: row["title"] for row in watch_list}
+            except Exception as exc:  # noqa: BLE001 - background task must never die
+                log(f"enabled-channel refresh failed: {exc!r}")
+
+    async def _dialog_refresh_loop() -> None:
+        while True:
+            await _refresh_tg_dialogs(c)
+            await asyncio.sleep(_DIALOG_REFRESH_SEC)
+
+    async def _heartbeat_loop() -> None:
+        while True:
+            try:
+                ts.meta_set("hb_forwarder", _utcnow_iso())
+                ts.meta_set("hb_forwarder_channels", str(len(watched)))
+            except Exception as exc:  # noqa: BLE001
+                log(f"heartbeat write failed: {exc!r}")
+            await asyncio.sleep(_HEARTBEAT_SEC)
+
+    names = ", ".join(f"{name} ({cid})" for cid, name in watched.items())
+    log(f"watching {len(watched)} channel(s) [{names}], relaying text posts to {targets[0][1]} — Ctrl+C to stop")
+    log("channel registry now controls the watch set: enable/disable/add/remove from the dashboard takes effect within ~60s, no restart needed")
+
+    asyncio.create_task(_enabled_refresh_loop())
+    asyncio.create_task(_dialog_refresh_loop())
+    asyncio.create_task(_heartbeat_loop())
     await c.run_until_disconnected()
 
 

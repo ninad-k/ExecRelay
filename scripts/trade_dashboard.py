@@ -91,6 +91,22 @@ _TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_INGEST_BOT_TOKEN") or "").strip(
 _ALERT_COOLDOWN_SEC = 6 * 3600
 _MGMT_LOOP_SEC = 60
 
+# ---------------------------------------------------------------------------
+# Pipeline status ("is anything broken") -- see pipeline_status() below.
+# Inherited from the same .env the rest of the stack sees (local-stack.ps1
+# imports it into the process before spawning every service, including this
+# one), so this mirrors telegram-ingest's own DRY_RUN flag without needing
+# an RPC to ask it.
+# ---------------------------------------------------------------------------
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return (os.environ.get(name, default) or "").strip().lower() in ("true", "1", "yes", "on")
+
+
+INGEST_DRY_RUN = _env_bool("TELEGRAM_INGEST_DRY_RUN", "true")
+_HB_STALE_AFTER_SEC = 90.0
+
 
 def _allowed_hosts() -> set[str]:
     _, _, port = ADDR.rpartition(":")
@@ -1184,6 +1200,252 @@ def _meta_set(key: str, value: str) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Pipeline status -- "is anything broken" panel (/api/pipeline). Pulls
+# together heartbeats written by the forwarder/ea_shim (meta table, so a
+# hung-but-alive process can't masquerade as healthy the way pid-liveness
+# does) with live HTTP health checks of the Go services and this stack's own
+# channel registry. Every read here is either the existing no-throw
+# ts.query()/​_meta_get, or a short-timeout HTTP probe that never raises.
+# ---------------------------------------------------------------------------
+
+
+def _hb_age_sec(key: str) -> float | None:
+    """Seconds since the given meta heartbeat key was last written, or None
+    if it's missing/unparseable (treated as "down" by callers)."""
+    raw = _meta_get(key)
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
+
+
+def _http_probe(url: str, timeout: float = 1.5) -> tuple[int | None, dict | None]:
+    """GET url. Returns (status, parsed-json-body-or-None); status is None
+    when the endpoint is unreachable (refused/timed out/DNS failure) --
+    never raises."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read()
+    except Exception:
+        return None, None
+    try:
+        body = json.loads(raw.decode())
+    except Exception:
+        body = None
+    return status, body
+
+
+def pipeline_status() -> dict:
+    """One component per link in the signal -> MT5-order chain, each
+    {name, state: ok|warn|down, detail}, plus an overall verdict. See the
+    build-out plan's "Overall verdict" rule: RED whenever a signal posted
+    right now would NOT reach MT5 (any blocking component down, dry-run on,
+    or zero channels enabled); AMBER for non-blocking degradation; GREEN
+    only when it would actually reach MT5."""
+    components: list[dict] = []
+
+    fwd_age = _hb_age_sec("hb_forwarder")
+    fwd_channels = _meta_get("hb_forwarder_channels") or "?"
+    if fwd_age is not None and fwd_age < _HB_STALE_AFTER_SEC:
+        components.append({
+            "name": "forwarder", "state": "ok",
+            "detail": f"watching {fwd_channels} channel(s) · heartbeat {int(fwd_age)}s ago",
+        })
+    else:
+        components.append({
+            "name": "forwarder", "state": "down",
+            "detail": "not relaying — signals never reach the bot",
+        })
+
+    status, body = _http_probe("http://127.0.0.1:8089/readyz")
+    if status == 200:
+        components.append({"name": "telegram-ingest", "state": "ok", "detail": "polling Telegram"})
+    elif status == 503:
+        components.append({
+            "name": "telegram-ingest", "state": "warn",
+            "detail": (body or {}).get("detail") or "not ready",
+        })
+    else:
+        components.append({"name": "telegram-ingest", "state": "down", "detail": "unreachable (127.0.0.1:8089)"})
+
+    status, _ = _http_probe("http://127.0.0.1:8081/health")
+    components.append({
+        "name": "ingress", "state": "ok" if status == 200 else "down",
+        "detail": "healthy" if status == 200 else "unreachable (127.0.0.1:8081)",
+    })
+
+    status, _ = _http_probe("http://127.0.0.1:8082/health")
+    components.append({
+        "name": "bridge", "state": "ok" if status == 200 else "down",
+        "detail": "healthy" if status == 200 else "unreachable (127.0.0.1:8082)",
+    })
+
+    ea_age = _hb_age_sec("hb_ea_shim")
+    ea_state_raw = _meta_get("hb_ea_shim_state")
+    try:
+        ea_state = json.loads(ea_state_raw) if ea_state_raw else {}
+    except json.JSONDecodeError:
+        ea_state = {}
+    ea_fresh = ea_age is not None and ea_age < _HB_STALE_AFTER_SEC
+    ea_mt5_ok = bool(ea_state.get("mt5"))
+    if ea_fresh and ea_mt5_ok:
+        components.append({"name": "ea-shim", "state": "ok", "detail": f"heartbeat {int(ea_age)}s ago"})
+    else:
+        components.append({
+            "name": "ea-shim", "state": "down",
+            "detail": "orders would be accepted but never executed",
+        })
+
+    if ea_fresh and ea_mt5_ok:
+        account = ea_state.get("account")
+        demo = ea_state.get("demo")
+        components.append({
+            "name": "mt5", "state": "ok",
+            "detail": f"account {account}" + (" (DEMO)" if demo else " (LIVE)"),
+            "account": account, "demo": bool(demo) if demo is not None else None,
+        })
+    else:
+        components.append({
+            "name": "mt5", "state": "down",
+            "detail": "unknown — ea-shim heartbeat stale or missing",
+            "account": None, "demo": None,
+        })
+
+    if INGEST_DRY_RUN:
+        components.append({
+            "name": "dry-run", "state": "warn",
+            "detail": "signals are parsed but NOT sent to the broker",
+        })
+    else:
+        components.append({"name": "dry-run", "state": "ok", "detail": "live — signals are sent to the broker"})
+
+    chans = ts.list_channels()
+    enabled_n = sum(1 for c in chans if c.get("enabled"))
+    total_n = len(chans)
+    components.append({
+        "name": "channels",
+        "state": "warn" if enabled_n == 0 else "ok",
+        "detail": (f"{enabled_n}/{total_n} enabled" if total_n else "no channels registered")
+                  + ("" if enabled_n else " — no channels are being processed"),
+        "enabled": enabled_n, "total": total_n,
+    })
+
+    by_name = {c["name"]: c for c in components}
+    blocking = ("forwarder", "telegram-ingest", "ingress", "bridge", "ea-shim", "mt5")
+    reasons = [f"{name} down" for name in blocking if by_name[name]["state"] == "down"]
+    if INGEST_DRY_RUN:
+        reasons.append("dry-run is on")
+    if enabled_n == 0:
+        reasons.append("0 channels enabled")
+
+    if reasons:
+        verdict, headline = "red", "SIGNALS NOT REACHING MT5"
+    else:
+        amber_reasons = []
+        if by_name["telegram-ingest"]["state"] == "warn":
+            amber_reasons.append("telegram-ingest degraded")
+        if total_n > enabled_n:
+            amber_reasons.append(f"{total_n - enabled_n} channel(s) disabled")
+        if amber_reasons:
+            verdict, headline, reasons = "amber", "SIGNALS REACHING MT5 (degraded)", amber_reasons
+        else:
+            verdict, headline = "green", "SIGNALS REACHING MT5"
+
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "reasons": reasons,
+        "components": components,
+        "updated": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Channel manager -- backs the "Signal channels" section + /api/channels*
+# routes. All writes go through _tradestore's no-throw channel helpers.
+# ---------------------------------------------------------------------------
+
+
+def channels_snapshot() -> dict:
+    channels = ts.list_channels()
+    # Signal sources are channels/groups; the account's ~90 private chats
+    # (many with no title at all) would bury them in the picker. Free-text
+    # entry remains available for anything not listed.
+    dialogs = [
+        d
+        for d in ts.list_tg_dialogs()
+        if (d.get("kind") in ("channel", "group")) and (d.get("title") or "").strip()
+    ]
+    dialogs.sort(key=lambda d: (d.get("title") or "").lower())
+
+    cutoff = _cutoff_iso(30)
+    sig_rows = ts.query(
+        "SELECT channel, COUNT(*) AS n, MAX(ts) AS last_ts FROM signals "
+        "WHERE ts >= ? AND channel IS NOT NULL AND channel != '' GROUP BY channel",
+        (cutoff,),
+    )
+    sig_by_channel = {r["channel"]: r for r in sig_rows}
+    direct_rows = ts.query(
+        "SELECT COUNT(*) AS n, MAX(ts) AS last_ts FROM signals "
+        "WHERE ts >= ? AND (channel IS NULL OR channel = '')",
+        (cutoff,),
+    )
+    direct_n = direct_rows[0]["n"] if direct_rows else 0
+    direct_last = direct_rows[0]["last_ts"] if direct_rows else None
+
+    registered_titles = {
+        (c.get("title") or "").strip().lower()
+        for c in channels
+        if c.get("chat_id") != "direct" and c.get("title")
+    }
+    for c in channels:
+        if c.get("chat_id") == "direct":
+            c["signals_30d"], c["last_signal"] = direct_n, direct_last
+        else:
+            s = sig_by_channel.get(c.get("title"))
+            c["signals_30d"] = s["n"] if s else 0
+            c["last_signal"] = s["last_ts"] if s else None
+        chat_id = str(c.get("chat_id") or "")
+        c["pending_resolution"] = chat_id != "direct" and not chat_id.lstrip("-").isdigit()
+
+    unregistered = [
+        {"channel": r["channel"], "signals_30d": r["n"], "last_signal": r["last_ts"]}
+        for r in sig_rows
+        if (r.get("channel") or "").strip().lower() not in registered_titles
+    ]
+    return {"channels": channels, "dialogs": dialogs, "unregistered": unregistered}
+
+
+def add_channel(payload: dict) -> dict:
+    """Add/upsert a channel row. `spec` is whatever the operator gave us --
+    a numeric id (from the dialog picker or typed directly), 'direct', or
+    free text (username/title fragment) the dashboard itself can't resolve
+    (no Telethon session here). A non-numeric spec is stored keyed by the
+    spec text itself and picked up by the forwarder's next registry refresh
+    (see telegram_user_forwarder.refresh_enabled_channels), which resolves
+    it to a real id/title or stamps a "could not resolve" note."""
+    spec = str(payload.get("spec") or "").strip()
+    if not spec:
+        raise ValueError("spec is required")
+    title = str(payload.get("title") or "").strip() or None
+    note = payload.get("note")
+    note = str(note).strip()[:300] or None if note else None
+    chat_id = spec
+    ts.upsert_channel(chat_id=chat_id, title=title, spec=spec, enabled=1, note=note)
+    pending = chat_id != "direct" and not chat_id.lstrip("-").isdigit()
+    return {"chat_id": chat_id, "title": title, "pending_resolution": pending}
+
+
 # --- background thread: daily/weekly digest + loss/drawdown alerts ------
 
 
@@ -1619,6 +1881,37 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .cal-cell.loss { background: var(--color-loss-dim); border-color: color-mix(in srgb, var(--color-loss) 35%, var(--color-border)); }
 .cal-cell .d { color: var(--color-text-muted); font-size: 0.68rem; }
 .cal-cell .amt { font-weight: 600; margin-top: 0.15rem; }
+
+.pipeline-banner { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; padding: 0.75rem 1.5rem; border-bottom: 1px solid var(--color-border); background: color-mix(in srgb, var(--color-surface) 92%, transparent); }
+.pipeline-pill { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 0.85rem; letter-spacing: 0.02em; padding: 0.5rem 1.15rem; border-radius: 999px; white-space: nowrap; }
+.pipeline-pill.green { background: var(--color-profit-dim); color: var(--color-profit); border: 1px solid color-mix(in srgb, var(--color-profit) 40%, transparent); }
+.pipeline-pill.amber { background: rgb(255 181 46 / 0.16); color: var(--color-warning); border: 1px solid color-mix(in srgb, var(--color-warning) 45%, transparent); }
+.pipeline-pill.red { background: var(--color-loss-dim); color: var(--color-loss); border: 1px solid color-mix(in srgb, var(--color-loss) 55%, transparent); animation: pipeline-pulse-red 2s ease-in-out infinite; }
+@keyframes pipeline-pulse-red { 0%, 100% { box-shadow: 0 0 8px color-mix(in srgb, var(--color-loss) 25%, transparent); } 50% { box-shadow: 0 0 22px color-mix(in srgb, var(--color-loss) 60%, transparent); } }
+.pipeline-chips { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.pipeline-chip { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.72rem; padding: 0.28rem 0.7rem; border-radius: 999px; border: 1px solid var(--color-border-light); }
+.pipeline-chip .dot { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: currentColor; flex-shrink: 0; }
+.pipeline-chip.ok { color: var(--color-profit); }
+.pipeline-chip.warn { color: var(--color-warning); }
+.pipeline-chip.down { color: var(--color-loss); }
+.badge.live { background: color-mix(in srgb, var(--color-gold) 22%, transparent); color: var(--color-gold); font-weight: 700; }
+.badge.demo { background: var(--color-surface-2); color: var(--color-text-dim); }
+
+.toggle-switch { position: relative; display: inline-block; width: 2.2rem; height: 1.25rem; vertical-align: middle; }
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-slider { position: absolute; inset: 0; background: var(--color-border-light); border-radius: 999px; cursor: pointer; transition: background .15s; }
+.toggle-slider:before { content: ""; position: absolute; width: 0.95rem; height: 0.95rem; left: 0.15rem; top: 0.15rem; background: #fff; border-radius: 50%; transition: transform .15s; }
+.toggle-switch input:checked + .toggle-slider { background: var(--color-profit); }
+.toggle-switch input:checked + .toggle-slider:before { transform: translateX(0.95rem); }
+.toggle-switch input:disabled + .toggle-slider { opacity: 0.5; cursor: default; }
+
+.addchannel-form { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end; margin-bottom: 1rem; }
+.addchannel-form > div { display: flex; flex-direction: column; }
+.addchannel-form label { font-size: 0.66rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.3rem; }
+.addchannel-form input, .addchannel-form select { background: var(--color-background); color: var(--color-text); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 0.42rem 0.6rem; font-size: 0.8rem; font-family: inherit; min-width: 14rem; }
+.addchannel-form .hint { font-size: 0.7rem; color: var(--color-warning); align-self: center; }
+.unregistered-row { border-left: 3px solid var(--color-warning); }
+.btn-danger { background: linear-gradient(135deg, var(--color-loss), #a4152b); color: #fff; border: 0; border-radius: var(--radius-sm); padding: 0.45rem 1.1rem; font-weight: 600; font-size: 0.8rem; cursor: pointer; }
 </style></head><body>
 <div class="topbar">
 <header>
@@ -1652,8 +1945,32 @@ button.jbtn:hover { background: var(--color-primary-glow); }
   <button id="theme-toggle" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">&#9789;</button>
 </div>
 </div>
+<div class="pipeline-banner">
+  <div class="pipeline-pill" id="pipeline-pill">checking pipeline…</div>
+  <div class="pipeline-chips" id="pipeline-chips"></div>
+</div>
 <main>
   <div class="cards" id="cards"></div>
+
+  <h2>Signal channels <span class="chip" id="chip-channels"></span></h2>
+  <div id="unregistered-warnings" class="review-strip"></div>
+  <form class="addchannel-form" id="add-channel-form">
+    <div>
+      <label>From known dialogs</label>
+      <select id="ch-dialog-select"><option value="">— pick a dialog —</option></select>
+    </div>
+    <div>
+      <label>Or free text (id / @username / title fragment)</label>
+      <input type="text" id="ch-spec-input" placeholder="e.g. -1001234567890, @channel, or a title fragment">
+    </div>
+    <div>
+      <label>Note (optional)</label>
+      <input type="text" id="ch-note-input" placeholder="optional">
+    </div>
+    <button class="btn-primary" type="submit">Add channel</button>
+    <span class="hint" id="ch-dialogs-hint"></span>
+  </form>
+  <div class="tablewrap"><table id="tbl-channels"></table></div>
 
   <h2>Performance</h2>
   <div class="grid2">
@@ -1736,6 +2053,18 @@ button.jbtn:hover { background: var(--color-primary-glow); }
   </div>
 </div></div>
 
+<div id="ch-delete-scrim" style="position:fixed;inset:0;background:rgb(0 0 0 / 0.55);display:none;align-items:center;justify-content:center;z-index:50">
+  <div style="width:min(440px,92vw);background:linear-gradient(180deg,var(--color-surface-2),var(--color-surface));border:1px solid var(--color-border-light);border-radius:var(--radius-lg);padding:1.5rem">
+    <h3 style="margin:0 0 .75rem;font-size:0.95rem">Remove channel from registry?</h3>
+    <p class="muted" style="font-size:0.82rem;margin:0 0 .5rem">This only removes the channel from the registry — it does <b>not</b> delete any recorded signal or order history, and it can be re-added later.</p>
+    <p style="font-size:0.85rem;font-weight:600" id="ch-delete-name"></p>
+    <div class="modal-actions">
+      <button class="btn-ghost" type="button" id="ch-delete-cancel">Cancel</button>
+      <button class="btn-danger" type="button" id="ch-delete-confirm">Remove</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const money = (v, c) => (v >= 0 ? "+" : "\u2212") + "$" + Math.abs(v).toFixed(2);
@@ -1809,8 +2138,140 @@ function table(id, header, rows, footer) {
 }
 
 async function refresh() {
-  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar()]);
+  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshChannels()]);
 }
+
+// --- pipeline status banner --------------------------------------------
+
+function pipelineChip(c) {
+  const stateCls = c.state === "ok" ? "ok" : (c.state === "warn" ? "warn" : "down");
+  let extra = "";
+  if (c.name === "mt5" && c.account) {
+    extra = ` <span class="badge ${c.demo ? "demo" : "live"}">${c.demo ? "DEMO" : "LIVE"}</span> #${esc(c.account)}`;
+  }
+  return `<span class="pipeline-chip ${stateCls}" title="${esc(c.detail || "")}"><span class="dot"></span>${esc(c.name)}${extra}</span>`;
+}
+
+async function refreshPipeline() {
+  try {
+    const res = await fetch(withToken("/api/pipeline"), { headers: authHeaders() });
+    if (!res.ok) return;
+    const p = await res.json();
+    const pill = $("pipeline-pill");
+    pill.className = "pipeline-pill " + p.verdict;
+    pill.textContent = p.headline + (p.reasons && p.reasons.length ? " — " + p.reasons.join("; ") : "");
+    $("pipeline-chips").innerHTML = p.components.map(pipelineChip).join("");
+  } catch (e) {}
+}
+
+// --- channel manager -----------------------------------------------------
+
+function channelStatusBadge(c) {
+  if (!c.pending_resolution) return "";
+  return c.note
+    ? ` <span class="badge bad" title="${esc(c.note)}">could not resolve</span>`
+    : ` <span class="badge neutral">resolving…</span>`;
+}
+
+function channelRow(c) {
+  const label = esc(c.title || c.spec || c.chat_id);
+  const isDirect = c.chat_id === "direct";
+  return `<tr>
+    <td>${label}${channelStatusBadge(c)}</td>
+    <td class="muted number">${esc(c.chat_id)}</td>
+    <td><label class="toggle-switch"><input type="checkbox" class="ch-toggle" data-chat-id="${esc(c.chat_id)}" ${c.enabled ? "checked" : ""}><span class="toggle-slider"></span></label></td>
+    <td class="number">${c.signals_30d || 0}</td>
+    <td class="muted number">${esc((c.last_signal || "").slice(0, 19).replace("T", " ")) || "—"}</td>
+    <td class="muted" style="white-space:normal;max-width:220px">${!c.pending_resolution ? esc(c.note || "") : ""}</td>
+    <td>${isDirect ? "" : `<button type="button" class="btn-ghost ch-delete" style="padding:.2rem .6rem;font-size:.72rem" data-chat-id="${esc(c.chat_id)}" data-title="${label}">Remove</button>`}</td>
+  </tr>`;
+}
+
+async function refreshChannels() {
+  const res = await fetch(withToken("/api/channels"), { headers: authHeaders() });
+  if (!res.ok) return;
+  const d = await res.json();
+  const channels = d.channels || [];
+  $("chip-channels").textContent = `${channels.filter(c => c.enabled).length}/${channels.length} enabled`;
+  table("tbl-channels", ["Channel", "Chat ID", "Enabled", "Signals (30d)", "Last signal", "Note", ""], channels.map(channelRow));
+
+  const dialogs = d.dialogs || [];
+  const sel = $("ch-dialog-select");
+  const prevVal = sel.value;
+  sel.innerHTML = '<option value="">— pick a dialog —</option>' +
+    dialogs.map(dl => `<option value="${esc(dl.chat_id)}" data-title="${esc(dl.title)}">${esc(dl.title)} — ${esc(dl.chat_id)} (${esc(dl.kind)})</option>`).join("");
+  if (prevVal) sel.value = prevVal;
+  $("ch-dialogs-hint").textContent = dialogs.length ? "" : "no dialogs cached yet (forwarder hasn't refreshed) — use free text";
+
+  const unreg = d.unregistered || [];
+  $("unregistered-warnings").innerHTML = unreg.length ? unreg.map(u =>
+    `<div class="review-chip unregistered-row">Unregistered channel "${esc(u.channel)}" produced ${u.signals_30d} signal(s) in 30d — currently fail-open (enabled by default). Last signal ${esc((u.last_signal || "").slice(0, 19).replace("T", " "))}
+     <button type="button" class="ch-add-unregistered" data-spec="${esc(u.channel)}">Add to registry</button></div>`
+  ).join("") : "";
+}
+
+document.addEventListener("change", async (e) => {
+  if (!e.target.classList.contains("ch-toggle")) return;
+  const chatId = e.target.dataset.chatId, enabled = e.target.checked;
+  e.target.disabled = true;
+  try {
+    await fetch(withToken("/api/channels/toggle"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ chat_id: chatId, enabled }),
+    });
+  } finally {
+    await refreshChannels();
+    refreshPipeline();
+  }
+});
+
+let pendingDeleteChatId = null;
+document.addEventListener("click", (e) => {
+  const delBtn = e.target.closest(".ch-delete");
+  if (delBtn) {
+    pendingDeleteChatId = delBtn.dataset.chatId;
+    $("ch-delete-name").textContent = delBtn.dataset.title || delBtn.dataset.chatId;
+    $("ch-delete-scrim").style.display = "flex";
+    return;
+  }
+  const addBtn = e.target.closest(".ch-add-unregistered");
+  if (addBtn) {
+    $("ch-spec-input").value = addBtn.dataset.spec;
+    $("ch-spec-input").focus();
+  }
+});
+$("ch-delete-cancel").addEventListener("click", () => { $("ch-delete-scrim").style.display = "none"; pendingDeleteChatId = null; });
+$("ch-delete-confirm").addEventListener("click", async () => {
+  if (!pendingDeleteChatId) return;
+  await fetch(withToken("/api/channels/delete"), {
+    method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ chat_id: pendingDeleteChatId }),
+  });
+  $("ch-delete-scrim").style.display = "none";
+  pendingDeleteChatId = null;
+  await refreshChannels();
+  refreshPipeline();
+});
+
+$("add-channel-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const dlSel = $("ch-dialog-select");
+  const dlOpt = dlSel.selectedOptions[0];
+  const spec = (dlSel.value || $("ch-spec-input").value || "").trim();
+  if (!spec) return;
+  const title = dlSel.value && dlOpt ? (dlOpt.dataset.title || "") : "";
+  const note = $("ch-note-input").value.trim();
+  const body = { spec };
+  if (title) body.title = title;
+  if (note) body.note = note;
+  await fetch(withToken("/api/channels"), {
+    method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  dlSel.value = ""; $("ch-spec-input").value = ""; $("ch-note-input").value = "";
+  await refreshChannels();
+  refreshPipeline();
+});
 
 async function refreshSummary() {
   const res = await fetch(withToken("/api/summary?days=" + currentDays + sourceQS()), { headers: authHeaders() });
@@ -2347,6 +2808,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_csv(trades_csv(days, source), "trades.csv")
         elif path == "/api/export/journal.csv":
             self._send_csv(journal_csv(), "journal.csv")
+        elif path == "/api/pipeline":
+            self._send(200, json.dumps(pipeline_status(), default=str).encode(), "application/json")
+        elif path == "/api/channels":
+            self._send(200, json.dumps(channels_snapshot(), default=str).encode(), "application/json")
         elif path == "/api/export/weekly.xlsx":
             days = _parse_days(self.path)
             source = _parse_source(self.path)
@@ -2376,12 +2841,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    _JSON_POST_ROUTES = (
+        "/api/journal", "/api/channels", "/api/channels/toggle", "/api/channels/delete",
+    )
+
     def do_POST(self) -> None:
         if not self._host_ok():
             self._reject(403, "forbidden: bad host")
             return
         path = urlsplit(self.path).path
-        if path != "/api/journal":
+        if path not in self._JSON_POST_ROUTES:
             self.send_response(404)
             self.end_headers()
             return
@@ -2395,8 +2864,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            entry = save_journal_entry(payload)
-            self._send(200, json.dumps(entry).encode(), "application/json")
+            if path == "/api/journal":
+                entry = save_journal_entry(payload)
+                self._send(200, json.dumps(entry).encode(), "application/json")
+            elif path == "/api/channels":
+                result = add_channel(payload)
+                self._send(200, json.dumps(result).encode(), "application/json")
+            elif path == "/api/channels/toggle":
+                chat_id = str(payload.get("chat_id") or "")
+                if not chat_id:
+                    raise ValueError("chat_id is required")
+                ts.set_channel_enabled(chat_id, bool(payload.get("enabled")))
+                self._send(200, json.dumps({"ok": True}).encode(), "application/json")
+            elif path == "/api/channels/delete":
+                chat_id = str(payload.get("chat_id") or "")
+                if not chat_id:
+                    raise ValueError("chat_id is required")
+                ts.delete_channel(chat_id)
+                self._send(200, json.dumps({"ok": True}).encode(), "application/json")
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(400, str(exc).encode(), "text/plain")
 

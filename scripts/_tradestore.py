@@ -41,10 +41,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / ".local-stack" / "execrelay.db"
+DB_PATH = Path(
+    os.environ.get("EXECRELAY_DB_PATH")
+    or (Path(__file__).resolve().parent.parent / ".local-stack" / "execrelay.db")
+)
 LOG_DIR = Path(__file__).resolve().parent.parent / ".local-stack" / "logs" / "transactions"
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 _SCHEMA_SQL = (
     """
@@ -116,12 +119,49 @@ _SCHEMA_SQL = (
         floating     REAL
     )
     """,
+    # channels: the operator-facing signal-source registry (schema v2). Keyed
+    # by the resolved numeric Telegram chat id (as text), or the literal
+    # 'direct' pseudo-channel for messages posted straight to the bot with no
+    # [SRC:...] tag. A row whose chat_id is neither 'direct' nor purely
+    # numeric is "pending resolution" -- it was added by spec text the
+    # dashboard couldn't resolve itself (no Telethon session); the forwarder
+    # resolves it to a real id/title on its next refresh and renames the row
+    # (see resolve_channel / mark_channel_resolution_error below).
+    """
+    CREATE TABLE IF NOT EXISTS channels (
+        chat_id     TEXT PRIMARY KEY,
+        title       TEXT,
+        spec        TEXT,
+        enabled     INTEGER NOT NULL DEFAULT 1,
+        added_ts    TEXT,
+        updated_ts  TEXT,
+        note        TEXT
+    )
+    """,
+    # tg_dialogs: forwarder-populated cache of the account's Telegram dialogs
+    # (scripts/telegram_user_forwarder.py, refreshed every ~10min), so the
+    # dashboard's "add channel" picker can offer real titles/ids instead of
+    # making the operator type a numeric chat id from memory.
+    """
+    CREATE TABLE IF NOT EXISTS tg_dialogs (
+        chat_id       TEXT PRIMARY KEY,
+        title         TEXT,
+        kind          TEXT,
+        refreshed_ts  TEXT
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals(outcome)",
     "CREATE INDEX IF NOT EXISTS idx_signals_channel ON signals(channel)",
     "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
     "CREATE INDEX IF NOT EXISTS idx_orders_source ON orders(source)",
     "CREATE INDEX IF NOT EXISTS idx_closed_trades_close_ts ON closed_trades(close_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(enabled)",
 )
+
+# Env vars this module reads directly (not via the Telethon-authenticated
+# forwarder process) purely to seed the channel registry on first migration
+# to schema v2 -- see _migrate_v2_seed_channels.
+_ENV_SOURCE_CHAT_VAR = "TG_FORWARDER_SOURCE_CHAT"
 
 
 def _warn(msg: str) -> None:
@@ -132,14 +172,86 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _env_dotenv_value(key: str) -> str:
+    """Read one key from the repo's .env directly (this module has no
+    _load_dotenv of its own, unlike telegram_user_forwarder.py) -- used only
+    to seed the channel registry once, on first migration to schema v2.
+    os.environ wins if already set (e.g. under local-stack.ps1, which
+    exports .env into the process before spawning children)."""
+    if os.environ.get(key):
+        return os.environ[key]
+    path = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip()
+    return ""
+
+
+def _migrate_v2_seed_channels(conn: sqlite3.Connection) -> None:
+    """One-time seed of the `channels` table from the operator's current
+    TG_FORWARDER_SOURCE_CHAT, plus the 'direct' pseudo-channel for messages
+    posted straight to the bot. Idempotent by construction: only runs while
+    schema_version < 2 (checked by the caller), and only inserts rows that
+    don't already exist (INSERT OR IGNORE) so a concurrent/duplicate call
+    from another process can never clobber an operator's later edits.
+    Behaviour-preserving: every channel currently in TG_FORWARDER_SOURCE_CHAT
+    is seeded enabled=1, so nothing stops relaying because of this
+    migration."""
+    now = _utcnow_iso()
+    conn.execute(
+        "INSERT OR IGNORE INTO channels (chat_id, title, spec, enabled, added_ts, updated_ts, note) "
+        "VALUES ('direct', 'Direct to bot', 'direct', 1, ?, ?, NULL)",
+        (now, now),
+    )
+    raw = _env_dotenv_value(_ENV_SOURCE_CHAT_VAR)
+    for part in (p.strip() for p in raw.split(",")):
+        if not part:
+            continue
+        # A bare numeric/@username spec becomes the row's key directly (as
+        # the forwarder's own _resolve() would treat it); anything else
+        # (a title fragment) is also stored as-is under chat_id -- it is
+        # "pending resolution" until the forwarder resolves it to a real id
+        # on its first refresh, exactly like a spec added via the dashboard.
+        key = part.lstrip("@") if not part.lstrip("-").isdigit() else part
+        conn.execute(
+            "INSERT OR IGNORE INTO channels (chat_id, title, spec, enabled, added_ts, updated_ts, note) "
+            "VALUES (?, NULL, ?, 1, ?, ?, NULL)",
+            (key, part, now, now),
+        )
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     for stmt in _SCHEMA_SQL:
         conn.execute(stmt)
     conn.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-        (SCHEMA_VERSION,),
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1')"
     )
     conn.commit()
+
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    try:
+        current = int(row["value"]) if row and row["value"] is not None else 1
+    except (TypeError, ValueError):
+        current = 1
+    if current < 2:
+        try:
+            _migrate_v2_seed_channels(conn)
+        except Exception as exc:  # noqa: BLE001 - migration must never crash a caller
+            _warn(f"schema v2 channel seed failed: {exc!r}")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (SCHEMA_VERSION,),
+        )
+        conn.commit()
 
 
 def get_conn() -> sqlite3.Connection | None:
@@ -445,6 +557,285 @@ def record_equity(
         conn.commit()
     except Exception as exc:  # noqa: BLE001
         _warn(f"record_equity failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def meta_get(key: str) -> str | None:
+    """Read one value from the meta table. None if absent or on any DB
+    failure -- callers (e.g. a heartbeat freshness check) must treat None
+    the same as "missing"."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return None
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"meta_get failed: {exc!r}")
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def meta_set(key: str, value: str) -> None:
+    """Upsert one meta key/value. No-throw -- used for cross-process
+    heartbeats (hb_forwarder, hb_ea_shim, ...) where a DB hiccup must never
+    take down the caller's actual job (relaying/trading)."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"meta_set failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Channel registry -- see the `channels` table docstring above _SCHEMA_SQL.
+# All no-throw per this module's contract.
+# ---------------------------------------------------------------------------
+
+
+def list_channels() -> list[dict]:
+    return query(
+        "SELECT chat_id, title, spec, enabled, added_ts, updated_ts, note FROM channels "
+        "ORDER BY CASE WHEN chat_id='direct' THEN 0 ELSE 1 END, "
+        "COALESCE(title, spec, chat_id) COLLATE NOCASE"
+    )
+
+
+def upsert_channel(
+    chat_id: str,
+    title: str | None = None,
+    spec: str | None = None,
+    enabled: int | bool = 1,
+    note: str | None = None,
+) -> None:
+    """Insert or fully overwrite one channel row -- the dashboard's
+    add-channel action and the schema v2 seed. Overwrites title/spec/note
+    unconditionally (last write wins), matching this module's other
+    upsert-style writers. For the forwarder's own resolution-in-place
+    updates (pending spec -> real id/title) use resolve_channel() /
+    mark_channel_resolution_error() instead, which preserve enabled."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        now = _utcnow_iso()
+        conn.execute(
+            """
+            INSERT INTO channels (chat_id, title, spec, enabled, added_ts, updated_ts, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title,
+                spec=excluded.spec,
+                enabled=excluded.enabled,
+                updated_ts=excluded.updated_ts,
+                note=excluded.note
+            """,
+            (str(chat_id), title, spec, 1 if enabled else 0, now, now, note),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"upsert_channel failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def set_channel_enabled(chat_id: str, enabled: bool) -> None:
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        conn.execute(
+            "UPDATE channels SET enabled=?, updated_ts=? WHERE chat_id=?",
+            (1 if enabled else 0, _utcnow_iso(), str(chat_id)),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"set_channel_enabled failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def delete_channel(chat_id: str) -> None:
+    """Removes the registry row only -- signals/orders history referencing
+    this channel's title is untouched (the dashboard makes this explicit to
+    the operator before calling delete)."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        conn.execute("DELETE FROM channels WHERE chat_id=?", (str(chat_id),))
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"delete_channel failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def resolve_channel(pending_chat_id: str, resolved_chat_id: str, resolved_title: str) -> None:
+    """Called by the forwarder once it resolves a channel's stored spec to a
+    real Telegram id/title. If the row was already keyed by its numeric id
+    (only the title was missing), updates title in place. If it was keyed by
+    the raw spec text (pending resolution), renames the row's primary key to
+    the resolved id, preserving enabled/spec/note. Clears any previous
+    "could not resolve" note. No-op if the row was deleted meanwhile."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        now = _utcnow_iso()
+        if str(pending_chat_id) == str(resolved_chat_id):
+            conn.execute(
+                "UPDATE channels SET title=?, updated_ts=?, note=NULL WHERE chat_id=?",
+                (resolved_title, now, str(pending_chat_id)),
+            )
+        else:
+            row = conn.execute(
+                "SELECT spec, enabled FROM channels WHERE chat_id=?", (str(pending_chat_id),)
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO channels (chat_id, title, spec, enabled, added_ts, updated_ts, note)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    title=excluded.title, spec=excluded.spec, enabled=excluded.enabled,
+                    updated_ts=excluded.updated_ts, note=NULL
+                """,
+                (str(resolved_chat_id), resolved_title, row["spec"], row["enabled"], now, now),
+            )
+            conn.execute("DELETE FROM channels WHERE chat_id=?", (str(pending_chat_id),))
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"resolve_channel failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def mark_channel_resolution_error(chat_id: str, error: str) -> None:
+    """Stamps a "could not resolve" note on a still-pending channel row
+    (channel not found / account not subscribed) so the dashboard can show a
+    red state instead of "resolving..." forever."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        conn.execute(
+            "UPDATE channels SET note=?, updated_ts=? WHERE chat_id=?",
+            (str(error)[:300], _utcnow_iso(), str(chat_id)),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"mark_channel_resolution_error failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def is_channel_enabled(channel_name: str | None) -> bool:
+    """Hot-path check for telegram-ingest: is this channel allowed to place
+    trades? `channel_name` is the [SRC:<title>] tag's title, or None/empty
+    for a message posted straight to the bot (matched against the 'direct'
+    pseudo-channel row).
+
+    Fail-open by design: a channel with NO registry row at all (a tagged
+    channel the operator hasn't registered yet) is treated as enabled --
+    a missing config row must never silently stop trading. Only an explicit
+    enabled=0 row skips the message. Never raises (query() doesn't)."""
+    if channel_name:
+        rows = query("SELECT enabled FROM channels WHERE title = ? COLLATE NOCASE", (channel_name,))
+    else:
+        rows = query("SELECT enabled FROM channels WHERE chat_id = 'direct'")
+    if not rows:
+        return True
+    return bool(rows[0].get("enabled"))
+
+
+# ---------------------------------------------------------------------------
+# tg_dialogs -- forwarder-populated cache backing the dashboard's "add
+# channel" picker. Written only by telegram_user_forwarder.py (it's the only
+# process with a Telethon session); read by the dashboard.
+# ---------------------------------------------------------------------------
+
+
+def list_tg_dialogs() -> list[dict]:
+    return query("SELECT chat_id, title, kind, refreshed_ts FROM tg_dialogs ORDER BY title COLLATE NOCASE")
+
+
+def replace_tg_dialogs(dialogs: list[tuple[str, str, str]]) -> None:
+    """Full refresh of the tg_dialogs picker list in one transaction, so
+    readers never see a half-updated set. `dialogs` is a list of
+    (chat_id, title, kind) tuples. No-throw; a failure here just means a
+    stale picker list, never anything relay/trading-affecting."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        now = _utcnow_iso()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM tg_dialogs")
+        conn.executemany(
+            "INSERT INTO tg_dialogs (chat_id, title, kind, refreshed_ts) VALUES (?, ?, ?, ?)",
+            [(str(cid), title, kind, now) for cid, title, kind in dialogs],
+        )
+        conn.execute("COMMIT")
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"replace_tg_dialogs failed: {exc!r}")
+        try:
+            if conn is not None:
+                conn.execute("ROLLBACK")
+        except Exception:
+            pass
     finally:
         if conn is not None:
             try:

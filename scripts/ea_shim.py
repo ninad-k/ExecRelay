@@ -41,7 +41,7 @@ import MetaTrader5 as mt5
 import websockets
 
 from _txnlog import get_txn_logger, log_txn
-from _tradestore import record_closed_trade, record_equity, record_order
+from _tradestore import meta_set, record_closed_trade, record_equity, record_order
 
 TXN_LOG = get_txn_logger("mt5-fills")
 
@@ -174,6 +174,11 @@ def _closed_result(ticket):
 # instead of running a second timing loop.
 EQUITY_SNAPSHOT_EVERY = 60
 
+# Pipeline-status heartbeat cadence: same trick, every 6th iteration (~30s)
+# -- frequent enough that the dashboard's ~90s staleness check has margin,
+# infrequent enough not to spam the store with a write every 5s poll.
+HEARTBEAT_EVERY = 6
+
 
 def position_monitor():
     """Notify Telegram when a shim-owned position opens (market fill or a
@@ -241,6 +246,26 @@ def position_monitor():
                         margin_free=a.margin_free,
                         floating=round(a.equity - a.balance, 2),
                     )
+
+            # Pipeline-status heartbeat: proves this process is not merely
+            # alive but genuinely polling positions AND still attached to
+            # MT5 -- a pid-liveness check alone can't tell a healthy shim
+            # from one hung on a login prompt, relaying/executing nothing
+            # (see trade_dashboard.py /api/pipeline). Read-only MT5 call +
+            # a no-throw store write; never touches order execution/sizing.
+            if iteration % HEARTBEAT_EVERY == 0:
+                acct_hb = mt5.account_info()
+                hb_state = {
+                    "mt5": acct_hb is not None,
+                    "account": acct_hb.login if acct_hb is not None else None,
+                    "demo": (
+                        acct_hb.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
+                        if acct_hb is not None
+                        else None
+                    ),
+                }
+                meta_set("hb_ea_shim", datetime.now(timezone.utc).isoformat())
+                meta_set("hb_ea_shim_state", json.dumps(hb_state))
         except Exception as e:
             log(f"position monitor error: {e!r}")
         time.sleep(POSITION_POLL_SECS)

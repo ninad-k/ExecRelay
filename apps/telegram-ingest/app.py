@@ -29,7 +29,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
 from _txnlog import get_txn_logger, log_txn  # noqa: E402
-from _tradestore import append_signal_trace, record_order, record_signal  # noqa: E402
+from _tradestore import (  # noqa: E402
+    append_signal_trace,
+    is_channel_enabled,
+    record_order,
+    record_signal,
+)
 
 TXN_LOG = get_txn_logger("telegram-signals")
 
@@ -627,6 +632,23 @@ _seen: set[tuple[int, int]] = set()
 _seen_order: list[tuple[int, int]] = []
 _SEEN_MAX = 5000
 
+# Channel-registry enforcement (defense-in-depth point (a) -- see
+# scripts/_tradestore.py `channels` table / is_channel_enabled). Cached per
+# channel name for ~10s so a disabled/enabled toggle takes effect within
+# ~15s without hitting SQLite on every poll iteration for repeat channels.
+_CHANNEL_CACHE_TTL_SEC = 10.0
+_channel_enabled_cache: dict[str | None, tuple[float, bool]] = {}
+
+
+def _channel_enabled_cached(channel_name: str | None) -> bool:
+    now = time.time()
+    cached = _channel_enabled_cache.get(channel_name)
+    if cached is not None and (now - cached[0]) < _CHANNEL_CACHE_TTL_SEC:
+        return cached[1]
+    enabled = is_channel_enabled(channel_name)
+    _channel_enabled_cache[channel_name] = (now, enabled)
+    return enabled
+
 
 def _mark_seen(key: tuple[int, int]) -> bool:
     """Returns False if already seen."""
@@ -646,6 +668,36 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
     if not _mark_seen((chat_id, message_id)):
         return
     channel_name, text = strip_source_tag(text)
+
+    # Enforcement point (a): a channel explicitly disabled in the registry
+    # is skipped entirely -- no ingress POST, no Telegram notification.
+    # A tagged channel with NO registry row at all fails OPEN (stays
+    # enabled) so a config gap can never silently stop trading; see
+    # is_channel_enabled()'s docstring. The dashboard's "unregistered
+    # channel" warning is what surfaces that gap to the operator.
+    if not _channel_enabled_cached(channel_name):
+        logger.info(
+            "chat %s msg %s: channel %r is disabled in the registry -- skipping",
+            chat_id, message_id, channel_name or "direct",
+        )
+        log_txn(
+            TXN_LOG,
+            chat_id=chat_id,
+            message_id=message_id,
+            channel=channel_name,
+            outcome="channel_disabled",
+            raw_text=text[:500],
+        )
+        record_signal(
+            chat_id=chat_id,
+            message_id=message_id,
+            channel=channel_name,
+            outcome="channel_disabled",
+            n_commands=0,
+            raw=_redact_secret(text)[:500],
+        )
+        return
+
     try:
         sig = parse_signal(text)
     except SignalError as exc:
