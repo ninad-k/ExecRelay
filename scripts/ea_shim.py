@@ -68,18 +68,25 @@ PENDING_FALLBACK = os.environ.get("EA_SHIM_PENDING_FALLBACK", "true").lower() in
 RISK_USD = float(os.environ.get("EA_SHIM_RISK_USD", "0") or 0)
 
 # One-cancels-other. A multi-entry signal (an entry range, or an explicit
-# "SECOND BUY LIMIT") rests several orders on the same symbol, all aiming at
-# the same target. Once one of them has run to that target the trade is over:
-# a leg still resting below is no longer the second half of a live idea, it is
-# a fresh entry into a move that already happened, taken at a worse price with
-# the same stop. So when a leg closes AT TP, the siblings still pending from
-# that same signal are withdrawn.
+# "SECOND SELL LIMIT") rests several orders on the same symbol, sharing one
+# SL and one TP. Once either bracket side has taken a leg out, the signal has
+# RESOLVED -- target reached, or invalidated at the stop -- and a sibling
+# still resting is no longer the second half of a live idea. On TP it would
+# re-enter a move that already finished; on SL it would re-enter a setup the
+# market just proved wrong, behind the very stop that failed. Both ways the
+# siblings from that same signal are withdrawn.
 #
-# Deliberately narrow -- only a close whose broker reason is TP triggers this.
-# A stop-out, a manual close or a close from the "close longs" command all
-# leave the other leg exactly where it is.
-CANCEL_SIBLINGS_ON_TP = os.environ.get(
-    "EA_SHIM_CANCEL_SIBLINGS_ON_TP", "true"
+# The trigger is the broker's own deal reason (DEAL_REASON_TP / _SL), so a
+# manual close or a "close longs" command still leaves the other leg exactly
+# where it is: the operator closing one trade by hand has said nothing about
+# the rest of the signal.
+#
+# EA_SHIM_CANCEL_SIBLINGS_ON_TP is honoured as a fallback: the switch briefly
+# shipped under that name when only the TP side triggered it.
+CANCEL_SIBLINGS_ON_CLOSE = (
+    os.environ.get("EA_SHIM_CANCEL_SIBLINGS_ON_CLOSE")
+    or os.environ.get("EA_SHIM_CANCEL_SIBLINGS_ON_TP")
+    or "true"
 ).lower() in ("true", "1", "yes", "on")
 
 NOTIFY_TOKEN = os.environ.get("TELEGRAM_INGEST_BOT_TOKEN", "")
@@ -243,9 +250,9 @@ EQUITY_SNAPSHOT_EVERY = 60
 HEARTBEAT_EVERY = 6
 
 
-def _cancel_siblings_after_tp(ticket, position):
-    """A leg of a multi-entry signal just hit TP -- withdraw the legs of THAT
-    SAME signal that are still resting.
+def _cancel_siblings_after_close(ticket, position, close_reason):
+    """A leg of a multi-entry signal just left the book at its TP or its SL --
+    withdraw the legs of THAT SAME signal that are still resting.
 
     Siblings are resolved through the trade store, not through the MT5
     comment. The comment names the channel, so comment-matching would also
@@ -258,6 +265,7 @@ def _cancel_siblings_after_tp(ticket, position):
     order and is skipped. Never raises -- this runs inside the monitor loop,
     and a bookkeeping problem must not stop position tracking or notifications.
     """
+    hit = "TP" if close_reason == mt5.DEAL_REASON_TP else "SL"
     try:
         siblings = sibling_broker_order_ids(str(ticket))
         if not siblings:
@@ -265,27 +273,28 @@ def _cancel_siblings_after_tp(ticket, position):
         removed, failures = cancel_pending_orders(siblings)
         if removed:
             log(
-                f"TP on {position.symbol} #{ticket} -- cancelled sibling "
+                f"{hit} on {position.symbol} #{ticket} -- cancelled sibling "
                 f"pending order(s) {', '.join(removed)}"
             )
             log_txn(
                 TXN_LOG,
-                event="siblings_cancelled_after_tp",
+                event="siblings_cancelled_after_close",
                 position=ticket,
                 symbol=position.symbol,
+                close_reason=hit,
                 cancelled=removed,
                 comment=position.comment,
             )
             tg_notify(
                 f"🚫 Pending order cancelled\n"
-                f"{position.symbol} hit TP, so the other entry from the same "
-                f"signal was withdrawn\n"
+                f"{position.symbol} hit {hit}, so the other entry from the "
+                f"same signal was withdrawn\n"
                 f"Ticket(s) {', '.join(removed)}"
             )
         for f in failures:
             log(f"could not cancel sibling pending {f}")
     except Exception as e:  # noqa: BLE001 - monitor loop must survive
-        log(f"sibling cancel after TP failed: {short_exc(e)}")
+        log(f"sibling cancel after {hit} failed: {short_exc(e)}")
 
 
 def position_monitor():
@@ -341,8 +350,11 @@ def position_monitor():
                             comment=p.comment,
                             source="telegram" if str(p.comment).startswith("tg-") else "tradingview",
                         )
-                        if CANCEL_SIBLINGS_ON_TP and close_reason == mt5.DEAL_REASON_TP:
-                            _cancel_siblings_after_tp(ticket, p)
+                        if CANCEL_SIBLINGS_ON_CLOSE and close_reason in (
+                            mt5.DEAL_REASON_TP,
+                            mt5.DEAL_REASON_SL,
+                        ):
+                            _cancel_siblings_after_close(ticket, p, close_reason)
             known = current
 
             iteration += 1

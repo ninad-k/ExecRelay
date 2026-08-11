@@ -30,6 +30,9 @@ TP @ 4089
 - First line → by default a pending **limit order at the stated entry
   price** (`TELEGRAM_INGEST_ENTRY_MODE=limit`); set `market` to execute the
   first leg immediately instead. `SL`/`TP` attached as absolute prices.
+  The entry line may state its own kind — `GOLD SELL LIMIT @ 4380` /
+  `GOLD SELL STOP @ 4360` — and then that kind is placed regardless of
+  `ENTRY_MODE`.
   Note: brokers reject a limit order on the wrong side of the current
   market price (e.g. a buy limit above market), so in limit mode a signal
   quoted at a worse-than-market entry is rejected by the broker rather

@@ -102,6 +102,38 @@ def test_buy_signal_without_second_order(app_module):
     assert cmds[0].startswith("60123456789,buylimit,EURUSD,entry_price=1.085,")
 
 
+def test_entry_line_may_state_its_own_pending_kind(app_module):
+    # "SELL LIMIT @ 4380" is an instruction, not a hint: both legs must rest
+    # as sell limits even when ENTRY_MODE would have said otherwise, and the
+    # SECOND line must survive the extra keyword on the entry line.
+    sig = app_module.parse_signal(
+        "GOLD SELL LIMIT @ 4380\n\nSECOND SELL LIMIT @ 4390\n\nSL @ 4400\nTP @ 4370"
+    )
+    assert sig == {
+        "symbol": "GOLD",
+        "side": "sell",
+        "entry": 4380.0,
+        "sl": 4400.0,
+        "tp": 4370.0,
+        "tps": [4370.0],
+        "order_type": "selllimit",
+        "second": {"kind": "limit", "entry": 4390.0},
+    }
+    cmds = app_module.build_commands(sig)
+    assert cmds == [
+        "60123456789,selllimit,XAUUSD,entry_price=4380,vol_lots=0.01,sl=4400,tp=4370,comment=tg-ingest,secret=s3cret",
+        "60123456789,selllimit,XAUUSD,entry_price=4390,vol_lots=0.01,sl=4400,tp=4370,comment=tg-ingest,secret=s3cret",
+    ]
+
+
+def test_entry_line_stop_kind_beats_entry_mode(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "ENTRY_MODE", "market")
+    sig = app_module.parse_signal("GOLD SELL STOP @ 4360\nSL @ 4380\nTP @ 4340")
+    assert sig["order_type"] == "sellstop"
+    cmds = app_module.build_commands(sig)
+    assert cmds[0].startswith("60123456789,sellstop,XAUUSD,entry_price=4360,")
+
+
 def test_non_signal_messages_return_none(app_module):
     for text in (
         "Good morning traders! Big news day today.",

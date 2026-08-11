@@ -181,8 +181,11 @@ _readiness = {"poll_ok": False, "detail": "not started"}
 # Trailing commentary (risk tables, disclaimers, referral links, emoji) is
 # ignored in all three.
 
+# The entry line may state its own pending kind ("GOLD SELL LIMIT @ 4380");
+# without one, ENTRY_MODE decides how the first leg is placed, as ever.
 _ENTRY_RE = re.compile(
-    r"^\s*(?P<symbol>[A-Z][A-Z0-9._]{1,14})\s+(?P<side>BUY|SELL)\s*@\s*(?P<entry>\d+(?:\.\d+)?)\s*$",
+    r"^\s*(?P<symbol>[A-Z][A-Z0-9._]{1,14})\s+(?P<side>BUY|SELL)"
+    r"(?:\s+(?P<kind>LIMIT|STOP))?\s*@\s*(?P<entry>\d+(?:\.\d+)?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _SECOND_RE = re.compile(
@@ -405,7 +408,7 @@ def parse_signal(text: str) -> dict | None:
 def _parse_explicit(
     text: str, entry_m: re.Match[str], sl_m: re.Match[str], tp_m: re.Match[str]
 ) -> dict:
-    """Dialect A: `SYMBOL SIDE @ price` with `SL @` / `TP @` lines."""
+    """Dialect A: `SYMBOL SIDE [LIMIT|STOP] @ price` with `SL @` / `TP @` lines."""
     side = entry_m.group("side").lower()
     entry = float(entry_m.group("entry"))
     sl = float(sl_m.group(1))
@@ -413,6 +416,12 @@ def _parse_explicit(
 
     sig = _blank_signal(entry_m.group("symbol").upper(), side, entry)
     sig.update(sl=sl, tp=tp, tps=[tp])
+    # A kind stated on the entry line is an instruction, not a hint --
+    # "SELL LIMIT @ 4380" must rest a sell limit even when ENTRY_MODE says
+    # market. Absent, order_type stays None and ENTRY_MODE keeps its say.
+    kind = (entry_m.group("kind") or "").lower()
+    if kind:
+        sig["order_type"] = f"{side}{kind}"
     _check_bracket(side, entry, sl, [tp])
 
     second_m = _SECOND_RE.search(text)
