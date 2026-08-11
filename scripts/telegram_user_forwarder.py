@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from telethon import TelegramClient, events
+    from telethon import TelegramClient, events, utils
 except ImportError:  # pragma: no cover
     print("telethon is required: pip install telethon", file=sys.stderr)
     sys.exit(2)
@@ -255,11 +255,20 @@ async def _resolve(c: TelegramClient, spec: str) -> tuple[int, str] | None:
     matched case-insensitively against the titles of the dialogs this account
     is actually in, which is the only way to name a channel you follow but
     that has no public username.
+
+    The id returned is always the MARKED one (a channel's -100... form), which
+    is what event.chat_id carries and therefore what the watch set must be
+    keyed by. entity.id is the raw id and does NOT compare equal -- a channel
+    stored that way is watched in name only: it resolves, it logs, it appears
+    enabled on the dashboard, and every message from it is silently dropped.
+    iter_dialogs below already yields marked ids, so this keeps the two
+    resolution paths returning the same thing.
     """
     spec = spec.lstrip("@") if not spec.lstrip("-").isdigit() else spec
     try:
         entity = await c.get_entity(int(spec) if spec.lstrip("-").isdigit() else spec)
-        return entity.id, getattr(entity, "title", None) or getattr(entity, "username", spec)
+        title = getattr(entity, "title", None) or getattr(entity, "username", spec)
+        return utils.get_peer_id(entity), title
     except Exception:
         pass  # fall through to a title search over the account's dialogs
 
@@ -360,10 +369,19 @@ async def refresh_enabled_channels(
             continue  # not a Telethon chat -- represents "no [SRC:] tag"
         title = (row.get("title") or "").strip()
         is_numeric = chat_id.lstrip("-").isdigit()
+        # Every chat this account can watch -- channel or group -- has a
+        # NEGATIVE marked id. A positive one is a raw entity.id written by an
+        # older _resolve; it can never equal event.chat_id, so the channel
+        # would sit there looking enabled while every message from it was
+        # dropped. Send it back through resolution to be rewritten in marked
+        # form rather than trusting it.
+        is_usable_id = is_numeric and chat_id.startswith("-")
 
-        if is_numeric and title:
+        if is_usable_id and title:
             resolved.append({"chat_id": int(chat_id), "title": title})
             continue
+        if is_numeric and not is_usable_id:
+            log(f"channel registry: {title or chat_id} is stored as a raw id ({chat_id}) — re-resolving")
 
         if c is None:
             continue  # can't resolve right now; drop until a real refresh can
