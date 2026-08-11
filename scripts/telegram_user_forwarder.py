@@ -162,6 +162,7 @@ async def _resolve_all(c: TelegramClient, spec: str, label: str) -> list[tuple[i
 
 _ENABLED_REFRESH_SEC = 30
 _DIALOG_REFRESH_SEC = 600
+_DIALOG_POLL_SEC = 3  # how often to look for a dashboard refresh request
 _HEARTBEAT_SEC = 30
 
 
@@ -548,9 +549,29 @@ async def cmd_run() -> None:
                 log(f"enabled-channel refresh failed: {short_exc(exc)}")
 
     async def _dialog_refresh_loop() -> None:
+        # Polled in short slices rather than one long sleep, so the
+        # dashboard's "Refresh" button is answered in seconds instead of
+        # whenever the 10-minute timer next comes round. That button only
+        # sets a flag in the trade store -- reading the account's dialogs
+        # needs the Telethon session, which lives here.
+        last = 0.0
         while True:
-            await _refresh_tg_dialogs(c)
-            await asyncio.sleep(_DIALOG_REFRESH_SEC)
+            requested = ts.meta_get(ts.DIALOG_REFRESH_REQUEST_KEY)
+            if requested or (time.time() - last) >= _DIALOG_REFRESH_SEC:
+                if requested:
+                    log("dialog refresh requested from the dashboard")
+                await _refresh_tg_dialogs(c)
+                last = time.time()
+                if requested:
+                    # Clear only the value actually served: a request that
+                    # arrived DURING the refresh carries a newer timestamp and
+                    # must survive to be handled on the next pass.
+                    try:
+                        if ts.meta_get(ts.DIALOG_REFRESH_REQUEST_KEY) == requested:
+                            ts.meta_set(ts.DIALOG_REFRESH_REQUEST_KEY, "")
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"could not clear dialog refresh request: {short_exc(exc)}")
+            await asyncio.sleep(_DIALOG_POLL_SEC)
 
     async def _heartbeat_loop() -> None:
         while True:

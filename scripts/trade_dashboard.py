@@ -1574,6 +1574,43 @@ def _ledger_window(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
+def _trace_id_channels(days: int) -> dict[str, str]:
+    """Map trace_id -> originating Telegram channel name.
+
+    An `orders` row knows only the comment tag it went out with ("tg-AGTP"),
+    which is initials chosen to fit MT5's comment field, not a name an operator
+    should have to decode. The readable name lives on the `signals` row, and
+    the trace_id issued by ingress is the only thing the two share -- so the
+    join goes through that, resolved in one pass here rather than a correlated
+    subquery per order row.
+
+    The signal window is deliberately a day wider than the order window: a
+    signal recorded just before the cutoff can still have placed its orders
+    inside it, and an unresolved trace_id shows as a blank channel, which reads
+    as "this did not come from a channel" -- exactly the wrong answer for a
+    relayed signal.
+
+    Telegram rows with no channel are direct messages to the bot rather than
+    relayed posts; they are labelled "direct", matching the ignored-messages
+    page. Non-Telegram orders never appear here at all.
+    """
+    out: dict[str, str] = {}
+    for s in ts.query(
+        "SELECT channel, trace_ids FROM signals "
+        "WHERE ts >= ? AND trace_ids IS NOT NULL AND trace_ids != '[]'",
+        (_ledger_window(days + 1),),
+    ):
+        try:
+            ids = json.loads(s.get("trace_ids") or "[]")
+        except (TypeError, ValueError):
+            continue
+        name = s.get("channel") or "direct"
+        for tid in ids if isinstance(ids, list) else []:
+            if tid:
+                out[str(tid)] = name
+    return out
+
+
 def ignored_messages(days: int = 7, source: str | None = None, limit: int = 500) -> dict:
     """Messages that arrived and produced NO order at the broker.
 
@@ -1656,6 +1693,7 @@ def actioned_messages(days: int = 7, source: str | None = None, limit: int = 500
         params.append(source)
     params.append(limit)
 
+    trace_channel = _trace_id_channels(days)
     rows = []
     for r in ts.query(
         "SELECT ts, trace_id, source, command, symbol, volume, entry, sl, tp, "
@@ -1668,6 +1706,7 @@ def actioned_messages(days: int = 7, source: str | None = None, limit: int = 500
             "ts": r.get("ts"),
             "source": r.get("source") or "other",
             "origin": r.get("comment") or "",
+            "channel": trace_channel.get(r.get("trace_id") or "", ""),
             "action": _ACTION_LABEL.get(cmd, f"{cmd} order placed" if cmd else "order"),
             "command": cmd,
             "symbol": r.get("symbol") or "",
@@ -1680,6 +1719,30 @@ def actioned_messages(days: int = 7, source: str | None = None, limit: int = 500
             "trace_id": r.get("trace_id") or "",
         })
     return {"rows": rows, "days": days, "source": source or ""}
+
+
+def request_dialog_refresh() -> dict:
+    """Ask the forwarder to re-read the account's Telegram dialogs, so a
+    channel subscribed to just now shows up in the "add channel" picker
+    without waiting out the 10-minute refresh timer.
+
+    This dashboard has no Telethon session -- only the forwarder is
+    authenticated -- so all it can do is raise a flag and report back what the
+    picker looks like RIGHT NOW. The caller watches those two values for a
+    change to know the request was served.
+
+    A dead forwarder is the one failure worth naming up front: the flag would
+    sit unread forever, and "nothing happened" is a much worse answer than
+    "the thing that does this is down"."""
+    ts.meta_set(ts.DIALOG_REFRESH_REQUEST_KEY, datetime.now(timezone.utc).isoformat())
+    dialogs = ts.list_tg_dialogs()
+    hb_age = _age_seconds(ts.meta_get("hb_forwarder"))
+    return {
+        "ok": True,
+        "count": len(dialogs),
+        "refreshed_ts": max((d.get("refreshed_ts") or "") for d in dialogs) if dialogs else "",
+        "forwarder_alive": hb_age is not None and hb_age < _HB_STALE_AFTER_SEC,
+    }
 
 
 def add_channel(payload: dict) -> dict:
@@ -2651,7 +2714,11 @@ button.actbtn:hover { background: var(--color-primary-glow); }
   <form class="addchannel-form" id="add-channel-form">
     <div>
       <label>From known dialogs</label>
-      <select id="ch-dialog-select"><option value="">— pick a dialog —</option></select>
+      <span style="display:flex;gap:.4rem;align-items:center">
+        <select id="ch-dialog-select"><option value="">— pick a dialog —</option></select>
+        <button class="btn-ghost" type="button" id="ch-dialogs-refresh" style="padding:.35rem .7rem;font-size:.72rem;white-space:nowrap"
+                title="Re-read your Telegram account for channels you have just joined">Refresh</button>
+      </span>
     </div>
     <div>
       <label>Or free text (id / @username / title fragment)</label>
@@ -2947,9 +3014,10 @@ async function refreshActioned() {
   $("chip-actioned").textContent = `${rows.length} over ${currentDays}d`;
   $("actioned-empty").textContent = rows.length ? "" : "Nothing has been sent to the broker in this window.";
   const num = v => (v === null || v === undefined || v === "") ? "—" : esc(String(v));
-  table("tbl-actioned", ["When", "Source", "Action", "Symbol", "Lots", "Entry", "SL", "TP", "Status", "Broker ID", "Tag"], rows.map(r => `<tr>
+  table("tbl-actioned", ["When", "Source", "From", "Action", "Symbol", "Lots", "Entry", "SL", "TP", "Status", "Broker ID", "Tag"], rows.map(r => `<tr>
     <td class="muted number">${ledgerTime(r.ts)}</td>
     <td>${sourceBadge(r.source)}</td>
+    <td>${esc(r.channel || "—")}</td>
     <td>${esc(r.action || "")}</td>
     <td>${esc(r.symbol || "—")}</td>
     <td class="number">${num(r.volume)}</td>
@@ -3250,6 +3318,59 @@ document.addEventListener("change", async (e) => {
   } finally {
     await refreshChannels();
     refreshPipeline();
+  }
+});
+
+// --- "Refresh" for the dialog picker -------------------------------------
+// Newly joined channels only reach the picker via the forwarder (it holds the
+// Telegram session). So: raise the flag, then watch the cache until it moves.
+// Polled rather than pushed because there is no channel back to the browser --
+// and a bounded wait that reports honestly beats a spinner that never ends.
+
+const DIALOG_REFRESH_TIMEOUT_MS = 25000;
+const DIALOG_POLL_MS = 1500;
+
+$("ch-dialogs-refresh").addEventListener("click", async (e) => {
+  const btn = e.target, hint = $("ch-dialogs-hint");
+  btn.disabled = true;
+  const restore = () => { btn.disabled = false; btn.textContent = "Refresh"; };
+  btn.textContent = "Refreshing…";
+  try {
+    const res = await fetch(withToken("/api/dialogs/refresh"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: "{}",
+    });
+    if (!res.ok) { hint.textContent = "refresh request failed (HTTP " + res.status + ")"; restore(); return; }
+    const before = await res.json();
+    if (!before.forwarder_alive) {
+      // The flag is set and will be picked up whenever the forwarder returns,
+      // but saying "done" here would be a lie.
+      hint.textContent = "forwarder is down — it reads your Telegram account, so the picker cannot update until it is back";
+      restore();
+      return;
+    }
+    hint.textContent = "asking the forwarder…";
+    const deadline = Date.now() + DIALOG_REFRESH_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, DIALOG_POLL_MS));
+      const c = await fetch(withToken("/api/channels"), { headers: authHeaders() });
+      if (!c.ok) continue;
+      const d = await c.json();
+      const dialogs = d.dialogs || [];
+      const stamp = dialogs.reduce((m, x) => (x.refreshed_ts || "") > m ? (x.refreshed_ts || "") : m, "");
+      if (stamp && stamp !== (before.refreshed_ts || "")) {
+        await refreshChannels();
+        const added = dialogs.length - before.count;
+        hint.textContent = `picker updated — ${dialogs.length} dialog(s)` +
+          (added > 0 ? `, ${added} new` : (added < 0 ? `, ${-added} gone` : ", nothing new"));
+        restore();
+        return;
+      }
+    }
+    hint.textContent = "forwarder did not respond in time — it may be reconnecting; try again shortly";
+  } catch (err) {
+    hint.textContent = "refresh failed: " + err;
+  } finally {
+    restore();
   }
 });
 
@@ -3891,6 +4012,7 @@ class Handler(BaseHTTPRequestHandler):
     _JSON_POST_ROUTES = (
         "/api/journal", "/api/channels", "/api/channels/toggle", "/api/channels/delete",
         "/api/signals/preview", "/api/signals/resubmit", "/api/dryrun",
+        "/api/dialogs/refresh",
     )
 
     def do_POST(self) -> None:
@@ -3939,6 +4061,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/dryrun":
                 status, body = set_dry_run_mode(payload)
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
+            elif path == "/api/dialogs/refresh":
+                self._send(200, json.dumps(request_dialog_refresh(), default=str).encode(), "application/json")
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(400, str(exc).encode(), "text/plain")
 

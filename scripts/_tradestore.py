@@ -975,6 +975,13 @@ def recent_symbols_for_channel(channel_name: str | None, days: int = 7) -> list[
 _DRY_RUN_KEY = "dry_run"
 _DRY_RUN_TS_KEY = "dry_run_updated_ts"
 
+# Set by the dashboard, consumed by the forwarder: "re-read the account's
+# Telegram dialogs now". The dashboard has no Telethon session of its own --
+# only the forwarder is authenticated -- so a newly joined channel can only
+# reach the picker by asking the forwarder to look. Named here so the two
+# processes cannot drift apart on the spelling.
+DIALOG_REFRESH_REQUEST_KEY = "tg_dialogs_refresh_requested"
+
 _TRUEISH = ("1", "true", "yes", "on")
 _FALSEISH = ("0", "false", "no", "off")
 
