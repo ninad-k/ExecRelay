@@ -145,7 +145,7 @@ _readiness = {"poll_ok": False, "detail": "not started"}
 # Signal grammar
 # ---------------------------------------------------------------------------
 #
-# Two dialects are understood. Both are strict: the whole message is rejected
+# Three dialects are understood. All are strict: the whole message is rejected
 # unless every recognised part is consistent.
 #
 # A. Explicit "@" format — the entry line names symbol and side, an optional
@@ -164,8 +164,22 @@ _readiness = {"poll_ok": False, "detail": "not started"}
 #      🛑 SL 4808 ⚠️
 #      🎯 Target 4790 4788 4784 4770+ 🎯
 #
+# C. "Entry range" format — the entry is quoted as two prices rather than one,
+#    and the targets arrive on their own lines:
+#
+#      Gold buy limit 4342 - 4339
+#      SL 4336.00
+#      Tp 4347
+#      Tp 4355
+#      Tp 4390
+#      Tp Open
+#
+#    Quoting a range means "work this whole zone", so BOTH ends are traded:
+#    one order at each, sharing the stated SL and the nearest target (4347
+#    here). See _parse_range for why both ends rather than a midpoint.
+#
 # Trailing commentary (risk tables, disclaimers, referral links, emoji) is
-# ignored in both.
+# ignored in all three.
 
 _ENTRY_RE = re.compile(
     r"^\s*(?P<symbol>[A-Z][A-Z0-9._]{1,14})\s+(?P<side>BUY|SELL)\s*@\s*(?P<entry>\d+(?:\.\d+)?)\s*$",
@@ -189,9 +203,9 @@ _EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 
-# Symbols this adapter will accept as the leading word of a trigger message.
-# An unknown first word means "not a signal" rather than "guess" — a channel
-# that posts a symbol we don't list is a config change, not a trade.
+# Symbols this adapter will accept as the leading word of a line. No line
+# leading with a known symbol means "not a signal" rather than "guess" — a
+# channel that posts a symbol we don't list is a config change, not a trade.
 KNOWN_SYMBOLS: frozenset[str] = frozenset(
     {
         "XAUUSD", "XAGUSD", "GOLD", "SILVER",
@@ -231,11 +245,31 @@ _TRIGGER_RE = re.compile(r"(?:\b(?:above|below|at)\b|@)\s*(\d+(?:\.\d+)?)", re.I
 # "SL 4808", "SL: 4808", "Stop Loss 4808" — with or without the "@" of dialect A.
 _SL_LOOSE_RE = re.compile(r"\b(?:sl|stop\s*loss)\s*:?\s*@?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 _TARGET_HEADER_RE = re.compile(r"\b(?:target|targets|tp)\s*:?\s*", re.IGNORECASE)
-# Deliberately no optional digit after the keyword: "Target 4790" must not have
-# its leading 4 eaten as a "TP4" label.
-_TP_LABEL_RE = re.compile(r"\btp\s*\d\s*:?\s*", re.IGNORECASE)
-_TP_LABELED_RE = re.compile(r"\btp\s*\d\s*:?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+# The ladder digit of "TP1: 4790" has to be told apart from the first digit of
+# a bare "Tp 4347" price, or the label eats it and the order goes out at 347.
+# The discriminator: a label digit is followed by a separator or a space, while
+# the digits of a price run straight into each other. Hence the lookahead — and
+# hence the digit being optional, so an unlabelled "Tp 4347" still yields 4347.
+_LABEL_SEP = r"(?=[:=.)\-]|\s)"
+_TP_LABEL_RE = re.compile(rf"\btp\s*\d{{1,2}}{_LABEL_SEP}\s*[:=.)\-]?\s*", re.IGNORECASE)
+_TP_LABELED_RE = re.compile(
+    rf"\btp\s*(?:\d{{1,2}}{_LABEL_SEP})?\s*[:=@.)\-]?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+# Dialect C's entry line: a side, optional wording ("limit", "zone", ": "), then
+# two prices joined by a dash / slash / "to". `[^\d\n]` for the wording keeps
+# the match on one line and stops it swallowing a price on the way.
+_RANGE_RE = re.compile(
+    r"\b(?P<side>buy|sell|long|short)\b"
+    r"(?P<mid>[^\d\n]{0,24}?)"
+    r"(?P<a>\d+(?:\.\d+)?)\s*(?:-{1,2}|–|—|/|\bto\b)\s*(?P<b>\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_KIND_STOP_RE = re.compile(r"\bstop\b", re.IGNORECASE)
+_KIND_LIMIT_RE = re.compile(r"\b(?:limit|zone|area|range)\b", re.IGNORECASE)
 
 
 class SignalError(ValueError):
@@ -354,6 +388,12 @@ def parse_signal(text: str) -> dict | None:
     tp_m = _TP_RE.search(clean)
     if entry_m is not None and sl_m is not None and tp_m is not None:
         return _parse_explicit(clean, entry_m, sl_m, tp_m)
+    # Range before trigger: a range line carries two prices, and the trigger
+    # grammar would happily read the first one as a lone entry and silently
+    # drop the second leg.
+    sig = _parse_range(clean)
+    if sig is not None:
+        return sig
     # A dialect-A entry line with looser SL/TP lines still parses as a trigger
     # signal; only if that fails too is the message genuinely malformed.
     sig = _parse_trigger(clean)
@@ -401,7 +441,7 @@ def _parse_explicit(
 def _parse_trigger(text: str) -> dict | None:
     """Dialect B: `SYMBOL Buy Trigger only Above <price>` + SL + target ladder.
 
-    The symbol must be the first word and known; the direction, trigger price
+    The symbol must lead a line and be known; the direction, trigger price
     and SL are taken from their first occurrence, which is the signal block at
     the top of the post — everything below it is promo copy.
     """
@@ -432,18 +472,113 @@ def _parse_trigger(text: str) -> dict | None:
     return sig
 
 
-def _extract_symbol(text: str) -> str | None:
-    words = text.split()
-    if not words:
+def _parse_range(text: str) -> dict | None:
+    """Dialect C: a two-price entry range, an SL, and targets on their own lines.
+
+        Gold buy limit 4342 - 4339
+        SL 4336.00
+        Tp 4347
+        Tp 4355
+        Tp 4390
+        Tp Open
+
+    BOTH ends of the range are traded — one order at each, sharing the stated
+    SL and the same target. A range is the channel saying "this whole zone is
+    the entry"; splitting it into two resting orders is the only reading that
+    honours that without inventing a price the channel never named (a midpoint
+    would), and it is the same shape as dialect A's optional second leg, so
+    build_commands needs no special case.
+
+    Which end leads is derived, not taken from the quoted order: for a limit
+    the leg price reaches FIRST leads (the higher one on a buy, the lower on a
+    sell), for a stop the other way round. A channel that quotes "4339 - 4342"
+    therefore places the same two orders as one that quotes "4342 - 4339".
+    """
+    symbol = _extract_symbol(text)
+    if symbol is None:
         return None
-    candidate = words[0].upper().strip(".,;:!?")
-    if candidate in KNOWN_SYMBOLS:
-        return candidate
-    # Some channels split the pair ("XAU USD").
-    if len(words) >= 2:
-        combined = (words[0] + words[1]).upper().strip(".,;:!?")
-        if combined in KNOWN_SYMBOLS:
-            return combined
+    m = _RANGE_RE.search(text)
+    if m is None:
+        return None
+
+    side = "buy" if m.group("side").lower() in ("buy", "long") else "sell"
+    a, b = float(m.group("a")), float(m.group("b"))
+    if a == b:
+        # Not a range at all -- let the other dialects have it rather than
+        # placing the same order twice.
+        return None
+
+    mid = m.group("mid") or ""
+    if _KIND_STOP_RE.search(mid):
+        kind = "stop"
+    elif _KIND_LIMIT_RE.search(mid):
+        kind = "limit"
+    else:
+        # Nothing said which way price reaches the zone. A quoted range is a
+        # resting zone in every dialect seen so far, so the legs are limits --
+        # but order_type stays unset below, leaving ENTRY_MODE its say over the
+        # leading leg exactly as dialect B does.
+        kind = "limit"
+
+    lead_high = (side == "buy") == (kind == "limit")
+    entry, second = (max(a, b), min(a, b)) if lead_high else (min(a, b), max(a, b))
+
+    sl_m = _SL_LOOSE_RE.search(text)
+    if sl_m is None:
+        raise SignalError("signal missing SL")
+    sl = float(sl_m.group(1))
+
+    tps = _extract_targets(text)
+    if not tps:
+        raise SignalError("signal missing TP/target line")
+    # Nearest-first, so TP_MODE=first means the target price reaches SOONEST
+    # rather than whichever one the channel happened to type first.
+    tps.sort(reverse=(side == "sell"))
+
+    # Every check is run against BOTH legs: the far leg sits closer to the stop
+    # and further from the targets, so it is the one a sloppy message breaks.
+    _check_bracket(side, entry, sl, tps)
+    _check_bracket(side, second, sl, tps)
+
+    sig = _blank_signal(symbol, side, entry)
+    sig.update(
+        sl=sl,
+        tp=tps[0],
+        tps=tps,
+        order_type=(
+            f"{side}{kind}" if _KIND_STOP_RE.search(mid) or _KIND_LIMIT_RE.search(mid)
+            else _derive_order_type(side, text)
+        ),
+        second={"kind": kind, "entry": second},
+    )
+    return sig
+
+
+def _extract_symbol(text: str) -> str | None:
+    """The first known symbol that LEADS A LINE, or None.
+
+    Anchored per line rather than to the first word of the whole message,
+    because channels routinely head a post with a caption line -- "SIGNAL 4",
+    "TRADE #12", a recap banner -- before the entry line. Anchoring to the
+    message start dropped those posts entirely even though the entry, SL and
+    targets below were perfectly well formed.
+
+    Leading a line is still the requirement, and it is what keeps the guard
+    that matters: "gold" inside a disclaimer or promo sentence never leads its
+    line, so prose still cannot promote itself to a symbol.
+    """
+    for line in text.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        candidate = words[0].upper().strip(".,;:!?")
+        if candidate in KNOWN_SYMBOLS:
+            return candidate
+        # Some channels split the pair ("XAU USD").
+        if len(words) >= 2:
+            combined = (words[0] + words[1]).upper().strip(".,;:!?")
+            if combined in KNOWN_SYMBOLS:
+                return combined
     return None
 
 

@@ -55,9 +55,12 @@ XAUUSD Sell Trigger only Below 4792 📉
   | Sell … above | `selllimit` |
   | Sell … below | `sellstop` |
 
-- The symbol must be the **first word** and one this adapter knows
+- The symbol must **lead a line** and be one this adapter knows
   (majors, metals, indices, BTC/ETH — see `KNOWN_SYMBOLS` in `app.py`).
-  An unknown first word means "not a signal", never a guess.
+  A caption line above the entry ("SIGNAL 4 🔽", "TRADE #12") is therefore
+  fine; a symbol mentioned mid-sentence in a disclaimer is not, because it
+  does not lead its line. No such line at all means "not a signal", never a
+  guess.
 - `SL 4808`, `SL: 4808` and `Stop Loss 4808` all work; so do
   `Target a b c+` and `TP1: a TP2: b TP3: c`.
 - Common aliases are normalised before the operator map:
@@ -68,10 +71,46 @@ XAUUSD Sell Trigger only Below 4792 📉
   (furthest), or `ladder` — one order per target, **each at the full fixed
   lot, so N targets means N× the exposure**.
 
-### Both formats
+### C. "Entry range" format
+
+```
+Gold buy limit 4342 - 4339
+SL 4336.00
+Tp 4347
+Tp 4355
+Tp 4390
+Tp Open
+```
+
+- The entry is a **zone, not a price**, so **both ends are traded** — one
+  order at each, sharing the stated SL and the same target:
+
+  | Order | Entry | SL | TP |
+  |---|---|---|---|
+  | `buylimit` | 4342 | 4336 | 4347 |
+  | `buylimit` | 4339 | 4336 | 4347 |
+
+  Sells mirror it exactly (`Gold sell limit 4360 - 4363` → `selllimit` at
+  4360 and at 4363).
+- **Which end leads is derived, not read off the message**: the leg price
+  reaches first (higher on a buy limit, lower on a sell limit; the other way
+  round for stops). `4339 - 4342` therefore places the same two orders as
+  `4342 - 4339`.
+- `limit` / `zone` / `area` / `range` in the line → limit orders; `stop` →
+  stop orders; neither → `TELEGRAM_INGEST_ENTRY_MODE` decides, as in format A.
+- Separators `-`, `–`, `—`, `/` and `to` all work.
+- Targets may sit on their **own lines** (`Tp 4347`) as well as inline. They
+  are sorted **nearest-first regardless of the order typed**, so the default
+  `TELEGRAM_INGEST_TP_MODE=first` takes the closest target (4347 above).
+  Lines with no price — `Tp Open` — are ignored.
+- The whole message is rejected if the SL sits inside or beyond the zone:
+  both legs are bracket-checked, not just the leading one.
+
+### All formats
 
 - Lot size is **never** taken from the message — it is fixed by
-  `TELEGRAM_INGEST_FIXED_LOT` (default `0.01`).
+  `TELEGRAM_INGEST_FIXED_LOT` (default `0.01`), or split across the signal's
+  orders when `TELEGRAM_INGEST_RISK_USD` is set.
 - Emoji, risk tables, disclaimers and referral links are stripped/ignored.
 
 ## Setup
