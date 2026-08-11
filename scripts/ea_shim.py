@@ -41,7 +41,13 @@ import MetaTrader5 as mt5
 import websockets
 
 from _txnlog import get_txn_logger, log_txn
-from _tradestore import meta_set, record_closed_trade, record_equity, record_order
+from _tradestore import (
+    meta_set,
+    record_closed_trade,
+    record_equity,
+    record_order,
+    sibling_broker_order_ids,
+)
 
 TXN_LOG = get_txn_logger("mt5-fills")
 
@@ -60,6 +66,21 @@ PENDING_FALLBACK = os.environ.get("EA_SHIM_PENDING_FALLBACK", "true").lower() in
     "on",
 )
 RISK_USD = float(os.environ.get("EA_SHIM_RISK_USD", "0") or 0)
+
+# One-cancels-other. A multi-entry signal (an entry range, or an explicit
+# "SECOND BUY LIMIT") rests several orders on the same symbol, all aiming at
+# the same target. Once one of them has run to that target the trade is over:
+# a leg still resting below is no longer the second half of a live idea, it is
+# a fresh entry into a move that already happened, taken at a worse price with
+# the same stop. So when a leg closes AT TP, the siblings still pending from
+# that same signal are withdrawn.
+#
+# Deliberately narrow -- only a close whose broker reason is TP triggers this.
+# A stop-out, a manual close or a close from the "close longs" command all
+# leave the other leg exactly where it is.
+CANCEL_SIBLINGS_ON_TP = os.environ.get(
+    "EA_SHIM_CANCEL_SIBLINGS_ON_TP", "true"
+).lower() in ("true", "1", "yes", "on")
 
 NOTIFY_TOKEN = os.environ.get("TELEGRAM_INGEST_BOT_TOKEN", "")
 _notify_chat_raw = (
@@ -163,8 +184,14 @@ def _fmt_position(p):
 
 
 def _closed_result(ticket):
-    """Realized P/L (incl. commission/swap) and close price of a position
-    that just left the open-positions list."""
+    """Realized P/L (incl. commission/swap), close price, and WHY it closed,
+    for a position that just left the open-positions list.
+
+    The reason comes from the broker's own closing deal (mt5.DEAL_REASON_*),
+    not inferred from the price or the sign of the P/L: a position can finish
+    profitable without having reached its take-profit, and one-cancels-other
+    must fire on "hit TP" specifically, never on "ended up green". None when
+    no closing deal is readable, which callers treat as "not a TP"."""
     deals = (
         mt5.history_deals_get(
             datetime.now() - timedelta(days=7),
@@ -176,7 +203,33 @@ def _closed_result(ticket):
     out = [d for d in deals if d.entry != mt5.DEAL_ENTRY_IN]
     profit = sum(d.profit + d.commission + d.swap for d in out)
     price = out[-1].price if out else 0.0
-    return profit, price
+    reason = getattr(out[-1], "reason", None) if out else None
+    return profit, price, reason
+
+
+def cancel_pending_orders(tickets):
+    """Withdraw the named pending orders. Returns (removed, failures).
+
+    Only orders that are still PENDING and shim-owned are touched:
+    mt5.orders_get() lists resting orders only, so a sibling that has already
+    triggered into a position is simply absent here and is left alone -- this
+    cancels orders, it never closes trades. A ticket that is gone (filled,
+    expired, already cancelled) is silently skipped for the same reason."""
+    wanted = {str(t) for t in tickets}
+    if not wanted:
+        return [], []
+    removed, failures = [], []
+    for o in mt5.orders_get() or []:
+        if str(o.ticket) not in wanted or o.magic != MAGIC:
+            continue
+        res = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+        if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
+            failures.append(
+                f"{o.ticket}: {res.retcode if res else mt5.last_error()}"
+            )
+        else:
+            removed.append(str(o.ticket))
+    return removed, failures
 
 
 # Equity snapshot cadence: position_monitor already polls every
@@ -188,6 +241,51 @@ EQUITY_SNAPSHOT_EVERY = 60
 # -- frequent enough that the dashboard's ~90s staleness check has margin,
 # infrequent enough not to spam the store with a write every 5s poll.
 HEARTBEAT_EVERY = 6
+
+
+def _cancel_siblings_after_tp(ticket, position):
+    """A leg of a multi-entry signal just hit TP -- withdraw the legs of THAT
+    SAME signal that are still resting.
+
+    Siblings are resolved through the trade store, not through the MT5
+    comment. The comment names the channel, so comment-matching would also
+    cancel a different, still-valid signal the same channel has working on the
+    same symbol. sibling_broker_order_ids() walks ticket -> trace_id -> signal
+    -> sibling tickets instead, so only legs of this one message are eligible.
+
+    Every failure path here is a no-op by construction: an unresolvable ticket
+    returns no siblings, and a sibling that already filled is not a pending
+    order and is skipped. Never raises -- this runs inside the monitor loop,
+    and a bookkeeping problem must not stop position tracking or notifications.
+    """
+    try:
+        siblings = sibling_broker_order_ids(str(ticket))
+        if not siblings:
+            return
+        removed, failures = cancel_pending_orders(siblings)
+        if removed:
+            log(
+                f"TP on {position.symbol} #{ticket} -- cancelled sibling "
+                f"pending order(s) {', '.join(removed)}"
+            )
+            log_txn(
+                TXN_LOG,
+                event="siblings_cancelled_after_tp",
+                position=ticket,
+                symbol=position.symbol,
+                cancelled=removed,
+                comment=position.comment,
+            )
+            tg_notify(
+                f"🚫 Pending order cancelled\n"
+                f"{position.symbol} hit TP, so the other entry from the same "
+                f"signal was withdrawn\n"
+                f"Ticket(s) {', '.join(removed)}"
+            )
+        for f in failures:
+            log(f"could not cancel sibling pending {f}")
+    except Exception as e:  # noqa: BLE001 - monitor loop must survive
+        log(f"sibling cancel after TP failed: {short_exc(e)}")
 
 
 def position_monitor():
@@ -211,7 +309,7 @@ def position_monitor():
                         )
                 for ticket, p in known.items():
                     if ticket not in current:
-                        profit, close_price = _closed_result(ticket)
+                        profit, close_price, close_reason = _closed_result(ticket)
                         sign = "+" if profit >= 0 else "-"
                         tg_notify(
                             f"{'✅' if profit >= 0 else '❌'} Trade closed\n"
@@ -243,6 +341,8 @@ def position_monitor():
                             comment=p.comment,
                             source="telegram" if str(p.comment).startswith("tg-") else "tradingview",
                         )
+                        if CANCEL_SIBLINGS_ON_TP and close_reason == mt5.DEAL_REASON_TP:
+                            _cancel_siblings_after_tp(ticket, p)
             known = current
 
             iteration += 1

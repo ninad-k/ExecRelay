@@ -962,6 +962,59 @@ def recent_symbols_for_channel(channel_name: str | None, days: int = 7) -> list[
     return [str(r["symbol"]) for r in rows if r.get("symbol")]
 
 
+def sibling_broker_order_ids(broker_order_id: str) -> list[str]:
+    """The OTHER broker order ids issued by the same signal as this one.
+
+    A range/second-entry signal becomes several orders, one per leg. They are
+    only related through the store: each leg is an `orders` row keyed by its
+    trace_id, and the `signals` row that produced them lists every one of those
+    trace_ids. So the walk is ticket -> trace_id -> signal -> sibling trace_ids
+    -> sibling tickets.
+
+    That indirection is the point. The MT5 comment identifies the CHANNEL
+    ("tg-VGTA"), not the signal, so matching on it would sweep in a different,
+    still-live signal from the same channel on the same symbol -- something
+    these channels do routinely. Only the store knows which legs were one
+    message.
+
+    Returns [] on anything unexpected -- no row, no signal, store unreachable.
+    Callers must treat that as "cancel nothing", never as "cancel everything".
+    """
+    if not broker_order_id:
+        return []
+    rows = query(
+        "SELECT trace_id FROM orders WHERE broker_order_id = ?", (str(broker_order_id),)
+    )
+    trace_id = str(rows[0]["trace_id"]) if rows and rows[0].get("trace_id") else ""
+    if not trace_id:
+        return []
+
+    # The signal that issued it. LIKE on the JSON array is a containment test,
+    # not a parse -- the quotes around the id keep it from matching a prefix of
+    # some other trace_id.
+    sig_rows = query(
+        "SELECT trace_ids FROM signals WHERE trace_ids LIKE ?", (f'%"{trace_id}"%',)
+    )
+    sibling_traces: list[str] = []
+    for r in sig_rows:
+        try:
+            ids = json.loads(r.get("trace_ids") or "[]")
+        except (TypeError, ValueError):
+            continue
+        if trace_id in ids:
+            sibling_traces.extend(t for t in ids if t and t != trace_id)
+    if not sibling_traces:
+        return []
+
+    marks = ",".join("?" * len(sibling_traces))
+    out = query(
+        f"SELECT broker_order_id FROM orders WHERE trace_id IN ({marks}) "
+        "AND broker_order_id IS NOT NULL AND broker_order_id != ''",
+        tuple(sibling_traces),
+    )
+    return [str(r["broker_order_id"]) for r in out if r.get("broker_order_id")]
+
+
 # ---------------------------------------------------------------------------
 # Runtime settings -- operator switches that must take effect without a stack
 # restart. Stored in the `meta` kv table, so there is no schema change here:
