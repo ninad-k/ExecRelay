@@ -86,6 +86,138 @@ def log(*a) -> None:
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+# --- decoding messages from a TL layer newer than Telethon knows -------------
+#
+# Telegram bumps a constructor id whenever it adds a field to a type. Telethon
+# only knows the ids that existed when it was released, so once the server
+# moves ahead, an ORDINARY channel post arrives with an id the client refuses
+# to read: TypeNotFoundError, the whole update container is discarded, and the
+# signal inside it is lost. There is no upgrade to apply -- this fires on the
+# newest release there is.
+#
+# The observed case is `message`: id 0x3ae56482 where Telethon knows
+# 0x7600b9d3. Every one of the 143 real messages recovered from the error logs
+# parses byte-for-byte identically under Telethon's existing Message layout,
+# so only the id moved; the fields did not.
+#
+# "Parses without raising" is NOT enough to act on. A desync that shifts a
+# price by a digit is far worse than a missed signal, so a decoded message is
+# trusted only if it survives BOTH checks below. Either one failing raises
+# TypeNotFoundError -- exactly what would have happened without this shim, so
+# the worst case is the behaviour we already had: skipped and logged, never
+# guessed at.
+#
+#   1. No unknown flag bits. In TL, a new field arrives with a new flag bit
+#      gating it. Telethon skips bits it does not know, leaving those bytes
+#      unread -- and since BOTH the parse and the re-serialization would then
+#      omit them, check 2 cannot see it. Comparing the flags against the mask
+#      Telethon actually reads is what catches "Telegram added a field".
+#
+#   2. Byte-exact round trip. Re-serialize the parsed message and compare it
+#      to the bytes consumed. This catches a field that moved, changed width
+#      or changed type -- anything where the layout is not what we assumed.
+#
+# All 143 real messages recovered from the error logs pass both.
+_MESSAGE_ALIAS_IDS = (0x3AE56482,)
+
+
+def _known_flag_masks(cls) -> tuple[int, int] | None:
+    """The flag bits Telethon's generated reader actually looks at.
+
+    Derived from the reader source rather than hand-copied, so it cannot fall
+    out of step with the installed Telethon. None means it could not be
+    determined -- in which case the alias is not installed at all, and the
+    relay keeps its current skip-and-log behaviour.
+    """
+    import inspect
+    import re as _re
+
+    try:
+        src = inspect.getsource(cls.from_reader)
+    except (OSError, TypeError):  # pragma: no cover - source not available
+        return None
+    mask = mask2 = 0
+    for bit in _re.findall(r"\bflags & (\d+)", src):
+        mask |= int(bit)
+    for bit in _re.findall(r"\bflags2 & (\d+)", src):
+        mask2 |= int(bit)
+    if not mask:  # nothing recognised: assume introspection failed
+        return None
+    return mask, mask2
+
+
+def _install_layer_aliases() -> list[str]:
+    """Teach Telethon the newer `message` constructor ids, verified per read.
+
+    Returns a description of what was installed, for the startup log. An id
+    Telethon already knows is left alone, so a future release that ships real
+    support silently wins over this shim.
+    """
+    try:
+        from telethon.errors import TypeNotFoundError
+        from telethon.tl import alltlobjects
+        from telethon.tl.types import Message
+    except ImportError:  # pragma: no cover - telethon import already guarded
+        return []
+
+    masks = _known_flag_masks(Message)
+    if masks is None:
+        return []
+    known_flags, known_flags2 = masks
+
+    def make_alias(constructor_id: int):
+        class _VerifiedMessage(Message):
+            CONSTRUCTOR_ID = constructor_id
+
+            @classmethod
+            def from_reader(cls, reader):
+                start = reader.tell_position()
+
+                def refuse():
+                    reader.set_position(start - 4)
+                    return TypeNotFoundError(constructor_id, reader.read())
+
+                # 1. flags first -- a bit we do not know means a field we do
+                #    not read, and bytes we would silently leave behind.
+                raw = reader.get_bytes()[start:start + 8]
+                if len(raw) < 8:
+                    raise refuse()
+                flags = int.from_bytes(raw[0:4], "little")
+                flags2 = int.from_bytes(raw[4:8], "little")
+                if (flags & ~known_flags) or (flags2 & ~known_flags2):
+                    raise refuse()
+
+                obj = Message.from_reader(reader)
+
+                # 2. and the layout we assumed must reproduce the bytes we
+                #    were given, exactly. bytes(obj) re-emits Telethon's own
+                #    constructor id, so compare the FIELDS only.
+                consumed = reader.get_bytes()[start:reader.tell_position()]
+                try:
+                    faithful = bytes(obj)[4:] == consumed
+                except Exception:  # noqa: BLE001 - unserializable == untrusted
+                    faithful = False
+                if not faithful:
+                    raise refuse()
+                return obj
+
+        _VerifiedMessage.__name__ = f"Message_{constructor_id:08x}"
+        return _VerifiedMessage
+
+    installed = []
+    for cid in _MESSAGE_ALIAS_IDS:
+        if cid in alltlobjects.tlobjects:
+            continue
+        alltlobjects.tlobjects[cid] = make_alias(cid)
+        installed.append(f"0x{cid:08x}")
+    return installed
+
+
+# Installed at import so every entrypoint benefits -- iter_dialogs (cmd_chats,
+# the dialog refresh) hits the same undecodable constructors as the relay does.
+_INSTALLED_ALIASES = _install_layer_aliases()
+
+
 def short_exc(exc: BaseException, limit: int = 200) -> str:
     """One-line, bounded description of an exception.
 
@@ -495,6 +627,12 @@ async def cmd_run() -> None:
         print("TG_FORWARDER_SOURCE_CHAT and TG_FORWARDER_TARGET_CHAT are required", file=sys.stderr)
         sys.exit(2)
     acquire_single_instance_lock()
+    if _INSTALLED_ALIASES:
+        log(
+            "decoding newer-layer message constructors: "
+            + ", ".join(_INSTALLED_ALIASES)
+            + " (each read is re-serialized and byte-compared before it is trusted)"
+        )
     c = client()
     await connect_authorized(c)
 
