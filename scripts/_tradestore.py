@@ -47,7 +47,7 @@ DB_PATH = Path(
 )
 LOG_DIR = Path(__file__).resolve().parent.parent / ".local-stack" / "logs" / "transactions"
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 _SCHEMA_SQL = (
     """
@@ -127,15 +127,24 @@ _SCHEMA_SQL = (
     # dashboard couldn't resolve itself (no Telethon session); the forwarder
     # resolves it to a real id/title on its next refresh and renames the row
     # (see resolve_channel / mark_channel_resolution_error below).
+    # partial_book / breakeven (schema v4): per-channel switches for the split-
+    # TP "book 50%" feature -- see channel_flags() and telegram-ingest's
+    # build_commands(split_tp=...) / ea_shim's half-vs-full TP close handling.
+    # Declared here so a brand-new DB gets them straight from CREATE TABLE;
+    # an already-existing DB gets them from the ALTER TABLE migration below
+    # (CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so the
+    # column list here is NOT itself sufficient for upgrades).
     """
     CREATE TABLE IF NOT EXISTS channels (
-        chat_id     TEXT PRIMARY KEY,
-        title       TEXT,
-        spec        TEXT,
-        enabled     INTEGER NOT NULL DEFAULT 1,
-        added_ts    TEXT,
-        updated_ts  TEXT,
-        note        TEXT
+        chat_id       TEXT PRIMARY KEY,
+        title         TEXT,
+        spec          TEXT,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        added_ts      TEXT,
+        updated_ts    TEXT,
+        note          TEXT,
+        partial_book  INTEGER NOT NULL DEFAULT 0,
+        breakeven     INTEGER NOT NULL DEFAULT 0
     )
     """,
     # tg_dialogs: forwarder-populated cache of the account's Telegram dialogs
@@ -292,6 +301,33 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         conn.commit()
         current = 3
+
+    if current < 4:
+        # channels.partial_book / channels.breakeven -- a DB created before
+        # this feature existed has a `channels` table without these columns;
+        # CREATE TABLE IF NOT EXISTS above never touches an existing table, so
+        # they have to be added explicitly. Guarded by pragma table_info so
+        # this is idempotent even if two processes race to migrate at once
+        # (ADD COLUMN on a column that already exists raises, which would
+        # otherwise wedge every later get_conn() call against this DB).
+        try:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(channels)")}
+            if "partial_book" not in cols:
+                conn.execute(
+                    "ALTER TABLE channels ADD COLUMN partial_book INTEGER NOT NULL DEFAULT 0"
+                )
+            if "breakeven" not in cols:
+                conn.execute(
+                    "ALTER TABLE channels ADD COLUMN breakeven INTEGER NOT NULL DEFAULT 0"
+                )
+        except Exception as exc:  # noqa: BLE001 - migration must never crash a caller
+            _warn(f"schema v4 channel flag columns migration failed: {exc!r}")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '4') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
+        current = 4
 
 
 def get_conn() -> sqlite3.Connection | None:
@@ -755,7 +791,8 @@ def meta_set(key: str, value: str) -> None:
 
 def list_channels() -> list[dict]:
     return query(
-        "SELECT chat_id, title, spec, enabled, added_ts, updated_ts, note FROM channels "
+        "SELECT chat_id, title, spec, enabled, added_ts, updated_ts, note, "
+        "partial_book, breakeven FROM channels "
         "ORDER BY CASE WHEN chat_id='direct' THEN 0 ELSE 1 END, "
         "COALESCE(title, spec, chat_id) COLLATE NOCASE"
     )
@@ -804,19 +841,41 @@ def upsert_channel(
                 pass
 
 
+# Boolean columns on `channels` an operator can flip at runtime, shared by
+# set_channel_flag()'s allowlist below. `field` ends up interpolated into SQL
+# (sqlite3 can't parameterize identifiers), so this gate is load-bearing, not
+# decorative -- keep it in sync with the channels schema.
+_CHANNEL_FLAG_COLUMNS = ("enabled", "partial_book", "breakeven")
+
+
 def set_channel_enabled(chat_id: str, enabled: bool) -> None:
+    set_channel_flag(chat_id, "enabled", enabled)
+
+
+def set_channel_flag(chat_id: str, field: str, value: bool) -> None:
+    """Flip one boolean column on a channel row -- shared setter behind
+    set_channel_enabled() and the dashboard's partial_book/breakeven toggles.
+
+    `field` MUST be one of _CHANNEL_FLAG_COLUMNS. The dashboard validates the
+    same allowlist before calling in (see trade_dashboard.py's
+    /api/channels/toggle handler); this check is the second, store-level
+    gate -- defense in depth, since an f-string column name is the one place
+    in this module SQL injection would actually be possible."""
+    if field not in _CHANNEL_FLAG_COLUMNS:
+        _warn(f"set_channel_flag: rejected unknown field {field!r}")
+        return
     conn = None
     try:
         conn = get_conn()
         if conn is None:
             return
         conn.execute(
-            "UPDATE channels SET enabled=?, updated_ts=? WHERE chat_id=?",
-            (1 if enabled else 0, _utcnow_iso(), str(chat_id)),
+            f"UPDATE channels SET {field}=?, updated_ts=? WHERE chat_id=?",
+            (1 if value else 0, _utcnow_iso(), str(chat_id)),
         )
         conn.commit()
     except Exception as exc:  # noqa: BLE001
-        _warn(f"set_channel_enabled failed: {exc!r}")
+        _warn(f"set_channel_flag failed: {exc!r}")
     finally:
         if conn is not None:
             try:
@@ -935,6 +994,33 @@ def is_channel_enabled(channel_name: str | None) -> bool:
     return bool(rows[0].get("enabled"))
 
 
+def channel_flags(channel_name: str | None) -> dict:
+    """Per-channel partial-booking / breakeven switches -- {"partial_book":
+    bool, "breakeven": bool}. `channel_name` matches is_channel_enabled()'s
+    lookup exactly (title COLLATE NOCASE, or the 'direct' pseudo-channel for
+    None/empty).
+
+    Fail CLOSED, the opposite of is_channel_enabled()'s fail-open: an
+    unregistered channel, a missing row, or any store failure returns both
+    False. Unlike "is this channel allowed to trade at all" (where a missing
+    row must never silently stop trading), a config gap here must never
+    silently DOUBLE the order count or start moving stops -- so absence of
+    config means "do nothing extra", not "do the new thing"."""
+    if channel_name:
+        rows = query(
+            "SELECT partial_book, breakeven FROM channels WHERE title = ? COLLATE NOCASE",
+            (channel_name,),
+        )
+    else:
+        rows = query("SELECT partial_book, breakeven FROM channels WHERE chat_id = 'direct'")
+    if not rows:
+        return {"partial_book": False, "breakeven": False}
+    return {
+        "partial_book": bool(rows[0].get("partial_book")),
+        "breakeven": bool(rows[0].get("breakeven")),
+    }
+
+
 def recent_symbols_for_channel(channel_name: str | None, days: int = 7) -> list[str]:
     """Distinct symbols this channel has actually traded in the last `days`.
 
@@ -962,24 +1048,35 @@ def recent_symbols_for_channel(channel_name: str | None, days: int = 7) -> list[
     return [str(r["symbol"]) for r in rows if r.get("symbol")]
 
 
-def sibling_broker_order_ids(broker_order_id: str) -> list[str]:
-    """The OTHER broker order ids issued by the same signal as this one.
+def sibling_order_rows(broker_order_id: str) -> list[dict]:
+    """Every order belonging to the same signal as `broker_order_id`,
+    INCLUDING the order asked about itself -- unlike sibling_broker_order_ids
+    below, which excludes it. Built for ea_shim's half-vs-full TP close
+    classification: deciding whether a just-closed order was the "half-TP"
+    leg or the "full-TP" leg needs its OWN tp next to its siblings' tps (not
+    just their broker order ids), plus the signal's channel (to look up
+    channel_flags() for the breakeven switch).
 
-    A range/second-entry signal becomes several orders, one per leg. They are
-    only related through the store: each leg is an `orders` row keyed by its
-    trace_id, and the `signals` row that produced them lists every one of those
-    trace_ids. So the walk is ticket -> trace_id -> signal -> sibling trace_ids
-    -> sibling tickets.
+    A range/second-entry signal becomes several orders, one per leg, related
+    only through the store: each leg is an `orders` row keyed by its
+    trace_id, and the `signals` row that produced them lists every one of
+    those trace_ids. So the walk is ticket -> trace_id -> signal -> every
+    trace_id on that signal -> every leg's order row.
 
     That indirection is the point. The MT5 comment identifies the CHANNEL
-    ("tg-VGTA"), not the signal, so matching on it would sweep in a different,
-    still-live signal from the same channel on the same symbol -- something
-    these channels do routinely. Only the store knows which legs were one
-    message.
+    ("tg-VGTA"), not the signal, so matching on it would sweep in a
+    different, still-live signal from the same channel on the same symbol --
+    something these channels do routinely. Only the store knows which legs
+    were one message.
+
+    Each row: {broker_order_id, trace_id, command, tp, entry, symbol,
+    channel}. `channel` is the signals row's channel value, copied onto every
+    row for convenience (it's the same for all of them -- one signal).
 
     Returns [] on anything unexpected -- no row, no signal, store unreachable.
-    Callers must treat that as "cancel nothing", never as "cancel everything".
-    """
+    Callers must treat that as "cannot resolve this signal's legs" and fall
+    back to whatever behaviour is safe when nothing is known (see
+    sibling_broker_order_ids and ea_shim's close-classification helper)."""
     if not broker_order_id:
         return []
     rows = query(
@@ -993,26 +1090,49 @@ def sibling_broker_order_ids(broker_order_id: str) -> list[str]:
     # not a parse -- the quotes around the id keep it from matching a prefix of
     # some other trace_id.
     sig_rows = query(
-        "SELECT trace_ids FROM signals WHERE trace_ids LIKE ?", (f'%"{trace_id}"%',)
+        "SELECT channel, trace_ids FROM signals WHERE trace_ids LIKE ?", (f'%"{trace_id}"%',)
     )
-    sibling_traces: list[str] = []
+    all_traces: list[str] = []
+    channel = None
     for r in sig_rows:
         try:
             ids = json.loads(r.get("trace_ids") or "[]")
         except (TypeError, ValueError):
             continue
         if trace_id in ids:
-            sibling_traces.extend(t for t in ids if t and t != trace_id)
-    if not sibling_traces:
+            all_traces = ids
+            channel = r.get("channel")
+            break
+    if not all_traces:
         return []
 
-    marks = ",".join("?" * len(sibling_traces))
+    marks = ",".join("?" * len(all_traces))
     out = query(
-        f"SELECT broker_order_id FROM orders WHERE trace_id IN ({marks}) "
+        f"SELECT broker_order_id, trace_id, command, tp, entry, symbol FROM orders "
+        f"WHERE trace_id IN ({marks}) "
         "AND broker_order_id IS NOT NULL AND broker_order_id != ''",
-        tuple(sibling_traces),
+        tuple(all_traces),
     )
-    return [str(r["broker_order_id"]) for r in out if r.get("broker_order_id")]
+    for r in out:
+        r["channel"] = channel
+    return out
+
+
+def sibling_broker_order_ids(broker_order_id: str) -> list[str]:
+    """The OTHER broker order ids issued by the same signal as this one --
+    thin wrapper over sibling_order_rows() (see its docstring for the store
+    walk), just excluding the id asked about and flattening to plain ids for
+    the OCO cancel path.
+
+    Returns [] on anything unexpected -- no row, no signal, store unreachable.
+    Callers must treat that as "cancel nothing", never as "cancel everything".
+    """
+    this_id = str(broker_order_id)
+    return [
+        str(r["broker_order_id"])
+        for r in sibling_order_rows(broker_order_id)
+        if r.get("broker_order_id") and str(r["broker_order_id"]) != this_id
+    ]
 
 
 # ---------------------------------------------------------------------------

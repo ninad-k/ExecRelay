@@ -481,6 +481,81 @@ def test_tp_amendment_is_not_read_as_an_entry_range(app_module):
     assert app_module.parse_tp_update("Tp set @ 4346 for both trade") == 4346.0
 
 
+# --- split_tp (per-channel partial_book) ------------------------------------
+#
+# build_commands(..., split_tp=True) doubles every order into a half-TP leg
+# (booking ~50% of the move) and a full-TP leg at the original target, each
+# using its OWN entry to compute the half. split_tp=False (the default) must
+# stay byte-identical to the pre-feature output -- covered by every test
+# above that calls build_commands() without the kwarg.
+
+
+def test_split_tp_single_leg_halves_the_tp_and_the_risk(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "RISK_USD_TOTAL", 100.0)
+    sig = app_module.parse_signal(
+        "GOLD SELL LIMIT @ 4380\n\nSL @ 4400\nTP @ 4370"
+    )
+    assert sig["second"] is None
+    cmds = app_module.build_commands(sig, split_tp=True)
+    # sell entry 4380, TP 4370 -> half TP = 4380 + (4370-4380)*0.5 = 4375.
+    assert cmds == [
+        "60123456789,selllimit,XAUUSD,entry_price=4380,risk=50,sl=4400,tp=4375,comment=tg-ingest,secret=s3cret",
+        "60123456789,selllimit,XAUUSD,entry_price=4380,risk=50,sl=4400,tp=4370,comment=tg-ingest,secret=s3cret",
+    ]
+
+
+def test_split_tp_off_by_default_is_byte_identical(app_module):
+    # Same signal as above, default split_tp=False: exactly one order, full
+    # TP only, risk NOT halved.
+    sig = app_module.parse_signal("GOLD SELL LIMIT @ 4380\n\nSL @ 4400\nTP @ 4370")
+    assert app_module.build_commands(sig) == [
+        "60123456789,selllimit,XAUUSD,entry_price=4380,vol_lots=0.01,sl=4400,tp=4370,comment=tg-ingest,secret=s3cret",
+    ]
+
+
+def test_split_tp_two_leg_range_signal_yields_four_commands_each_leg_own_half(
+    app_module, monkeypatch
+):
+    monkeypatch.setattr(app_module, "RISK_USD_TOTAL", 200.0)
+    sig = app_module.parse_signal(RANGE_BUY_MESSAGE)
+    assert sig["second"] == {"kind": "limit", "entry": 4339.0}
+    cmds = app_module.build_commands(sig, split_tp=True)
+    assert len(cmds) == 4
+    # risk split over n_orders = 1 target * 2 legs * 2 (split) = 4 -> 50 each.
+    assert all(",risk=50," in c for c in cmds)
+    # First leg: entry 4342, TP 4347 -> half = 4342 + (4347-4342)*0.5 = 4344.5.
+    assert cmds[0] == (
+        "60123456789,buylimit,XAUUSD,entry_price=4342,risk=50,sl=4336,"
+        "tp=4344.5,comment=tg-ingest,secret=s3cret"
+    )
+    assert cmds[1] == (
+        "60123456789,buylimit,XAUUSD,entry_price=4342,risk=50,sl=4336,"
+        "tp=4347,comment=tg-ingest,secret=s3cret"
+    )
+    # Second leg: its OWN entry 4339, TP 4347 -> half = 4339 + (4347-4339)*0.5 = 4343.
+    assert cmds[2] == (
+        "60123456789,buylimit,XAUUSD,entry_price=4339,risk=50,sl=4336,"
+        "tp=4343,comment=tg-ingest,secret=s3cret"
+    )
+    assert cmds[3] == (
+        "60123456789,buylimit,XAUUSD,entry_price=4339,risk=50,sl=4336,"
+        "tp=4347,comment=tg-ingest,secret=s3cret"
+    )
+
+
+def test_split_tp_market_entry_mode_still_uses_signal_entry_for_the_half(
+    app_module, monkeypatch
+):
+    # Market-mode commands carry no entry_price field, but sig["entry"] is
+    # still the E used to compute the half TP.
+    monkeypatch.setattr(app_module, "ENTRY_MODE", "market")
+    sig = app_module.parse_signal("EURUSD BUY @ 1.0850\nSL @ 1.0800\nTP @ 1.0950")
+    cmds = app_module.build_commands(sig, split_tp=True)
+    assert len(cmds) == 2
+    assert cmds[0].startswith("60123456789,buy,EURUSD,vol_lots=0.01,sl=1.08,tp=1.09,")
+    assert cmds[1].startswith("60123456789,buy,EURUSD,vol_lots=0.01,sl=1.08,tp=1.095,")
+
+
 def test_duplicate_messages_are_dropped(app_module):
     key = (-1001234567890, 424242)
     app_module._seen.discard(key)

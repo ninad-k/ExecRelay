@@ -1745,6 +1745,15 @@ def request_dialog_refresh() -> dict:
     }
 
 
+# Columns /api/channels/toggle is allowed to flip. First gate against a
+# client-supplied `field` string that gets passed through to _tradestore's
+# set_channel_flag(); that function has its own matching allowlist
+# (_CHANNEL_FLAG_COLUMNS) as a second, store-level check -- this one exists so
+# a bad request is rejected with a clear 400 here rather than a silent no-op
+# two layers down.
+_CHANNEL_TOGGLE_FIELDS = ("enabled", "partial_book", "breakeven")
+
+
 def add_channel(payload: dict) -> dict:
     """Add/upsert a channel row. `spec` is whatever the operator gave us --
     a numeric id (from the dialog picker or typed directly), 'direct', or
@@ -3137,13 +3146,19 @@ function channelStatusBadge(c) {
     : ` <span class="badge neutral">resolving…</span>`;
 }
 
+function channelToggleCell(c, field, checked) {
+  return `<td><label class="toggle-switch"><input type="checkbox" class="ch-toggle" data-chat-id="${esc(c.chat_id)}" data-field="${field}" ${checked ? "checked" : ""}><span class="toggle-slider"></span></label></td>`;
+}
+
 function channelRow(c) {
   const label = esc(c.title || c.spec || c.chat_id);
   const isDirect = c.chat_id === "direct";
   return `<tr>
     <td>${label}${channelStatusBadge(c)}</td>
     <td class="muted number">${esc(c.chat_id)}</td>
-    <td><label class="toggle-switch"><input type="checkbox" class="ch-toggle" data-chat-id="${esc(c.chat_id)}" ${c.enabled ? "checked" : ""}><span class="toggle-slider"></span></label></td>
+    ${channelToggleCell(c, "enabled", c.enabled)}
+    ${channelToggleCell(c, "partial_book", c.partial_book)}
+    ${channelToggleCell(c, "breakeven", c.breakeven)}
     <td class="number">${c.signals_30d || 0}</td>
     <td class="muted number">${esc((c.last_signal || "").slice(0, 19).replace("T", " ")) || "—"}</td>
     <td class="muted" style="white-space:normal;max-width:220px">${!c.pending_resolution ? esc(c.note || "") : ""}</td>
@@ -3161,7 +3176,7 @@ async function refreshChannels() {
   const d = await res.json();
   const channels = d.channels || [];
   $("chip-channels").textContent = `${channels.filter(c => c.enabled).length}/${channels.length} enabled`;
-  table("tbl-channels", ["Channel", "Chat ID", "Enabled", "Signals (30d)", "Last signal", "Note", ""], channels.map(channelRow));
+  table("tbl-channels", ["Channel", "Chat ID", "Enabled", "50% book", "Breakeven", "Signals (30d)", "Last signal", "Note", ""], channels.map(channelRow));
 
   const dialogs = d.dialogs || [];
   const sel = $("ch-dialog-select");
@@ -3308,12 +3323,12 @@ $("resubmit-scrim").addEventListener("click", e => { if (e.target.id === "resubm
 
 document.addEventListener("change", async (e) => {
   if (!e.target.classList.contains("ch-toggle")) return;
-  const chatId = e.target.dataset.chatId, enabled = e.target.checked;
+  const chatId = e.target.dataset.chatId, field = e.target.dataset.field || "enabled", value = e.target.checked;
   e.target.disabled = true;
   try {
     await fetch(withToken("/api/channels/toggle"), {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ chat_id: chatId, enabled }),
+      body: JSON.stringify({ chat_id: chatId, field, value }),
     });
   } finally {
     await refreshChannels();
@@ -4044,7 +4059,20 @@ class Handler(BaseHTTPRequestHandler):
                 chat_id = str(payload.get("chat_id") or "")
                 if not chat_id:
                     raise ValueError("chat_id is required")
-                ts.set_channel_enabled(chat_id, bool(payload.get("enabled")))
+                # `field` defaults to "enabled" so the original {chat_id,
+                # enabled} shape (no field) keeps working unchanged; the two
+                # new toggles (partial_book, breakeven) pass {chat_id, field,
+                # value} instead. `value` falls back to `enabled` for the
+                # same reason.
+                field = str(payload.get("field") or "enabled")
+                if field not in _CHANNEL_TOGGLE_FIELDS:
+                    raise ValueError(
+                        f"field must be one of {', '.join(_CHANNEL_TOGGLE_FIELDS)}, got {field!r}"
+                    )
+                value = payload.get("value", payload.get("enabled"))
+                if not isinstance(value, bool):
+                    raise ValueError("value must be true or false")
+                ts.set_channel_flag(chat_id, field, value)
                 self._send(200, json.dumps({"ok": True}).encode(), "application/json")
             elif path == "/api/channels/delete":
                 chat_id = str(payload.get("chat_id") or "")

@@ -42,11 +42,13 @@ import websockets
 
 from _txnlog import get_txn_logger, log_txn
 from _tradestore import (
+    channel_flags,
     meta_set,
     record_closed_trade,
     record_equity,
     record_order,
     sibling_broker_order_ids,
+    sibling_order_rows,
 )
 
 TXN_LOG = get_txn_logger("mt5-fills")
@@ -297,6 +299,170 @@ def _cancel_siblings_after_close(ticket, position, close_reason):
         log(f"sibling cancel after {hit} failed: {short_exc(e)}")
 
 
+def _classify_tp_close(ticket, rows):
+    """Half-TP vs full-TP close, decided from the store's view of this
+    signal's legs -- never from the MT5 comment, which only names the
+    CHANNEL ("tg-VGTA"), not the signal, so it cannot distinguish a
+    partial_book split from an ordinary single-order close.
+
+    `rows` is sibling_order_rows(str(ticket)): every order of this ticket's
+    signal, INCLUDING this ticket's own row. A partial_book signal's
+    half-TP leg always has a tp strictly closer to entry than its full-TP
+    sibling, so "some sibling's tp is further in the profit direction than
+    this row's own tp" is exactly "this was the half leg". Direction is
+    read off the row's own `command`: a buy-side command profits going UP
+    (further = higher tp), a sell-side command profits going DOWN (further
+    = lower tp).
+
+    Returns ("half" | "full", channel) when decidable, or (None, None) when
+    it isn't (this ticket's own row missing from `rows`, no tp recorded, or
+    a command that says neither buy nor sell). Callers must treat None the
+    same as "full" -- i.e. fall back to the pre-split cancel-siblings
+    behaviour, since that was correct before this feature existed and is
+    never a false breakeven move."""
+    own = next(
+        (r for r in rows if str(r.get("broker_order_id")) == str(ticket)), None
+    )
+    if own is None or own.get("tp") is None:
+        return None, None
+    try:
+        own_tp = float(own["tp"])
+    except (TypeError, ValueError):
+        return None, None
+    command = str(own.get("command") or "").lower()
+    if "buy" in command:
+        profit_is_up = True
+    elif "sell" in command:
+        profit_is_up = False
+    else:
+        return None, None
+
+    for r in rows:
+        if str(r.get("broker_order_id")) == str(ticket):
+            continue
+        tp = r.get("tp")
+        if tp is None:
+            continue
+        try:
+            sib_tp = float(tp)
+        except (TypeError, ValueError):
+            continue
+        if (sib_tp > own_tp) if profit_is_up else (sib_tp < own_tp):
+            return "half", own.get("channel")
+    return "full", own.get("channel")
+
+
+def _move_siblings_to_breakeven(ticket, position, sibling_ids):
+    """Half-TP leg just closed and this channel has breakeven ON -- move the
+    SL of this signal's still-OPEN sibling positions to each one's own
+    price_open. `sibling_ids` is the full sibling set (pending or filled);
+    mt5.positions_get() naturally narrows that to positions that actually
+    exist right now, so an already-cancelled or not-yet-triggered sibling is
+    silently skipped, same as cancel_pending_orders does for OCO.
+
+    Re-sends each position's existing tp unchanged rather than omitting it:
+    modify_positions_sltp's docstring explains why -- MT5 reads a 0 tp as
+    "remove the take-profit", so leaving it out of the request would
+    silently strip it.
+
+    Never raises -- runs inside the monitor loop; a bookkeeping problem here
+    must not stop position tracking or notifications."""
+    try:
+        wanted = {str(s) for s in sibling_ids if s}
+        if not wanted:
+            return
+        moved, failures = [], []
+        for p in mt5.positions_get() or []:
+            if p.magic != MAGIC or str(p.ticket) not in wanted:
+                continue
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": p.symbol,
+                "position": p.ticket,
+                "sl": p.price_open,
+                "tp": p.tp,
+                "magic": MAGIC,
+            }
+            res = mt5.order_send(req)
+            if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
+                failures.append(f"{p.ticket}: {res.retcode if res else mt5.last_error()}")
+            else:
+                moved.append(str(p.ticket))
+        if moved:
+            log(
+                f"half-TP on {position.symbol} #{ticket} -- moved sibling "
+                f"position(s) {', '.join(moved)} to breakeven"
+            )
+            log_txn(
+                TXN_LOG,
+                event="breakeven_after_partial_tp",
+                position=ticket,
+                symbol=position.symbol,
+                moved=moved,
+                comment=position.comment,
+            )
+            tg_notify(
+                f"🛡️ Breakeven\n"
+                f"{position.symbol} booked 50% at TP, so the rest of this "
+                f"signal's open position(s) were moved to breakeven\n"
+                f"Ticket(s) {', '.join(moved)}"
+            )
+        for f in failures:
+            log(f"could not move sibling to breakeven {f}")
+    except Exception as e:  # noqa: BLE001 - monitor loop must survive
+        log(f"breakeven move after half-TP failed: {short_exc(e)}")
+
+
+def _handle_close_oco(ticket, position, close_reason):
+    """Dispatch a just-closed position to the right one-cancels-other /
+    breakeven action. Replaces a direct _cancel_siblings_after_close() call
+    now that a signal can be split into half-TP / full-TP order pairs
+    (partial_book) -- see the module-level notes above CANCEL_SIBLINGS_ON_CLOSE
+    for the un-split OCO rationale, which still applies unchanged to SL closes
+    and to full-TP closes.
+
+    SL close: unchanged -- withdraw pending siblings. Every split order of a
+    signal shares one SL, so they close together regardless; this just
+    withdraws whatever hasn't triggered yet.
+
+    TP close: classify via the store (_classify_tp_close):
+      - half-TP: the signal is still live (the full-TP sibling is still
+        resting or still open) -- do NOT cancel pending siblings. If this
+        channel has breakeven ON, move this signal's still-open positions'
+        SL to their own price_open instead.
+      - full-TP, or undecidable (no store rows, ticket unresolvable, row
+        missing tp/command): today's pre-split behaviour -- cancel pending
+        siblings. Never guesses breakeven when the classification itself is
+        unknown.
+    """
+    if close_reason == mt5.DEAL_REASON_SL:
+        _cancel_siblings_after_close(ticket, position, close_reason)
+        return
+    if close_reason != mt5.DEAL_REASON_TP:
+        return
+    try:
+        rows = sibling_order_rows(str(ticket))
+    except Exception as e:  # noqa: BLE001 - monitor loop must survive
+        log(f"sibling_order_rows failed for #{ticket}: {short_exc(e)}")
+        rows = []
+    if not rows:
+        _cancel_siblings_after_close(ticket, position, close_reason)
+        return
+    kind, channel = _classify_tp_close(ticket, rows)
+    if kind != "half":
+        _cancel_siblings_after_close(ticket, position, close_reason)
+        return
+    flags = channel_flags(channel)
+    if not flags.get("breakeven"):
+        return
+    sibling_ids = [
+        r.get("broker_order_id")
+        for r in rows
+        if r.get("broker_order_id") and str(r["broker_order_id"]) != str(ticket)
+    ]
+    _move_siblings_to_breakeven(ticket, position, sibling_ids)
+
+
 def position_monitor():
     """Notify Telegram when a shim-owned position opens (market fill or a
     pending order triggering) and when one closes (with realized P/L). Also
@@ -354,7 +520,7 @@ def position_monitor():
                             mt5.DEAL_REASON_TP,
                             mt5.DEAL_REASON_SL,
                         ):
-                            _cancel_siblings_after_close(ticket, p, close_reason)
+                            _handle_close_oco(ticket, p, close_reason)
             known = current
 
             iteration += 1

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"
 from _txnlog import get_txn_logger, log_txn  # noqa: E402
 from _tradestore import (  # noqa: E402
     append_signal_trace,
+    channel_flags,
     get_dry_run,
     is_channel_enabled,
     recent_symbols_for_channel,
@@ -681,7 +682,7 @@ def select_targets(sig: dict) -> list[float]:
     return [tps[-1]] if TP_MODE == "last" else [tps[0]]
 
 
-def build_commands(sig: dict, comment: str | None = None) -> list[str]:
+def build_commands(sig: dict, comment: str | None = None, split_tp: bool = False) -> list[str]:
     """Render a parsed signal as flat ExecRelay webhook command bodies.
 
     A signal that names its own trigger direction ("Trigger only Above") is
@@ -696,7 +697,21 @@ def build_commands(sig: dict, comment: str | None = None) -> list[str]:
 
     comment defaults to TELEGRAM_INGEST_COMMENT; callers pass an override
     (e.g. the originating channel's initials) to identify the source on the
-    broker side, where MT5's comment field is the only place it's visible."""
+    broker side, where MT5's comment field is the only place it's visible.
+
+    split_tp (per-channel `partial_book` setting) turns every order this
+    signal would otherwise place into TWO: same entry, same SL, one with TP
+    at the halfway point between that leg's own entry and the original
+    target (booking roughly half the move) and one at the original target.
+    n_orders doubles to match, which — via the risk=.../n_orders split below —
+    automatically halves each order's risk; that IS the "book 50%" mechanism,
+    there is no separate partial-close logic anywhere in this pipeline. The
+    vol_lots fixed-lot path (RISK_USD_TOTAL <= 0) does NOT get this halving:
+    both split orders emit the same fixed lot, doubling total exposure on
+    that path. Accepted as-is — fixed-lot sizing is a manual/testing mode,
+    not how live risk is actually configured. Each leg computes its half TP
+    from its OWN entry (the second leg's own price, not the first leg's), and
+    emits half before full so the ledger reads in booking order."""
     symbol = resolve_symbol(sig["symbol"])
     secret = f",secret={SECRET}" if SECRET else ""
     targets = select_targets(sig)
@@ -704,7 +719,7 @@ def build_commands(sig: dict, comment: str | None = None) -> list[str]:
 
     # Split the per-signal risk budget evenly over every order this signal
     # expands into, so the SIGNAL total — not each leg — is the cap.
-    n_orders = len(targets) * (2 if sig["second"] is not None else 1)
+    n_orders = len(targets) * (2 if sig["second"] is not None else 1) * (2 if split_tp else 1)
     if RISK_USD_TOTAL > 0:
         sizing = f"risk={round(RISK_USD_TOTAL / n_orders, 2):g}"
     else:
@@ -716,26 +731,34 @@ def build_commands(sig: dict, comment: str | None = None) -> list[str]:
             f",comment={comment}{secret}"
         )
 
+    def leg_tps(entry: float, target: float) -> list[float]:
+        if not split_tp:
+            return [target]
+        half = entry + (target - entry) * 0.5
+        return [half, target]
+
     cmds: list[str] = []
     for tp in targets:
-        if sig.get("order_type"):
-            cmds.append(
-                f"{LICENSE_ID},{sig['order_type']},{symbol}"
-                f",entry_price={_fmt(sig['entry'])},{common(tp)}"
-            )
-        elif ENTRY_MODE == "market":
-            cmds.append(f"{LICENSE_ID},{sig['side']},{symbol},{common(tp)}")
-        else:
-            cmds.append(
-                f"{LICENSE_ID},{sig['side']}limit,{symbol}"
-                f",entry_price={_fmt(sig['entry'])},{common(tp)}"
-            )
+        for leg_tp in leg_tps(sig["entry"], tp):
+            if sig.get("order_type"):
+                cmds.append(
+                    f"{LICENSE_ID},{sig['order_type']},{symbol}"
+                    f",entry_price={_fmt(sig['entry'])},{common(leg_tp)}"
+                )
+            elif ENTRY_MODE == "market":
+                cmds.append(f"{LICENSE_ID},{sig['side']},{symbol},{common(leg_tp)}")
+            else:
+                cmds.append(
+                    f"{LICENSE_ID},{sig['side']}limit,{symbol}"
+                    f",entry_price={_fmt(sig['entry'])},{common(leg_tp)}"
+                )
         if sig["second"] is not None:
             cmd = f"{sig['side']}{sig['second']['kind']}"
-            cmds.append(
-                f"{LICENSE_ID},{cmd},{symbol}"
-                f",entry_price={_fmt(sig['second']['entry'])},{common(tp)}"
-            )
+            for leg_tp in leg_tps(sig["second"]["entry"], tp):
+                cmds.append(
+                    f"{LICENSE_ID},{cmd},{symbol}"
+                    f",entry_price={_fmt(sig['second']['entry'])},{common(leg_tp)}"
+                )
     return cmds
 
 
@@ -867,6 +890,26 @@ def _channel_enabled_cached(channel_name: str | None) -> bool:
     enabled = is_channel_enabled(channel_name)
     _channel_enabled_cache[channel_name] = (now, enabled)
     return enabled
+
+
+# Same cache/TTL shape as _channel_enabled_cached above, for the partial_book
+# / breakeven switches (scripts/_tradestore.py channel_flags()). Only
+# partial_book is actually read here: it decides how build_commands() splits
+# THIS message's orders at placement time. breakeven is deliberately NOT read
+# in this service at all -- ea_shim reads it fresh (via its own store call) at
+# close time instead, so flipping breakeven for a channel takes effect on
+# trades that are already open, not just on the next signal.
+_channel_flags_cache: dict[str | None, tuple[float, dict]] = {}
+
+
+def _channel_flags_cached(channel_name: str | None) -> dict:
+    now = time.time()
+    cached = _channel_flags_cache.get(channel_name)
+    if cached is not None and (now - cached[0]) < _CHANNEL_CACHE_TTL_SEC:
+        return cached[1]
+    flags = channel_flags(channel_name)
+    _channel_flags_cache[channel_name] = (now, flags)
+    return flags
 
 
 # Dry-run is an operator switch the dashboard can flip at runtime (persisted in
@@ -1096,7 +1139,8 @@ def handle_message(chat_id: int, message_id: int, text: str) -> None:
         return
 
     comment = f"tg-{channel_initials(channel_name)}" if channel_name else None
-    commands = build_commands(sig, comment=comment)
+    flags = _channel_flags_cached(channel_name)
+    commands = build_commands(sig, comment=comment, split_tp=flags["partial_book"])
     # Read the switch ONCE for the whole message: the outcome recorded below
     # and the per-command branch further down must agree even if the operator
     # flips dry-run (or the cache expires) midway through handling this one.
