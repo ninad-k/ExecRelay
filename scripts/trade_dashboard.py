@@ -213,6 +213,10 @@ RESUBMIT_TXN_LOG = get_txn_logger("dashboard-resubmit")
 # Operator control actions that change how the stack trades (currently just the
 # dry-run switch) get their own audit trail, separate from resubmits.
 CONTROL_TXN_LOG = get_txn_logger("dashboard-control")
+# "Send a sample TradingView signal" (see build_test_signal_command() /
+# send_test_signal() below) gets its own audit trail too, separate from real
+# telegram resubmits.
+WEBHOOK_TEST_TXN_LOG = get_txn_logger("dashboard-webhook-test")
 
 
 def _allowed_hosts() -> set[str]:
@@ -2163,6 +2167,113 @@ def resubmit_signal(payload: dict) -> tuple[int, dict]:
     return 200, {"ok": all_ok, "results": results, "warnings": preview.get("warnings", [])}
 
 
+# --- "Send a sample TradingView signal" -----------------------------------
+#
+# Builds a raw ExecRelay webhook body in exactly the wire format
+# pine/EMA915_Pullback_Webhook.pine sends (license,COMMAND,symbol,key=value...)
+# and POSTs it straight to ingress via _post_to_ingress -- the same function
+# resubmit_signal() uses -- so "Preview" / "Send" here exercises the real
+# TradingView -> ingress -> bridge -> ea_shim path, not a simulation of it.
+
+_WEBHOOK_TEST_COMMANDS = {"BUY", "SELL", "CLOSELONG", "CLOSESHORT"}
+_WEBHOOK_TEST_OPENS = {"BUY", "SELL"}
+
+
+def build_test_signal_command(fields: dict) -> tuple[str | None, str | None]:
+    """Returns (command, error); exactly one is non-None."""
+    command = str(fields.get("command") or "").strip().upper()
+    if command not in _WEBHOOK_TEST_COMMANDS:
+        return None, f"command must be one of {', '.join(sorted(_WEBHOOK_TEST_COMMANDS))}"
+
+    symbol = str(fields.get("symbol") or "").strip()
+    if not symbol:
+        return None, "symbol is required"
+
+    parts = [_ingest.LICENSE_ID, command, symbol]
+
+    if command in _WEBHOOK_TEST_OPENS:
+        vol_lots = str(fields.get("vol_lots") or "").strip()
+        if not vol_lots:
+            return None, "vol_lots is required for BUY/SELL"
+        parts.append(f"vol_lots={vol_lots}")
+
+        risk_mode = str(fields.get("risk_mode") or "bypass").strip()
+        if risk_mode == "bypass":
+            parts.append("risk=0")  # exact lots, no $-risk resizing (matches the pine script)
+        elif risk_mode == "custom":
+            risk_val = str(fields.get("risk") or "").strip()
+            if not risk_val:
+                return None, "risk is required when risk_mode is 'custom'"
+            parts.append(f"risk={risk_val}")
+        elif risk_mode != "stack":
+            return None, "risk_mode must be one of bypass, custom, stack"
+        # risk_mode == "stack": omit risk entirely, let EA_SHIM_RISK_USD size it.
+
+        sl = str(fields.get("sl") or "").strip()
+        tp = str(fields.get("tp") or "").strip()
+        if not sl or not tp:
+            return None, "sl and tp are required for BUY/SELL"
+        parts.append(f"sl={sl}")
+        parts.append(f"tp={tp}")
+
+    comment = str(fields.get("comment") or "webhook-test").strip()
+    if comment:
+        parts.append(f"comment={comment}")
+    if _ingest.SECRET:
+        parts.append(f"secret={_ingest.SECRET}")
+
+    return ",".join(parts), None
+
+
+def send_test_signal(payload: dict) -> tuple[int, dict]:
+    """Operator-triggered TradingView webhook test. Mirrors resubmit_signal()'s
+    safety gates: explicit confirm:true required to actually send, dry-run
+    always refuses. Returns a preview-shaped body ({ok, commands, warnings,
+    errors}) matching derive_preview()'s shape so the dashboard's existing
+    resubmit-confirm modal can render either one unchanged."""
+    warnings: list[str] = []
+    if effective_dry_run():
+        warnings.append("system is in DRY-RUN")
+    if not _ingest.LICENSE_ID:
+        warnings.append("TELEGRAM_INGEST_LICENSE_ID is not set — ingress will reject with license_rejected")
+
+    command, err = build_test_signal_command(payload)
+    if err:
+        return 400, {"ok": False, "commands": [], "warnings": warnings, "errors": [err]}
+
+    redacted = _ingest._redact_secret(command)
+    preview = {"ok": True, "commands": [redacted], "warnings": warnings, "errors": []}
+
+    if payload.get("confirm") is not True:
+        return 200, preview
+
+    if effective_dry_run():
+        return 409, {
+            "ok": False,
+            "error": "system is in DRY-RUN — test signal refused (turn dry-run off in the pipeline bar to place orders)",
+            "preview": preview,
+        }
+
+    try:
+        status, resp_text, trace_id = _post_to_ingress(command)
+    except Exception as exc:  # noqa: BLE001 - a network hiccup must not crash the handler
+        status, resp_text, trace_id = 0, str(exc), ""
+
+    ok = status == 200
+    log_txn(
+        WEBHOOK_TEST_TXN_LOG,
+        command=redacted,
+        http_status=status,
+        trace_id=trace_id,
+        ok=ok,
+    )
+    return 200, {
+        "ok": ok,
+        "results": [{"http_status": status, "trace_id": trace_id, "response": resp_text[:300]}],
+        "warnings": warnings,
+    }
+
+
 # --- background thread: daily/weekly digest + loss/drawdown alerts ------
 
 
@@ -2760,6 +2871,61 @@ button.actbtn:hover { background: var(--color-primary-glow); }
     </div>
   </section>
 
+  <section id="section-webhook-test">
+    <h2>Send a sample TradingView signal</h2>
+    <p class="muted" style="font-size:0.76rem;margin:0 0 .5rem">
+      Builds a webhook body in the exact format the TradingView strategy sends and posts it to
+      the real ingress endpoint — the same path a live TradingView alert takes. This can place a
+      real order; nothing is sent until you confirm, and it's refused outright while dry-run is on.
+    </p>
+    <form class="addchannel-form" id="webhook-test-form" onsubmit="return false">
+      <div>
+        <label>Command</label>
+        <select id="wt-command">
+          <option value="BUY">Buy</option>
+          <option value="SELL">Sell</option>
+          <option value="CLOSELONG">Close long</option>
+          <option value="CLOSESHORT">Close short</option>
+        </select>
+      </div>
+      <div>
+        <label>Symbol</label>
+        <input type="text" id="wt-symbol" value="XAUUSD" style="min-width:8rem">
+      </div>
+      <div id="wt-open-fields" style="display:contents">
+        <div>
+          <label>Volume (lots)</label>
+          <input type="text" id="wt-vol-lots" value="0.01" style="min-width:6rem">
+        </div>
+        <div>
+          <label>Risk sizing</label>
+          <select id="wt-risk-mode">
+            <option value="bypass">Exact lots (risk=0)</option>
+            <option value="stack">Stack $-risk sizing</option>
+            <option value="custom">Custom $ risk</option>
+          </select>
+        </div>
+        <div id="wt-risk-custom-field" style="display:none">
+          <label>Risk ($)</label>
+          <input type="text" id="wt-risk" value="25" style="min-width:6rem">
+        </div>
+        <div>
+          <label>Stop loss (price)</label>
+          <input type="text" id="wt-sl" placeholder="e.g. 4398" style="min-width:8rem">
+        </div>
+        <div>
+          <label>Take profit (price)</label>
+          <input type="text" id="wt-tp" placeholder="e.g. 4368" style="min-width:8rem">
+        </div>
+      </div>
+      <div>
+        <label>Comment</label>
+        <input type="text" id="wt-comment" value="webhook-test" style="min-width:8rem">
+      </div>
+      <button class="btn-primary" type="button" id="webhook-test-preview-btn">Preview</button>
+    </form>
+  </section>
+
   <h2>Performance</h2>
   <div class="grid2">
     <div class="chart-card"><h2 style="margin:0 0 .5rem" id="chart-equity-h2">Equity curve <span class="chip acctwide" id="chip-equity">account-wide</span></h2><div id="chart-equity"></div></div>
@@ -3247,7 +3413,7 @@ async function refreshUnposted() {
   }
 }
 
-let pendingResubmit = null; // { signal_id, text }
+let pendingResubmit = null; // { kind: "signal"|"webhook-test", signal_id, text, fields }
 
 function renderResubmitModal(d) {
   const n = (d.commands || []).length;
@@ -3264,7 +3430,7 @@ function renderResubmitModal(d) {
 }
 
 async function openPreview(signalId, text) {
-  pendingResubmit = { signal_id: signalId ?? null, text: text ?? null };
+  pendingResubmit = { kind: "signal", signal_id: signalId ?? null, text: text ?? null };
   const body = signalId != null ? { signal_id: signalId } : { text };
   try {
     const res = await fetch(withToken("/api/signals/preview"), {
@@ -3276,16 +3442,44 @@ async function openPreview(signalId, text) {
   }
 }
 
+function gatherWebhookTestFields() {
+  const command = $("wt-command").value;
+  return {
+    command,
+    symbol: $("wt-symbol").value,
+    vol_lots: $("wt-vol-lots").value,
+    risk_mode: $("wt-risk-mode").value,
+    risk: $("wt-risk").value,
+    sl: $("wt-sl").value,
+    tp: $("wt-tp").value,
+    comment: $("wt-comment").value,
+  };
+}
+
+async function openWebhookTestPreview() {
+  const fields = gatherWebhookTestFields();
+  pendingResubmit = { kind: "webhook-test", fields };
+  try {
+    const res = await fetch(withToken("/api/webhook-test/send"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(fields),
+    });
+    renderResubmitModal(await res.json());
+  } catch (e) {
+    renderResubmitModal({ ok: false, commands: [], warnings: [], errors: ["preview request failed: " + e] });
+  }
+}
+
 async function confirmResubmit() {
   if (!pendingResubmit) return;
-  const body = Object.assign(
-    { confirm: true },
-    pendingResubmit.signal_id != null ? { signal_id: pendingResubmit.signal_id } : { text: pendingResubmit.text }
-  );
+  const isWebhookTest = pendingResubmit.kind === "webhook-test";
+  const url = isWebhookTest ? "/api/webhook-test/send" : "/api/signals/resubmit";
+  const body = isWebhookTest
+    ? Object.assign({ confirm: true }, pendingResubmit.fields)
+    : Object.assign({ confirm: true }, pendingResubmit.signal_id != null ? { signal_id: pendingResubmit.signal_id } : { text: pendingResubmit.text });
   const btn = $("resubmit-confirm");
   btn.disabled = true;
   try {
-    const res = await fetch(withToken("/api/signals/resubmit"), {
+    const res = await fetch(withToken(url), {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body),
     });
     const d = await res.json();
@@ -3293,7 +3487,7 @@ async function confirmResubmit() {
       $("resubmit-results").innerHTML = (d.results || []).map(r =>
         `<div>${r.http_status === 200 ? '<span class="badge ok">sent</span>' : '<span class="badge bad">failed</span>'} trace ${esc(r.trace_id || "-")} (HTTP ${r.http_status})</div>`
       ).join("") || `<div class="${d.ok ? "pos" : "neg"}">${d.ok ? "sent" : "not sent"}</div>`;
-      await refreshUnposted();
+      if (!isWebhookTest) await refreshUnposted();
     } else {
       $("resubmit-results").innerHTML = `<div class="neg">${esc(d.error || ("HTTP " + res.status))}</div>`;
       btn.disabled = false;
@@ -3315,6 +3509,8 @@ document.addEventListener("click", (e) => {
     if (t.trim()) openPreview(null, t);
     return;
   }
+  const webhookTestBtn = e.target.closest("#webhook-test-preview-btn");
+  if (webhookTestBtn) { openWebhookTestPreview(); return; }
   const rcancel = e.target.closest("#resubmit-cancel");
   if (rcancel) { $("resubmit-scrim").style.display = "none"; pendingResubmit = null; return; }
 });
@@ -3883,6 +4079,13 @@ document.addEventListener("change", e => {
     persistState();
     refresh();
   }
+  if (e.target.id === "wt-command") {
+    const isOpen = e.target.value === "BUY" || e.target.value === "SELL";
+    $("wt-open-fields").style.display = isOpen ? "contents" : "none";
+  }
+  if (e.target.id === "wt-risk-mode") {
+    $("wt-risk-custom-field").style.display = e.target.value === "custom" ? "" : "none";
+  }
 });
 
 const THEME_KEY = "execrelay-dashboard-theme";
@@ -4027,7 +4230,7 @@ class Handler(BaseHTTPRequestHandler):
     _JSON_POST_ROUTES = (
         "/api/journal", "/api/channels", "/api/channels/toggle", "/api/channels/delete",
         "/api/signals/preview", "/api/signals/resubmit", "/api/dryrun",
-        "/api/dialogs/refresh",
+        "/api/dialogs/refresh", "/api/webhook-test/send",
     )
 
     def do_POST(self) -> None:
@@ -4091,6 +4294,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
             elif path == "/api/dialogs/refresh":
                 self._send(200, json.dumps(request_dialog_refresh(), default=str).encode(), "application/json")
+            elif path == "/api/webhook-test/send":
+                status, body = send_test_signal(payload)
+                self._send(status, json.dumps(body, default=str).encode(), "application/json")
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(400, str(exc).encode(), "text/plain")
 
