@@ -171,20 +171,25 @@ def sized_volume(symbol, ref_price, sl, requested, risk_usd):
 
 
 def tg_notify(text):
-    """Best-effort Telegram message to the signal chat. Never raises."""
-    if not (NOTIFY_TOKEN and NOTIFY_CHAT):
-        return
-    try:
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
-            data=json.dumps({"chat_id": NOTIFY_CHAT, "text": text}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-    except Exception as e:
-        log(f"telegram notify failed: {short_exc(e)}")
+    """Telegram integration disabled (2026-08-14) -- the bot now runs as its
+    own separate project (C:\\TelegramBot). Kept as a no-op choke point
+    (rather than commenting out every call site) so the position-open/close
+    notifications stay callable without any other code changes. Uncomment
+    the body below to re-enable."""
+    return
+    # if not (NOTIFY_TOKEN and NOTIFY_CHAT):
+    #     return
+    # try:
+    #     req = urllib.request.Request(
+    #         f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
+    #         data=json.dumps({"chat_id": NOTIFY_CHAT, "text": text}).encode(),
+    #         headers={"Content-Type": "application/json"},
+    #         method="POST",
+    #     )
+    #     with urllib.request.urlopen(req, timeout=10):
+    #         pass
+    # except Exception as e:
+    #     log(f"telegram notify failed: {short_exc(e)}")
 
 
 def _fmt_position(p):
@@ -924,8 +929,11 @@ async def main():
     if RISK_USD > 0:
         log(f"risk sizing active: max ${RISK_USD:g} loss per order")
     if NOTIFY_TOKEN and NOTIFY_CHAT:
+        # Telegram notifications (tg_notify) are disabled as of 2026-08-14 --
+        # this thread still starts because it also persists closed trades and
+        # runs the breakeven SL move, neither of which are Telegram-specific.
         threading.Thread(target=position_monitor, daemon=True).start()
-        log(f"position monitor active: notifying chat {NOTIFY_CHAT}")
+        log("position monitor active (Telegram notifications disabled)")
     while True:
         try:
             await run_session()

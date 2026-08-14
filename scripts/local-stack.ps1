@@ -285,6 +285,11 @@ function Invoke-Start {
 
     Start-Tracked -Name "ea-shim" -FilePath $python -ArgumentList @("scripts\ea_shim.py") | Out-Null
 
+    # --- Telegram integration disabled -- TradingView-only, at user's request
+    # (2026-08-14). Both blocks below fed signals into the same /webhook
+    # TradingView also posts to; uncomment both (and the closing #>) to
+    # re-enable the Telegram Bot-API ingest + personal-account forwarder.
+    <#
     if ($env:TELEGRAM_INGEST_BOT_TOKEN -and $env:TELEGRAM_INGEST_ALLOWED_CHAT_IDS) {
         # When the perimeter gate is on, every webhook caller (including the
         # internal ingest module) must carry ?token=<value>.
@@ -310,6 +315,8 @@ function Invoke-Start {
     } else {
         Write-Warning "skipping telegram-forwarder: TG_FORWARDER_SOURCE_CHAT / TG_FORWARDER_TARGET_CHAT (or API_ID) not set in .env -- Telegram signals will only flow if posted directly to the ingest bot's chat"
     }
+    #>
+    Write-Warning "Telegram integration is disabled (see 'Telegram integration disabled' in local-stack.ps1 Invoke-Start) -- only TradingView webhook signals are executed"
 
     # Localhost-only (shows account balances; optional bearer-token auth via
     # DASHBOARD_TOKEN in .env) -- keep it off the public interface even
@@ -339,12 +346,14 @@ function Invoke-Start {
         }
     }
 
-    $botUser = if ($env:TELEGRAM_BOT_USERNAME) { $env:TELEGRAM_BOT_USERNAME } else { "TeleGoldSignalsBot" }
+    # $botUser = if ($env:TELEGRAM_BOT_USERNAME) { $env:TELEGRAM_BOT_USERNAME } else { "TeleGoldSignalsBot" }
     $dashboardUrl = "http://127.0.0.1:$DashboardPort"
     if ($env:DASHBOARD_TOKEN) { $dashboardUrl += "?token=$($env:DASHBOARD_TOKEN)" }
     Write-Host ""
     Write-Host "  trade dashboard:  $dashboardUrl  (local only)"
-    Write-Host "  telegram bot:     https://t.me/$botUser  (order + open/close notifications)"
+    # Telegram integration disabled (2026-08-14) -- see 'Telegram integration
+    # disabled' above. Uncomment together with that block to re-enable.
+    # Write-Host "  telegram bot:     https://t.me/$botUser  (order + open/close notifications)"
     Write-Host ""
     Write-Host "stack is up. EA connects to 127.0.0.1:$BridgePort (instance: test-instance)."
 }
