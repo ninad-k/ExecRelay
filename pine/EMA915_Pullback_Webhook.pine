@@ -1,0 +1,394 @@
+//@version=6
+strategy(
+     title = "9/15 EMA Pullback Strategy - Crossover To Pullback Angle",
+     overlay = true,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.0,
+     slippage = 0,
+     process_orders_on_close = true,
+     margin_long = 100,
+     margin_short = 100,
+     max_labels_count = 500
+)
+
+// --------------------------------------------------
+// 1. EMA SETTINGS
+// --------------------------------------------------
+groupEma = "1. EMA Settings"
+
+fastLen = input.int(9, "Fast EMA Length", minval = 1, group = groupEma)
+slowLen = input.int(15, "Slow EMA Length", minval = 1, group = groupEma)
+
+// --------------------------------------------------
+// 2. ANGLE SETTINGS
+// --------------------------------------------------
+groupAngle = "2. Crossover To Pullback Angle"
+
+minAngle = input.float(30.0, "Minimum EMA Trend Angle", minval = 0.0, maxval = 89.0, step = 0.5, group = groupAngle)
+
+atrLen = input.int(14, "ATR Length For Angle Calculation", minval = 1, group = groupAngle)
+
+// Simple angle calibration:
+// If EMA moves 1 ATR in this many candles, the script treats it as around 45 degrees.
+// Default 10 means: 1 ATR move in 10 candles = strong trend.
+angleScaleBars = input.float(10.0, "Angle Calibration: 1 ATR Move In X Bars = 45 Degrees", minval = 1.0, step = 1.0, group = groupAngle)
+
+// 0 = setup will not expire unless opposite EMA crossover happens.
+maxSetupBars = input.int(0, "Cancel Setup After Bars | 0 = Never", minval = 0, group = groupAngle)
+
+// --------------------------------------------------
+// 3. PULLBACK SETTINGS
+// --------------------------------------------------
+groupPullback = "3. Pullback Settings"
+
+// Set this to 0 for exact touch of 15 EMA.
+// Keep 0.10 or 0.20 to allow small near-touch difference.
+pullbackAtrMult = input.float(0, "15 EMA Touch/Near Zone: ATR Multiplier", minval = 0.0, step = 0.05, group = groupPullback)
+
+// --------------------------------------------------
+// 4. RISK / POSITION SIZE
+// --------------------------------------------------
+groupRisk = "4. Risk / Position Size"
+
+rr = input.float(2.0, "Reward:Risk Target", minval = 0.1, step = 0.1, group = groupRisk)
+
+slBufferTicks = input.int(2, "SL Buffer Beyond Signal Candle High/Low, In Ticks", minval = 0, group = groupRisk)
+
+// Set quantity here.
+// Use 0 to control quantity from Strategy Settings -> Properties -> Order Size.
+qtyInput = input.float(1.0, "Qty / Lots / Contracts / Shares | 0 = Use Strategy Properties", minval = 0.0, step = 0.01, group = groupRisk)
+
+allowLongs = input.bool(true, "Allow Buy Trades", group = groupRisk)
+allowShorts = input.bool(true, "Allow Sell Trades", group = groupRisk)
+
+// --------------------------------------------------
+// 5. BACKTEST DATE FILTER
+// --------------------------------------------------
+groupDate = "5. Backtest Date Filter"
+
+useDateFilter = input.bool(false, "Use Date Filter", group = groupDate)
+
+// These are Unix timestamps in milliseconds.
+// 1577836800000 = 2020-01-01 00:00 UTC
+// 4102444740000 = 2099-12-31 23:59 UTC
+startDate = input.time(defval = 1577836800000, title = "Start Date", group = groupDate)
+endDate = input.time(defval = 4102444740000, title = "End Date", group = groupDate)
+
+inTradeWindow = not useDateFilter or (time >= startDate and time <= endDate)
+
+// --------------------------------------------------
+// 6. DEBUG SETTINGS
+// --------------------------------------------------
+groupDebug = "6. Debug"
+
+showDebugLabels = input.bool(false, "Show Debug Labels On Pullback Candles", group = groupDebug)
+
+// --------------------------------------------------
+// 6B. EXECRELAY WEBHOOK ALERT SETTINGS  (no effect on trade logic)
+// --------------------------------------------------
+groupWebhook = "6B. ExecRelay Webhook Alerts"
+
+// License ID from the ExecRelay stack (EXECRELAY_LICENSES in .env).
+whLicenseId = input.string("", "ExecRelay License ID", group = groupWebhook)
+
+// Body secret for the license. Leave blank only if your license has no secret.
+whSecret = input.string("", "ExecRelay Body Secret | blank = none", group = groupWebhook)
+
+// Broker symbol. Blank = use the chart symbol as-is.
+// The ExecRelay shim already resolves broker suffix variants automatically
+// (XAUUSD -> XAUUSD_ / XAUUSD. / XAUUSDm), so blank is usually fine.
+whSymbol = input.string("", "MT5 Symbol Override | blank = chart symbol", group = groupWebhook)
+
+// MT5 volume in lots for every webhook order.
+// This is separate from the chart Qty above - chart qty is for the backtest,
+// this value is what actually goes to the broker.
+whLots = input.float(1.0, "MT5 Volume In Lots", minval = 0.01, step = 0.01, group = groupWebhook)
+
+// The ExecRelay shim resizes lots from the SL distance whenever the stack
+// sets EA_SHIM_RISK_USD (currently $100/order), which would shrink this
+// fixed lot on every entry that carries an SL - and every entry here does.
+// ON: send risk=0 with each entry so the broker receives exactly the lots
+// above. OFF: let the stack's $-risk sizing decide the lot instead.
+whFixedLots = input.bool(true, "Force Exact Lots | Bypass Stack $-Risk Sizing", group = groupWebhook)
+
+// Short tag that becomes the broker order comment.
+// The bar time is appended automatically so ExecRelay's duplicate-signal
+// filter (which hashes the whole alert body) never drops a repeat alert.
+whComment = input.string("x915", "Order Comment Tag", group = groupWebhook)
+
+// Also send CLOSELONG / CLOSESHORT when the strategy's TP/SL exit fills.
+// The broker already holds the SL/TP sent with the entry, so this is a
+// redundant safety net that re-syncs MT5 with TradingView. Recommended ON.
+whSendCloseAlerts = input.bool(true, "Send Close Alert When TP/SL Exit Fills", group = groupWebhook)
+
+// --- Webhook message helpers (strings only, never touches signals) ---
+whSym = whSymbol == "" ? syminfo.ticker : whSymbol
+whSecretPart = whSecret != "" ? ",secret=" + whSecret : ""
+whRiskPart = whFixedLots ? ",risk=0" : ""
+whLotsStr = str.tostring(whLots, "#.####")
+
+f_px(_p) =>
+    str.tostring(_p, format.mintick)
+
+// Unique per-bar suffix so no two alert bodies are ever byte-identical.
+whBarTag = str.tostring(time, "#")
+
+// --------------------------------------------------
+// 7. BASIC CALCULATIONS
+// --------------------------------------------------
+fastEma = ta.ema(close, fastLen)
+slowEma = ta.ema(close, slowLen)
+atr = ta.atr(atrLen)
+
+bullCross = ta.crossover(fastEma, slowEma)
+bearCross = ta.crossunder(fastEma, slowEma)
+
+greenCandle = close > open
+redCandle = close < open
+
+pullbackBuffer = atr * pullbackAtrMult
+slBuffer = slBufferTicks * syminfo.mintick
+
+// --------------------------------------------------
+// 8. SAVE CROSSOVER POINT
+// --------------------------------------------------
+var bool bullSetup = false
+var bool bearSetup = false
+
+var int setupBar = na
+var float setupFastEma = na
+var float setupSlowEma = na
+var float setupAtr = na
+
+// When bullish crossover happens, save the crossover point.
+// No slope check is done here now.
+if bullCross
+    bullSetup := true
+    bearSetup := false
+    setupBar := bar_index
+    setupFastEma := fastEma
+    setupSlowEma := slowEma
+    setupAtr := atr
+
+// When bearish crossover happens, save the crossover point.
+// No slope check is done here now.
+else if bearCross
+    bearSetup := true
+    bullSetup := false
+    setupBar := bar_index
+    setupFastEma := fastEma
+    setupSlowEma := slowEma
+    setupAtr := atr
+
+barsSinceSetupForCancel = not na(setupBar) ? bar_index - setupBar : na
+setupExpired = maxSetupBars > 0 and not na(barsSinceSetupForCancel) and barsSinceSetupForCancel > maxSetupBars
+
+// Cancel bullish setup if EMA structure breaks or setup expires.
+if bullSetup and not na(setupBar) and bar_index > setupBar and (fastEma <= slowEma or setupExpired)
+    bullSetup := false
+    bearSetup := false
+    setupBar := na
+    setupFastEma := na
+    setupSlowEma := na
+    setupAtr := na
+
+// Cancel bearish setup if EMA structure breaks or setup expires.
+if bearSetup and not na(setupBar) and bar_index > setupBar and (fastEma >= slowEma or setupExpired)
+    bullSetup := false
+    bearSetup := false
+    setupBar := na
+    setupFastEma := na
+    setupSlowEma := na
+    setupAtr := na
+
+// --------------------------------------------------
+// 9. CROSSOVER-TO-PULLBACK ANGLE CALCULATION
+// --------------------------------------------------
+PI = 3.141592653589793
+
+f_angleFromCross(_currentEma, _startEma, _barsPassed, _atrAtCross, _scaleBars) =>
+    float refAtr = not na(_atrAtCross) and _atrAtCross > 0.0 ? _atrAtCross : atr
+    float normalizedSlope = not na(_startEma) and not na(_barsPassed) and _barsPassed > 0 and not na(refAtr) and refAtr > 0.0 ? ((_currentEma - _startEma) / refAtr) * (_scaleBars / _barsPassed) : na
+    math.atan(normalizedSlope) * 180.0 / PI
+
+barsFromCross = not na(setupBar) ? bar_index - setupBar : na
+
+fastAngleFromCross = f_angleFromCross(fastEma, setupFastEma, barsFromCross, setupAtr, angleScaleBars)
+slowAngleFromCross = f_angleFromCross(slowEma, setupSlowEma, barsFromCross, setupAtr, angleScaleBars)
+
+// Buy angle condition:
+// From bullish crossover point to pullback candle,
+// both EMAs must be +30 degrees or more.
+buyAngleOk = not na(fastAngleFromCross) and not na(slowAngleFromCross) and fastAngleFromCross >= minAngle and slowAngleFromCross >= minAngle
+
+// Sell angle condition:
+// From bearish crossover point to pullback candle,
+// both EMAs must be -30 degrees or less.
+sellAngleOk = not na(fastAngleFromCross) and not na(slowAngleFromCross) and fastAngleFromCross <= -minAngle and slowAngleFromCross <= -minAngle
+
+// --------------------------------------------------
+// 10. PULLBACK CONDITIONS
+// --------------------------------------------------
+afterCross = not na(barsFromCross) and barsFromCross > 0
+flat = strategy.position_size == 0
+
+// Buy pullback:
+// Signal candle should touch/come near 15 EMA and close above 15 EMA.
+longPullbackAt15 = low <= slowEma + pullbackBuffer and close > slowEma
+
+// Sell pullback:
+// Signal candle should touch/come near 15 EMA and close below 15 EMA.
+shortPullbackAt15 = high >= slowEma - pullbackBuffer and close < slowEma
+
+// --------------------------------------------------
+// 11. STOP LOSS AND TARGET CALCULATION
+// --------------------------------------------------
+longStopCandidate = low - slBuffer
+longRisk = close - longStopCandidate
+validLongRisk = longRisk > syminfo.mintick
+
+shortStopCandidate = high + slBuffer
+shortRisk = shortStopCandidate - close
+validShortRisk = shortRisk > syminfo.mintick
+
+// --------------------------------------------------
+// 12. FINAL BUY AND SELL CONDITIONS
+// --------------------------------------------------
+longSignal = allowLongs and inTradeWindow and flat and bullSetup and afterCross and fastEma > slowEma and greenCandle and longPullbackAt15 and buyAngleOk and validLongRisk
+
+shortSignal = allowShorts and inTradeWindow and flat and bearSetup and afterCross and fastEma < slowEma and redCandle and shortPullbackAt15 and sellAngleOk and validShortRisk
+
+// --------------------------------------------------
+// 13. OPTIONAL DEBUG LABELS
+// --------------------------------------------------
+debugBuyCandidate = showDebugLabels and bullSetup and afterCross and greenCandle and longPullbackAt15
+debugSellCandidate = showDebugLabels and bearSetup and afterCross and redCandle and shortPullbackAt15
+
+if debugBuyCandidate
+    label.new(
+         bar_index,
+         low,
+         "BUY CHECK\n9 EMA angle: " + str.tostring(fastAngleFromCross, "#.##") + "\n15 EMA angle: " + str.tostring(slowAngleFromCross, "#.##") + "\nAngle OK: " + (buyAngleOk ? "YES" : "NO"),
+         style = label.style_label_up,
+         color = buyAngleOk ? color.new(color.green, 0) : color.new(color.red, 0),
+         textcolor = color.white,
+         size = size.small
+     )
+
+if debugSellCandidate
+    label.new(
+         bar_index,
+         high,
+         "SELL CHECK\n9 EMA angle: " + str.tostring(fastAngleFromCross, "#.##") + "\n15 EMA angle: " + str.tostring(slowAngleFromCross, "#.##") + "\nAngle OK: " + (sellAngleOk ? "YES" : "NO"),
+         style = label.style_label_down,
+         color = sellAngleOk ? color.new(color.green, 0) : color.new(color.red, 0),
+         textcolor = color.white,
+         size = size.small
+     )
+
+// --------------------------------------------------
+// 13B. EXECRELAY ALERT MESSAGES  (strings only)
+// --------------------------------------------------
+// Close messages are rebuilt every bar so the bar-time tag stays fresh
+// on the exit order that eventually fills.
+longCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSELONG," + whSym + ",comment=" + whComment + "x-" + whBarTag + whSecretPart : ""
+shortCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSESHORT," + whSym + ",comment=" + whComment + "x-" + whBarTag + whSecretPart : ""
+
+// --------------------------------------------------
+// 14. TRADE MANAGEMENT
+// --------------------------------------------------
+var float longStop = na
+var float longTarget = na
+var float shortStop = na
+var float shortTarget = na
+
+if longSignal
+    longStop := longStopCandidate
+    longTarget := close + longRisk * rr
+
+    shortStop := na
+    shortTarget := na
+
+    // ExecRelay: BUY with absolute SL/TP prices, so the broker holds the
+    // exact same stop and target as the strategy.
+    longEntryMsg = whLicenseId + ",BUY," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(longStop) + ",tp=" + f_px(longTarget) + ",comment=" + whComment + "-" + whBarTag + whSecretPart
+
+    if qtyInput > 0.0
+        strategy.entry("Long", strategy.long, qty = qtyInput, comment = "Buy", alert_message = longEntryMsg)
+    else
+        strategy.entry("Long", strategy.long, comment = "Buy", alert_message = longEntryMsg)
+
+    strategy.exit("Long TP/SL", from_entry = "Long", stop = longStop, limit = longTarget, alert_message = longCloseMsg)
+
+    bullSetup := false
+    bearSetup := false
+    setupBar := na
+    setupFastEma := na
+    setupSlowEma := na
+    setupAtr := na
+
+if shortSignal
+    shortStop := shortStopCandidate
+    shortTarget := close - shortRisk * rr
+
+    longStop := na
+    longTarget := na
+
+    // ExecRelay: SELL with absolute SL/TP prices.
+    shortEntryMsg = whLicenseId + ",SELL," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(shortStop) + ",tp=" + f_px(shortTarget) + ",comment=" + whComment + "-" + whBarTag + whSecretPart
+
+    if qtyInput > 0.0
+        strategy.entry("Short", strategy.short, qty = qtyInput, comment = "Sell", alert_message = shortEntryMsg)
+    else
+        strategy.entry("Short", strategy.short, comment = "Sell", alert_message = shortEntryMsg)
+
+    strategy.exit("Short TP/SL", from_entry = "Short", stop = shortStop, limit = shortTarget, alert_message = shortCloseMsg)
+
+    bullSetup := false
+    bearSetup := false
+    setupBar := na
+    setupFastEma := na
+    setupSlowEma := na
+    setupAtr := na
+
+// Keep exits active while trade is open.
+if strategy.position_size > 0 and not na(longStop) and not na(longTarget)
+    strategy.exit("Long TP/SL", from_entry = "Long", stop = longStop, limit = longTarget, alert_message = longCloseMsg)
+
+if strategy.position_size < 0 and not na(shortStop) and not na(shortTarget)
+    strategy.exit("Short TP/SL", from_entry = "Short", stop = shortStop, limit = shortTarget, alert_message = shortCloseMsg)
+
+// Reset plotted SL/TP values after position closes.
+if strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+    longStop := na
+    longTarget := na
+    shortStop := na
+    shortTarget := na
+
+// --------------------------------------------------
+// 15. VISUALS
+// --------------------------------------------------
+plot(fastEma, "9 EMA", color = color.blue, linewidth = 2)
+plot(slowEma, "15 EMA", color = color.orange, linewidth = 2)
+
+plot(strategy.position_size > 0 ? longStop : na, "Long Stop Loss", color = color.red, style = plot.style_linebr)
+plot(strategy.position_size > 0 ? longTarget : na, "Long Target", color = color.green, style = plot.style_linebr)
+
+plot(strategy.position_size < 0 ? shortStop : na, "Short Stop Loss", color = color.red, style = plot.style_linebr)
+plot(strategy.position_size < 0 ? shortTarget : na, "Short Target", color = color.green, style = plot.style_linebr)
+
+plotshape(longSignal, title = "Buy Signal Candle", style = shape.triangleup, location = location.belowbar, color = color.green, text = "BUY", textcolor = color.white, size = size.tiny)
+plotshape(shortSignal, title = "Sell Signal Candle", style = shape.triangledown, location = location.abovebar, color = color.red, text = "SELL", textcolor = color.white, size = size.tiny)
+
+// Background shows active setup.
+// Green background = bullish crossover setup active.
+// Red background = bearish crossover setup active.
+bgcolor(bullSetup ? color.new(color.green, 92) : bearSetup ? color.new(color.red, 92) : na)
+
+// These two plots are hidden from chart but visible in Data Window.
+plot(fastAngleFromCross, "9 EMA Angle From Crossover", display = display.data_window)
+plot(slowAngleFromCross, "15 EMA Angle From Crossover", display = display.data_window)
