@@ -268,9 +268,16 @@ func (k ParamKind) String() string {
 	}
 }
 
+// IsVolume reports whether kind is one of the mutually-exclusive "pick a
+// base position size" params. ParamRisk is deliberately excluded: per
+// ea_shim.py's sized_volume(), risk is a $-cap that *resizes* whatever base
+// volume was requested (vol_lots, or a 0.01 default) rather than an
+// alternative way to state that base volume, so it can legally accompany
+// vol_lots (e.g. vol_lots=1,risk=0 to request exactly 1 lot with no
+// $-risk resizing).
 func (k ParamKind) IsVolume() bool {
 	switch k {
-	case ParamRisk, ParamVolLots, ParamVolDollar, ParamVolPctBalanceLoss,
+	case ParamVolLots, ParamVolDollar, ParamVolPctBalanceLoss,
 		ParamVolPctEquityLoss, ParamVolPctBalanceMargin:
 		return true
 	default:

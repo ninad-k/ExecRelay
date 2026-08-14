@@ -98,7 +98,7 @@ func TestParseRejects(t *testing.T) {
 		{"empty", "", ErrEmptyInput},
 		{"unknown command", "60123456789,hold,EURUSD", ErrUnknownCommand},
 		{"unknown param", "60123456789,buy,EURUSD,vol_lots=1,foo=bar", ErrUnknownParam},
-		{"duplicate volume", "60123456789,buy,EURUSD,vol_lots=1,risk=1", ErrDuplicateVolume},
+		{"duplicate volume", "60123456789,buy,EURUSD,vol_lots=1,vol_dollar=50,sl=10", ErrDuplicateVolume},
 		{"duplicate sl", "60123456789,buy,EURUSD,vol_lots=1,sl=10,sl_pips=10", ErrDuplicateSL},
 		{"duplicate tp", "60123456789,buy,EURUSD,vol_lots=1,tp=10,tp_pips=10", ErrDuplicateTP},
 		{"pending entry", "60123456789,buylimit,EURUSD,vol_lots=1", ErrPendingRequiresEntry},
@@ -117,6 +117,22 @@ func TestParseRejects(t *testing.T) {
 				t.Fatalf("Parse() error = %v, code = %v, want %v", err, codeOf(err), tt.code)
 			}
 		})
+	}
+}
+
+// TestParseVolLotsWithRiskOverride covers the "exact lots, bypass $-risk
+// sizing" pattern (vol_lots + risk=0) used by fixed-lot strategies running
+// on a stack that otherwise sizes every order from a per-order $ risk.
+func TestParseVolLotsWithRiskOverride(t *testing.T) {
+	signal, err := Parse("60123456789,buy,XAUUSD,vol_lots=1,risk=0,sl=4415,tp=4385")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if p, ok := signal.Param(ParamVolLots); !ok || p.Value != "1" {
+		t.Fatalf("vol_lots param = %#v, %v", p, ok)
+	}
+	if p, ok := signal.Param(ParamRisk); !ok || p.Value != "0" {
+		t.Fatalf("risk param = %#v, %v", p, ok)
 	}
 }
 

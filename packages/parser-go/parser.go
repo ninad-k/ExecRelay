@@ -146,7 +146,7 @@ func validateSignal(signal *Signal, state validationState) error {
 		}
 	}
 
-	if signal.Command.OpensOrder() && !state.hasVolume {
+	if signal.Command.OpensOrder() && !state.hasVolume && !state.hasRisk {
 		return ParseError{Code: ErrMissingVolume, Field: "volume"}
 	}
 	if signal.Command.IsPendingOpen() && !state.hasEntry {

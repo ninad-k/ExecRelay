@@ -42,6 +42,28 @@ def _purge_old(name: str) -> None:
             pass  # another process may be mid-rotation; skip, not fatal
 
 
+class _SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """TimedRotatingFileHandler that tolerates a locked log file at rollover.
+
+    On Windows, os.rename() during rollover fails with PermissionError if
+    another process (e.g. a second, un-shut-down instance of the same
+    service) has the file open. The stdlib handler lets that exception
+    propagate out of emit() -- which drops the very record that triggered
+    the rollover -- and only advances rolloverAt on a successful rename, so
+    once a rollover fails it fails again on every subsequent call, silently
+    dropping every record from then on instead of just missing one day's
+    rotation.
+    """
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except OSError:
+            if self.stream is None:
+                self.stream = self._open()
+            self.rolloverAt = self.computeRollover(time.time())
+
+
 def get_txn_logger(name: str) -> logging.Logger:
     """Return a JSON-lines logger writing to transactions/<name>.log,
     rotated daily at UTC midnight, keeping RETENTION_DAYS days of history."""
@@ -52,7 +74,7 @@ def get_txn_logger(name: str) -> logging.Logger:
     if logger.handlers:
         return logger  # already configured (e.g. re-imported)
 
-    handler = TimedRotatingFileHandler(
+    handler = _SafeTimedRotatingFileHandler(
         LOG_DIR / f"{name}.log",
         when="midnight",
         interval=1,
