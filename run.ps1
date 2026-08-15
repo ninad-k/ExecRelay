@@ -1,11 +1,10 @@
 # ExecRelay — C:\ExecRelay
 #
 # Main entry point. Builds and starts the full stack (nats,
-# ml-predictor, ingress, bridge, ea-shim, telegram-ingest, telegram-forwarder,
-# trade-dashboard), prints the public TradingView webhook URL, the Rey Capital
-# trade dashboard link and the Telegram bot link, then STAYS ATTACHED,
-# streaming every service's log to the console (color-coded per service,
-# errors in red) until Ctrl+C — which stops the whole stack.
+# ml-predictor, ingress, bridge, ea-shim, trade-dashboard), prints the public
+# TradingView webhook URL and the Rey Capital trade dashboard link, then
+# STAYS ATTACHED, streaming every service's log to the console (color-coded
+# per service, errors in red) until Ctrl+C — which stops the whole stack.
 #
 # If the stack is already running, it does not double-start; it just attaches
 # to the logs.

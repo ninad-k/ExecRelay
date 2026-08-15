@@ -130,18 +130,3 @@ request contract, the decision→command table, and the design rationale, and
      (`ret_288`, `vol_288`, `active_rate_288`, `ema_200_slope`, `bb_z`,
      `h1_dist_ema50`, `h1_ret_24`, `h4_dist_ema50`) — this avoids ever sending
      NaN features, which the predictor would otherwise reject as invalid JSON.
-
-## Telegram notifications
-
-Alerts fired by this script can produce Telegram notifications
-(PineConnector-style): once you link your account to the ExecRelay bot
-(portal → `POST /me/telegram/link`, then open the deep link), every fill —
-success, rejection, or timeout — for signals sent by this script arrives as
-a Telegram message. Nothing extra is needed in the Pine script or the alert
-payload: the **`Comment / strategy tag` input is what identifies this
-strategy in the Telegram feed** (the `Strategy:` line of each message), and
-ML-path signals additionally show the model's `prob_win` and decision. Set a
-distinct tag per chart/strategy so the messages are tellable apart.
-
-See [`docs/customer/telegram-notifications.md`](../docs/customer/telegram-notifications.md)
-for the linking flow and bot commands.

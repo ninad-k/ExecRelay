@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Example Dashboard | ExecRelay{% endblock %}
+
+{% block content %}
+  <div class="card">
+    <h2>Open positions</h2>
+    <table>
+      <thead>
+        <tr><th>Symbol</th><th>Direction</th><th>Entry</th><th>P/L</th></tr>
+      </thead>
+      <tbody>
+        {% for position in positions %}
+        <tr>
+          <td>{{ position.symbol }}</td>
+          <td>{{ position.direction }}</td>
+          <td class="number">{{ "%.5f"|format(position.entry_price) }}</td>
+          <td>
+            <span class="pill {{ 'profit' if position.pnl >= 0 else 'loss' }} number">
+              {{ "%.2f"|format(position.pnl) }}
+            </span>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4">No open positions.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

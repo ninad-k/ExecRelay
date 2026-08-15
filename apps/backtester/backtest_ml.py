@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -283,6 +284,12 @@ class ComparisonReport:
     unfiltered: dict
     filtered: dict
     uplift_pct: float
+    # Per-trade detail, not part of to_dict()'s JSON summary (kept out of it
+    # for backward compatibility with existing --output report.json
+    # consumers) -- used by report_export.py to render the HTML report and
+    # trades CSV. Populated by run_comparison().
+    unfiltered_trades: list[Trade] = field(default_factory=list)
+    filtered_trades: list[Trade] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -395,6 +402,8 @@ def run_comparison(
         unfiltered=unfiltered_stats,
         filtered=filtered_stats,
         uplift_pct=uplift,
+        unfiltered_trades=unfiltered.trades,
+        filtered_trades=filtered.trades,
     )
 
 
@@ -439,6 +448,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output", default=None, help="Write JSON report here instead of stdout"
     )
+    parser.add_argument(
+        "--html",
+        default=None,
+        help="Also render a self-contained HTML report to this path "
+        "(see apps/backtester/results/README.md for the storage convention)",
+    )
+    parser.add_argument(
+        "--trades-csv",
+        default=None,
+        help="Also write a CSV of every trade (both branches) to this path",
+    )
     return parser
 
 
@@ -465,6 +485,22 @@ def main(argv: Sequence[str] | None = None) -> ComparisonReport:
         Path(args.output).write_text(text + "\n")
     else:
         print(text)
+
+    if args.html:
+        from report_export import render_html_report
+
+        # Explicit utf-8: the HTML declares <meta charset="utf-8"> and uses
+        # non-ASCII characters (em dash), but Path.write_text()'s default
+        # encoding is the platform's locale encoding -- cp1252 on Windows --
+        # which would silently mangle them.
+        Path(args.html).write_text(render_html_report(report), encoding="utf-8")
+        print(f"wrote {args.html}", file=sys.stderr)
+
+    if args.trades_csv:
+        from report_export import write_trades_csv
+
+        write_trades_csv(report, args.trades_csv)
+        print(f"wrote {args.trades_csv}", file=sys.stderr)
 
     return report
 

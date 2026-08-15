@@ -1,13 +1,5 @@
 import { clearToken, getToken } from './auth'
-import type {
-  Fill,
-  Instance,
-  License,
-  Signal,
-  TelegramLink,
-  TelegramStatus,
-  TraceTimeline,
-} from './types'
+import type { Fill, Instance, License, Signal, TraceTimeline } from './types'
 
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
@@ -126,25 +118,6 @@ export const api = {
       `/licenses/${licenseId}/confirm-rotation`,
       { method: 'POST' },
     )
-  },
-
-  getTelegram() {
-    return apiFetch<TelegramStatus>('/me/telegram')
-  },
-
-  createTelegramLink() {
-    return apiFetch<TelegramLink>('/me/telegram/link', { method: 'POST' })
-  },
-
-  patchTelegram(prefs: { notify_fills?: boolean; notify_timeouts?: boolean }) {
-    return apiFetch<TelegramStatus>('/me/telegram', {
-      method: 'PATCH',
-      body: JSON.stringify(prefs),
-    })
-  },
-
-  deleteTelegram() {
-    return apiFetch<void>('/me/telegram', { method: 'DELETE' })
   },
 
   correlateSignals(licenseId: string, signalIds: string[]) {

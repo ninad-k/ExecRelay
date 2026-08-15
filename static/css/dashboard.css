@@ -1,0 +1,100 @@
+/* Shared design tokens for lightweight server-rendered dashboards/tools in
+   this repo. Mirrors the palette used by scripts/trade_dashboard.py (which
+   inlines its own copy since it has zero external dependencies) so any new
+   Jinja-templated tool looks consistent with it. Supports light/dark via
+   the "light" class on <html>, same convention as trade_dashboard.py. */
+
+:root {
+  --color-background: #020c1b;
+  --color-surface: #061526;
+  --color-surface-2: #0b2040;
+  --color-border: #123060;
+  --color-border-light: #1d4a8a;
+  --color-primary: #00c2e0;
+  --color-primary-dim: #00a3be;
+  --color-primary-glow: rgb(0 194 224 / 0.18);
+  --color-profit: #05e8a4;
+  --color-profit-dim: rgb(5 232 164 / 0.14);
+  --color-loss: #ff3d5f;
+  --color-loss-dim: rgb(255 61 95 / 0.14);
+  --color-warning: #ffb52e;
+  --color-gold: #f4b942;
+  --color-text: #cde4ff;
+  --color-text-muted: #4e7aab;
+  --color-text-dim: #7aa3cc;
+  --radius-sm: 0.375rem;
+  --radius: 0.625rem;
+  --radius-lg: 0.875rem;
+}
+
+html.light {
+  --color-background: #eef4ff;
+  --color-surface: #ffffff;
+  --color-surface-2: #deeaf8;
+  --color-border: #b8d0ec;
+  --color-border-light: #90b8e4;
+  --color-primary: #0077b6;
+  --color-primary-dim: #005f99;
+  --color-primary-glow: rgb(0 119 182 / 0.12);
+  --color-profit: #00916e;
+  --color-profit-dim: rgb(0 145 110 / 0.12);
+  --color-loss: #d62839;
+  --color-loss-dim: rgb(214 40 57 / 0.12);
+  --color-warning: #c77c00;
+  --color-gold: #b8860b;
+  --color-text: #08203f;
+  --color-text-muted: #3a6290;
+  --color-text-dim: #1e4e7a;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+  background-color: var(--color-background);
+  color: var(--color-text);
+}
+
+.number { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+
+a { color: var(--color-primary); }
+
+header.topbar {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 0.875rem 1.5rem;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+header.topbar .brand { font-weight: 600; letter-spacing: 0.02em; }
+header.topbar .brand .accent { color: var(--color-primary); }
+
+main { padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.card h2 {
+  margin: 0 0 0.75rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-muted);
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--color-border); }
+th { color: var(--color-text-muted); font-weight: 500; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.06em; }
+
+.pill {
+  display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px;
+  font-size: 0.72rem; font-weight: 600;
+}
+.pill.profit { background: var(--color-profit-dim); color: var(--color-profit); }
+.pill.loss { background: var(--color-loss-dim); color: var(--color-loss); }

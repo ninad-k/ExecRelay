@@ -50,11 +50,6 @@ _INSTANCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 INGRESS_URL = os.environ.get("INGRESS_URL", "http://ingress:8080")
 SIGNALS_STREAM = os.environ.get("SIGNALS_STREAM", "SIGNALS")
 
-# Telegram notification linking. The bot itself runs in the tasks service;
-# portal-api only mints link tokens and builds the t.me deep link.
-TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "")
-TELEGRAM_LINK_TTL_MINUTES = int(os.environ.get("TELEGRAM_LINK_TTL_MINUTES", "15"))
-
 DEBUG = os.environ.get("DEBUG", "false" if IS_PROD else "true").lower() in (
     "true",
     "1",
@@ -400,29 +395,6 @@ class FillOut(BaseModel):
     broker_order_id: str | None
     error_code: str | None
     error_message: str | None
-
-
-class TelegramLinkOut(BaseModel):
-    deep_link: str
-    link_token: str
-    expires_at: datetime
-
-
-class TelegramStatusOut(BaseModel):
-    linked: bool
-    linked_at: datetime | None = None
-    chat_id: str | None = None
-    notify_fills: bool = True
-    notify_timeouts: bool = True
-    # Delivery health for the portal warning badge: failed sends in the last
-    # 24 h (typically "user blocked the bot") and the most recent send status.
-    failed_last_24h: int = 0
-    last_delivery_status: str | None = None
-
-
-class TelegramPrefsIn(BaseModel):
-    notify_fills: bool | None = None
-    notify_timeouts: bool | None = None
 
 
 class TraceEvent(BaseModel):
@@ -1015,125 +987,6 @@ async def confirm_rotation(
         pool, user["id"], "rotate_hmac_confirm", reason=f"license_id={license_id}"
     )
     return {"message": "HMAC secret rotation complete"}
-
-
-# ---------------------------------------------------------------------------
-# Telegram notifications (PineConnector-style account linking)
-# ---------------------------------------------------------------------------
-
-
-@app.post("/me/telegram/link", response_model=TelegramLinkOut)
-@limiter.limit("10/minute")
-async def create_telegram_link(
-    request: Request,
-    user: dict = Depends(current_user),
-    pool: asyncpg.Pool = Depends(get_pool),
-) -> TelegramLinkOut:
-    """Mint a short-lived link token and return the bot deep link. Opening the
-    link and tapping Start sends `/start <token>` to the bot; the tasks service
-    resolves it into a chat link. Re-calling rotates the token; an already
-    linked chat stays linked until /stop or DELETE /me/telegram."""
-    if not TELEGRAM_BOT_USERNAME:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "telegram notifications are not configured on this deployment",
-        )
-    # Telegram start payloads allow [A-Za-z0-9_-], max 64 chars.
-    token = secrets.token_urlsafe(24)
-    expires_at = datetime.now(timezone.utc) + timedelta(
-        minutes=TELEGRAM_LINK_TTL_MINUTES
-    )
-    await pool.execute(
-        """
-        INSERT INTO telegram_links (user_id, link_token, token_expires_at)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (user_id) DO UPDATE
-        SET link_token = EXCLUDED.link_token,
-            token_expires_at = EXCLUDED.token_expires_at,
-            updated_at = NOW()
-        """,
-        user["id"],
-        token,
-        expires_at,
-    )
-    await _audit(pool, user["id"], "telegram_link_token_created")
-    return TelegramLinkOut(
-        deep_link=f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={token}",
-        link_token=token,
-        expires_at=expires_at,
-    )
-
-
-@app.get("/me/telegram", response_model=TelegramStatusOut)
-async def telegram_status(
-    user: dict = Depends(current_user),
-    pool: asyncpg.Pool = Depends(get_pool),
-) -> TelegramStatusOut:
-    row = await pool.fetchrow(
-        """
-        SELECT chat_id, linked_at, notify_fills, notify_timeouts,
-               (SELECT COUNT(*) FROM notifications_log nl
-                WHERE nl.user_id = telegram_links.user_id
-                  AND nl.channel = 'telegram' AND nl.status = 'failed'
-                  AND nl.created_at > NOW() - interval '24 hours') AS failed_last_24h,
-               (SELECT nl.status FROM notifications_log nl
-                WHERE nl.user_id = telegram_links.user_id
-                  AND nl.channel = 'telegram'
-                ORDER BY nl.created_at DESC LIMIT 1) AS last_delivery_status
-        FROM telegram_links WHERE user_id = $1
-        """,
-        user["id"],
-    )
-    if row is None or row["chat_id"] is None:
-        return TelegramStatusOut(linked=False)
-    return TelegramStatusOut(
-        linked=True,
-        linked_at=row["linked_at"],
-        chat_id=str(row["chat_id"]),
-        notify_fills=row["notify_fills"],
-        notify_timeouts=row["notify_timeouts"],
-        failed_last_24h=row["failed_last_24h"] or 0,
-        last_delivery_status=row["last_delivery_status"],
-    )
-
-
-@app.patch("/me/telegram", response_model=TelegramStatusOut)
-async def patch_telegram_prefs(
-    body: TelegramPrefsIn,
-    user: dict = Depends(current_user),
-    pool: asyncpg.Pool = Depends(get_pool),
-) -> TelegramStatusOut:
-    row = await pool.fetchrow(
-        """
-        UPDATE telegram_links
-        SET notify_fills = COALESCE($2, notify_fills),
-            notify_timeouts = COALESCE($3, notify_timeouts),
-            updated_at = NOW()
-        WHERE user_id = $1
-        RETURNING chat_id, linked_at, notify_fills, notify_timeouts
-        """,
-        user["id"],
-        body.notify_fills,
-        body.notify_timeouts,
-    )
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "telegram link not set up")
-    return TelegramStatusOut(
-        linked=row["chat_id"] is not None,
-        linked_at=row["linked_at"],
-        chat_id=str(row["chat_id"]) if row["chat_id"] is not None else None,
-        notify_fills=row["notify_fills"],
-        notify_timeouts=row["notify_timeouts"],
-    )
-
-
-@app.delete("/me/telegram", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_telegram_link(
-    user: dict = Depends(current_user),
-    pool: asyncpg.Pool = Depends(get_pool),
-) -> None:
-    await pool.execute("DELETE FROM telegram_links WHERE user_id = $1", user["id"])
-    await _audit(pool, user["id"], "telegram_unlinked")
 
 
 @app.get("/requests/{request_id}")

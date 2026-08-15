@@ -67,3 +67,31 @@ docs/ARCHITECTURE_AND_COMPARISON.pdf
 # scripts/local-stack.sh working directory (downloaded nats-server, built
 # binaries, logs, pid files)
 .local-stack/
+
+# PyInstaller build output for packaging/dashboard/build_exe.py (the .exe
+# itself is also covered by the *.exe rule above, but these hold the
+# unpacked intermediate build tree too).
+/packaging/dashboard/build/
+/packaging/dashboard/dist/
+/dist/
+/build/
+
+# Local dev-only settings for scripts/trade_dashboard.py, scripts/ea_shim.py,
+# etc. -- copy config.example.json to config.json and edit; config.json is
+# machine-specific and never committed.
+/config.json
+
+# Self-signed dev TLS certs from scripts/generate-dev-certs.py (default
+# --out ./certs). Regeneratable, never commit a private key. (Ignoring
+# `/certs/*` rather than `/certs/` so the !negation below can still see
+# inside the directory -- git won't recurse into a wholesale-ignored dir.)
+/certs/*
+!/certs/.gitkeep
+
+# Generated backtest_ml.py output (HTML report / JSON summary / trades CSV)
+# -- see apps/backtester/results/README.md for the convention. Reproducible
+# from --candles/--signals inputs plus the tracked model artifact.
+apps/backtester/results/*
+!apps/backtester/results/.gitkeep
+!apps/backtester/results/README.md
+!apps/backtester/results/README.docx

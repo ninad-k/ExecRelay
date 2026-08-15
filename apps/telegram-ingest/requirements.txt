@@ -1,1 +1,0 @@
-# stdlib-only service; file kept for Dockerfile/tooling symmetry.

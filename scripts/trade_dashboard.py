@@ -4,9 +4,9 @@ Single-file stdlib HTTP server, branded with the Rey Capital design system
 (colors/typography/components mirrored from C:\\AccountManagementSystem
 frontend/src/index.css). Combines, on every request:
 
-  * transactions/telegram-signals.log*  -- Telegram-sourced signals
-  * transactions/mt5-fills.log*         -- every order the EA shim executed,
-    classified Telegram vs TradingView by its comment prefix ("tg-…")
+  * transactions/mt5-fills.log*         -- every order the EA shim executed
+    (all TradingView-sourced; "other" covers non-stack activity on the
+    account, e.g. manual trades or a different EA)
   * the running MT5 terminal (optional) -- open positions + a selectable
     trailing window (7/30/90d) of closed deals for the shim's magic number,
     with realized P/L (partial closes grouped into one row per position)
@@ -61,22 +61,24 @@ MAGIC = int(os.environ.get("EA_SHIM_MAGIC", "20240101"))
 DASHBOARD_TOKEN = (os.environ.get("DASHBOARD_TOKEN") or "").strip()
 ROOT = Path(__file__).resolve().parent.parent
 
-# Reuse telegram-ingest's own signal grammar / command builder rather than
-# duplicating it -- see "Signals not placed" / preview / resubmit below.
-# Importing is side-effect-free (main(), the poll loop and the health-server
-# thread are all guarded by `if __name__ == "__main__"`); the only things
-# that run at import time are plain env-var reads and logger setup, same as
-# this file's own top-level constants.
-_INGEST_APP_DIR = ROOT / "apps" / "telegram-ingest"
-if str(_INGEST_APP_DIR) not in sys.path:
-    sys.path.insert(0, str(_INGEST_APP_DIR))
-import app as _ingest  # noqa: E402
-
 TXN_DIR = ROOT / ".local-stack" / "logs" / "transactions"
 JOURNAL_PATH = ROOT / ".local-stack" / "journal.json"
 ASSETS = Path(__file__).resolve().parent / "dashboard-assets"
 
 EMOTIONS = ["calm", "confident", "neutral", "anxious", "fearful", "greedy", "fomo", "revenge", "bored"]
+
+# ---------------------------------------------------------------------------
+# ExecRelay webhook credentials -- prefixed onto every command body this
+# dashboard sends straight to ingress (see "Send a sample TradingView
+# signal" below). LICENSE_ID is the per-license credential ADR 0006 requires
+# on every webhook command (docs/adr/0006-per-license-hmac-not-global.md);
+# WEBHOOK_SECRET is the optional additional per-command secret. Sourced from
+# dashboard-local env vars -- this is the only remaining thing in-repo that
+# needs them locally for its own test-signal tool.
+# ---------------------------------------------------------------------------
+
+LICENSE_ID = (os.environ.get("DASHBOARD_LICENSE_ID") or "").strip()
+WEBHOOK_SECRET = (os.environ.get("DASHBOARD_WEBHOOK_SECRET") or "").strip()
 
 # ---------------------------------------------------------------------------
 # Management reporting — env config
@@ -88,28 +90,11 @@ EMOTIONS = ["calm", "confident", "neutral", "anxious", "fearful", "greedy", "fom
 
 EA_SHIM_RISK_USD = float(os.environ.get("EA_SHIM_RISK_USD", "0") or 0)
 
-_ALLOWED_CHAT_IDS = [
-    c.strip() for c in (os.environ.get("TELEGRAM_INGEST_ALLOWED_CHAT_IDS") or "").split(",") if c.strip()
-]
-MGMT_CHAT_ID = (os.environ.get("MGMT_CHAT_ID") or "").strip() or (_ALLOWED_CHAT_IDS[0] if _ALLOWED_CHAT_IDS else "")
-MGMT_DIGEST_TIME = (os.environ.get("MGMT_DIGEST_TIME", "20:00") or "").strip()
-MGMT_DIGEST_WEEKLY_DAY = (os.environ.get("MGMT_DIGEST_WEEKLY_DAY", "Mon") or "Mon").strip()
-# Loss/drawdown alerts are OFF by default (owner's call, 2026-08-10): they are
-# account-wide, so unrelated EAs trading the same terminal kept tripping them.
-# Set a positive threshold in .env to re-enable either one.
-MGMT_ALERT_DAILY_LOSS_USD = float(os.environ.get("MGMT_ALERT_DAILY_LOSS_USD", "0") or 0)
-MGMT_ALERT_DRAWDOWN_PCT = float(os.environ.get("MGMT_ALERT_DRAWDOWN_PCT", "0") or 0)
-_TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_INGEST_BOT_TOKEN") or "").strip()
-
-_ALERT_COOLDOWN_SEC = 6 * 3600
-_MGMT_LOOP_SEC = 60
-
 # ---------------------------------------------------------------------------
 # Pipeline status ("is anything broken") -- see pipeline_status() below.
 # Inherited from the same .env the rest of the stack sees (local-stack.ps1
 # imports it into the process before spawning every service, including this
-# one), so this mirrors telegram-ingest's own DRY_RUN flag without needing
-# an RPC to ask it.
+# one).
 # ---------------------------------------------------------------------------
 
 
@@ -117,7 +102,7 @@ def _env_bool(name: str, default: str = "false") -> bool:
     return (os.environ.get(name, default) or "").strip().lower() in ("true", "1", "yes", "on")
 
 
-_DRY_RUN_ENV_DEFAULT = _env_bool("TELEGRAM_INGEST_DRY_RUN", "true")
+_DRY_RUN_ENV_DEFAULT = _env_bool("DASHBOARD_DRY_RUN_DEFAULT", "true")
 _HB_STALE_AFTER_SEC = 90.0
 
 
@@ -125,17 +110,16 @@ def effective_dry_run() -> bool:
     """The dry-run state actually in force right now.
 
     The operator can flip dry-run from this dashboard (POST /api/dryrun), which
-    persists to the trade store's `meta` table; telegram-ingest re-reads the
-    same value on its message path. The env var is only the default for a store
-    that has never been written to, so never branch on _DRY_RUN_ENV_DEFAULT
-    directly -- always ask here."""
+    persists to the trade store's `meta` table. The env var is only the
+    default for a store that has never been written to, so never branch on
+    _DRY_RUN_ENV_DEFAULT directly -- always ask here."""
     return ts.get_dry_run(_DRY_RUN_ENV_DEFAULT)
 
 
 def set_dry_run_mode(payload: dict) -> tuple[int, dict]:
     """Flip the dry-run switch. Returns (http_status, body).
 
-    Gates, mirroring resubmit_signal()'s posture -- the two are the only
+    Gates, mirroring send_test_signal()'s posture -- the two are the only
     controls in this dashboard that can change whether real orders reach the
     broker:
 
@@ -146,15 +130,14 @@ def set_dry_run_mode(payload: dict) -> tuple[int, dict]:
          `confirm: true`, so a stray click or a replayed request cannot arm
          live trading. Turning it ON is the safe direction and needs no
          confirmation.
-      3. Going live also re-runs telegram-ingest's own startup precondition:
-         TELEGRAM_INGEST_LICENSE_ID must be set, because it prefixes every
-         command built for the broker. That check used to run only at boot,
+      3. Going live also re-checks the same precondition the webhook-test
+         tool relies on: LICENSE_ID must be set, because it prefixes every
+         command sent to the broker. That check used to run only at boot,
          when dry-run could not change afterwards -- this switch can, so the
          guarantee has to be re-established here or the switch would be a way
          around it.
-      4. Every accepted change is written to the control audit log and
-         announced to the management chat -- going live is exactly the event
-         an operator wants a receipt for.
+      4. Every accepted change is written to the control audit log -- going
+         live is exactly the event an operator wants a receipt for.
     """
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
@@ -167,10 +150,10 @@ def set_dry_run_mode(payload: dict) -> tuple[int, dict]:
             "dry_run": effective_dry_run(),
         }
 
-    if enabled is False and not getattr(_ingest, "LICENSE_ID", ""):
+    if enabled is False and not LICENSE_ID:
         return 409, {
             "ok": False,
-            "error": "TELEGRAM_INGEST_LICENSE_ID is not set — it prefixes every broker "
+            "error": "DASHBOARD_LICENSE_ID is not set — it prefixes every broker "
                      "command, so going live would emit malformed orders. Set it in .env "
                      "and restart the stack before switching off dry-run.",
             "dry_run": effective_dry_run(),
@@ -188,34 +171,24 @@ def set_dry_run_mode(payload: dict) -> tuple[int, dict]:
         requested=enabled,
         ok=(after == enabled),
     )
-    if after != before and MGMT_CHAT_ID:
-        _send_telegram(
-            MGMT_CHAT_ID,
-            ("🟡 DRY-RUN ON — signals are parsed but no orders reach the broker."
-             if after else
-             "🔴 DRY-RUN OFF — the stack is LIVE, signals now place real orders."),
-        )
     return 200, {"ok": after == enabled, "dry_run": after}
 
 # ---------------------------------------------------------------------------
-# Resubmit -- operator-triggered order placement for signals that never
-# reached MT5. This is the ONLY place in this file that ever POSTs to
-# ingress; see resubmit_signal() below for the full set of safety gates.
 # INGRESS_PORT is independently configurable (default 8081, matching
 # local-stack.ps1's $IngressPort) so tests can point it at a local stub
-# server without touching the real ingress.
+# server without touching the real ingress. _post_to_ingress() below is the
+# only place in this file that ever POSTs there -- currently used solely by
+# the "Send a sample TradingView signal" tool (send_test_signal()).
 # ---------------------------------------------------------------------------
 
 INGRESS_PORT = (os.environ.get("INGRESS_PORT") or "8081").strip() or "8081"
 INGRESS_PERIMETER_TOKEN = (os.environ.get("INGRESS_PERIMETER_TOKEN") or "").strip()
 _INGRESS_WEBHOOK_URL = f"http://127.0.0.1:{INGRESS_PORT}/webhook"
-RESUBMIT_TXN_LOG = get_txn_logger("dashboard-resubmit")
 # Operator control actions that change how the stack trades (currently just the
-# dry-run switch) get their own audit trail, separate from resubmits.
+# dry-run switch) get their own audit trail.
 CONTROL_TXN_LOG = get_txn_logger("dashboard-control")
 # "Send a sample TradingView signal" (see build_test_signal_command() /
-# send_test_signal() below) gets its own audit trail too, separate from real
-# telegram resubmits.
+# send_test_signal() below) gets its own audit trail too.
 WEBHOOK_TEST_TXN_LOG = get_txn_logger("dashboard-webhook-test")
 
 
@@ -379,13 +352,17 @@ def _side_of(command: str) -> str:
 
 
 def _source_of(comment: str) -> str:
-    return "telegram" if (comment or "").startswith("tg-") else "tradingview"
+    """This stack has exactly one signal source: every order it places is
+    TradingView-sourced by construction. Kept as a function (rather than
+    inlining the literal) so callers don't need to change if a second source
+    is ever added back."""
+    return "tradingview"
 
 
 def _deal_source(magic: int, comment: str) -> str:
-    """Classify account activity: this stack's trades (by magic) split into
-    telegram/tradingview by comment; anything else on the account (other
-    EAs, manual trades) is "other"."""
+    """Classify account activity: this stack's own trades (by magic) are
+    always "tradingview"; anything else on the account (other EAs, manual
+    trades) is "other"."""
     if magic == MAGIC:
         return _source_of(comment)
     return "other"
@@ -395,46 +372,16 @@ def _redact(cmd: str) -> str:
     return re.sub(r"secret=[^,]*", "secret=***", cmd or "")
 
 
-def _signal_stats() -> dict:
-    # Telegram integration disabled (2026-08-14) -- telegram-signals.log is
-    # only ever written by telegram-ingest, so this would just keep
-    # re-reporting stale pre-disable data. Uncomment the body below to
-    # re-enable.
-    return {"received": 0, "posted": 0, "rejected": 0, "dry_run": 0, "errors": 0, "recent": []}
-    # rows = _read_txn("telegram-signals")
-    # by_outcome: dict[str, int] = {}
-    # for r in rows:
-    #     outcome = r.get("outcome", "other")
-    #     by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
-    # recent = [
-    #     {
-    #         "ts": r.get("ts", ""),
-    #         "channel": r.get("channel") or "direct",
-    #         "outcome": r.get("outcome", ""),
-    #         "detail": _redact(r.get("command") or r.get("raw_text") or "")[:130],
-    #     }
-    #     for r in rows[-12:]
-    # ][::-1]
-    # return {
-    #     "received": len(rows),
-    #     "posted": by_outcome.get("posted", 0),
-    #     "rejected": by_outcome.get("rejected", 0),
-    #     "dry_run": by_outcome.get("dry_run", 0),
-    #     "errors": by_outcome.get("webhook_error", 0),
-    #     "recent": recent,
-    # }
-
-
 def _order_stats(source: str | None = None) -> dict:
-    """`source`, when given, restricts to orders whose comment-derived source
-    matches (telegram/tradingview). mt5-fills.log only ever logs this stack's
-    own orders (telegram/tradingview by comment prefix) -- "other" EA/manual
-    activity never appears here, so source="other" naturally yields empty
-    buckets/recent rows rather than needing special-casing."""
+    """`source`, when given, restricts to orders whose source matches
+    ("tradingview"/"other"). mt5-fills.log only ever logs this stack's own
+    (tradingview) orders -- "other" EA/manual activity never appears here, so
+    source="other" naturally yields empty buckets/recent rows rather than
+    needing special-casing."""
     rows = [r for r in _read_txn("mt5-fills") if r.get("command")]
     if source:
         rows = [r for r in rows if _source_of(r.get("comment", "")) == source]
-    out = {"telegram": _empty_bucket(), "tradingview": _empty_bucket()}
+    out = {"tradingview": _empty_bucket()}
     recent = []
     for r in rows:
         b = out[_source_of(r.get("comment", ""))]
@@ -572,7 +519,7 @@ def _closed_positions(days: int, journal: dict) -> tuple[list[dict], float | Non
 
 
 def _mt5_stats(journal: dict, days: int, source: str | None = None) -> dict:
-    """`source`, when given ("telegram"/"tradingview"/"other"), restricts open
+    """`source`, when given ("tradingview"/"other"), restricts open
     positions and the closed-trades window (count/wins/losses/net/rows/daily/
     review_queue) to that source. `closed.by_source` is the one exception --
     it is always computed from the *unfiltered* closed set, because the
@@ -613,7 +560,7 @@ def _mt5_stats(journal: dict, days: int, source: str | None = None) -> dict:
     grouped = [r for r in grouped_all if r["source"] == source] if source else grouped_all
 
     wins = [r for r in grouped if r["profit"] >= 0]
-    by_source: dict[str, float] = {"telegram": 0.0, "tradingview": 0.0, "other": 0.0}
+    by_source: dict[str, float] = {"tradingview": 0.0, "other": 0.0}
     for r in grouped_all:
         by_source[r["source"]] = round(by_source.get(r["source"], 0.0) + r["profit"], 2)
 
@@ -645,13 +592,10 @@ def _mt5_stats(journal: dict, days: int, source: str | None = None) -> dict:
 
 
 def summary(days: int = 7, source: str | None = None) -> dict:
-    """`source` ("telegram"/"tradingview"/"other"), when given, filters orders,
-    open positions and the closed-trades window throughout. Signals are left
-    unfiltered (they are inherently telegram-only; the client hides that
-    section instead when a non-telegram source is selected) and the
-    "Performance by source" comparison inside mt5.closed.by_source is always
-    computed unfiltered -- see _mt5_stats. source=None (the default) must
-    produce byte-for-byte the same numbers as before this parameter existed."""
+    """`source` ("tradingview"/"other"), when given, filters orders, open
+    positions and the closed-trades window throughout. The "Performance by
+    source" comparison inside mt5.closed.by_source is always computed
+    unfiltered -- see _mt5_stats. source=None (the default) shows everything."""
     journal = _load_journal()
     journaled = [j for j in journal.values() if j.get("setup") or j.get("notes") or j.get("rating")]
     ratings = [j["rating"] for j in journaled if j.get("rating")]
@@ -659,7 +603,6 @@ def summary(days: int = 7, source: str | None = None) -> dict:
         "updated": datetime.now(timezone.utc).isoformat(),
         "days": days,
         "source": source or "",
-        "signals": _signal_stats(),
         "orders": _order_stats(source),
         "mt5": _mt5_stats(journal, days, source),
         "journal": {
@@ -806,7 +749,7 @@ def _parse_days(path: str) -> int:
     return max(1, min(120, d))
 
 
-_VALID_SOURCES = ("telegram", "tradingview", "other")
+_VALID_SOURCES = ("tradingview", "other")
 
 
 def _parse_source(path: str) -> str | None:
@@ -833,12 +776,15 @@ def _channel_label(channel: str | None) -> str:
 
 
 def scorecard(days: int = 30) -> dict:
-    """Per-channel signal->order->closed-trade funnel. Real Telegram channels
-    come from signals.channel (joined to orders via signals.trace_ids ->
-    orders.trace_id); a synthetic "tradingview" row covers orders.source=
-    "tradingview" (those never go through the signals table), and a synthetic
-    "other EAs" row covers closed_trades.source="other" so the section totals
-    reconcile against the whole account, not just the signal-driven slice.
+    """Per-channel signal->order->closed-trade funnel. The `signals` table
+    this joins against (signals.channel / signals.trace_ids -> orders.trace_id)
+    is no longer populated by anything in this stack, so in practice this
+    reduces to two synthetic rows: "tradingview", covering orders.source=
+    "tradingview", and "other EAs", covering closed_trades.source="other" --
+    together they reconcile the section's totals against the whole account,
+    not just the signal-driven slice. The signals-table join is left in place
+    (harmless against an empty table) rather than special-cased away, so a
+    future signal source can populate it again without code changes here.
 
     Order -> closed-trade join is a heuristic: orders.broker_order_id ==
     closed_trades.position_id, which only resolves once MT5 reports a market
@@ -1046,11 +992,11 @@ def _live_risk() -> dict:
 
 
 def _compliance(days: int, source: str | None = None) -> dict:
-    """Stack-level (telegram+tradingview) risk-cap compliance, keyed off the
-    orders table's `source` column. `source`, when given, restricts both rows
-    to that source; "other" naturally yields empty (the orders table never
-    records "other"-EA activity -- only this stack's own telegram/tradingview
-    orders go through it)."""
+    """Stack-level (tradingview) risk-cap compliance, keyed off the orders
+    table's `source` column. `source`, when given, restricts both rows to
+    that source; "other" naturally yields empty (the orders table never
+    records "other"-EA activity -- only this stack's own tradingview orders
+    go through it)."""
     cutoff = _cutoff_iso(days)
     if source:
         risk_orders = ts.query(
@@ -1156,12 +1102,12 @@ def calendar_month(month: str, stack_only: bool = True, source: str | None = Non
 
 def _digest_period(days: int, source: str | None = None) -> dict:
     """`source`, when given, restricts signals/orders/closed-trade counts to
-    that source (signals has no source column, so it zeroes for non-telegram
-    sources). Equity/margin readouts stay account-level/unfiltered. Callers
-    that omit `source` (the Telegram digest thread, --digest-now CLI) see no
-    behavior change."""
+    that source (the `signals` table has no source column and is no longer
+    populated by anything in this stack, so a given source always zeroes it).
+    Equity/margin readouts stay account-level/unfiltered. Callers that omit
+    `source` (the --digest-now CLI) see no behavior change."""
     cutoff = _cutoff_iso(days)
-    if source and source != "telegram":
+    if source:
         received = 0
     else:
         received = len(ts.query("SELECT 1 FROM signals WHERE ts >= ?", (cutoff,)))
@@ -1230,9 +1176,8 @@ def _fmt_signed(v: float) -> str:
 
 
 def build_digest_text(days: int, weekly: bool) -> str:
-    """Plain-text digest (no markdown -- goes straight into a Telegram
-    message). Pure function of the store's current state; callers decide
-    whether/where to send it."""
+    """Plain-text digest (no markdown), printed to the console by the
+    --digest-now CLI path. Pure function of the store's current state."""
     d = _digest_period(days)
     period_label = "Weekly (7-day)" if weekly else f"{days}-day"
     lines = [
@@ -1256,31 +1201,7 @@ def build_digest_text(days: int, weekly: bool) -> str:
     return "\n".join(lines)
 
 
-# --- Telegram send + meta persistence ---------------------------------
-
-
-def _send_telegram(chat_id: str, text: str) -> bool:
-    """Telegram integration disabled (2026-08-14) -- the bot now runs as its
-    own separate project (C:\\TelegramBot). Kept as a no-op choke point
-    (rather than commenting out every call site) so dry-run announcements,
-    the digest thread, and loss/drawdown alerts stay callable without any
-    other code changes. Uncomment the body below to re-enable.
-    """
-    return False
-    # if not _TELEGRAM_BOT_TOKEN or not chat_id:
-    #     return False
-    # try:
-    #     url = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}/sendMessage"
-    #     data = json.dumps({"chat_id": chat_id, "text": text}).encode()
-    #     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    #     with urllib.request.urlopen(req, timeout=10) as resp:
-    #         return 200 <= resp.status < 300
-    # except (urllib.error.URLError, OSError, ValueError) as exc:
-    #     print(f"[mgmt] telegram send failed: {exc!r}", file=sys.stderr)
-    #     return False
-    # except Exception as exc:  # noqa: BLE001 - background thread must never die
-    #     print(f"[mgmt] telegram send failed (unexpected): {exc!r}", file=sys.stderr)
-    #     return False
+# --- meta persistence ---------------------------------------------------
 
 
 def _meta_get(key: str) -> str | None:
@@ -1299,33 +1220,13 @@ def _meta_get(key: str) -> str | None:
             pass
 
 
-def _meta_set(key: str, value: str) -> None:
-    conn = ts.get_conn()
-    if conn is None:
-        return
-    try:
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        conn.commit()
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
 # ---------------------------------------------------------------------------
 # Pipeline status -- "is anything broken" panel (/api/pipeline). Pulls
-# together heartbeats written by the forwarder/ea_shim (meta table, so a
-# hung-but-alive process can't masquerade as healthy the way pid-liveness
-# does) with live HTTP health checks of the Go services and this stack's own
-# channel registry. Every read here is either the existing no-throw
-# ts.query()/​_meta_get, or a short-timeout HTTP probe that never raises.
+# together the heartbeat ea_shim writes (meta table, so a hung-but-alive
+# process can't masquerade as healthy the way pid-liveness does) with live
+# HTTP health checks of the Go services. Every read here is either the
+# existing no-throw ts.query()/​_meta_get, or a short-timeout HTTP probe that
+# never raises.
 # ---------------------------------------------------------------------------
 
 
@@ -1372,39 +1273,6 @@ def pipeline_status() -> dict:
     or zero channels enabled); AMBER for non-blocking degradation; GREEN
     only when it would actually reach MT5."""
     components: list[dict] = []
-
-    # Telegram integration disabled (2026-08-14) -- the bot now runs as its
-    # own separate project (C:\TelegramBot). The forwarder and telegram-ingest
-    # components are commented out rather than left in: both would report
-    # "down" forever now that neither process ever starts here, which would
-    # permanently poison the "blocking" reasons below into a false RED.
-    # Uncomment both blocks (and re-add "forwarder"/"telegram-ingest" to the
-    # `blocking` tuple and the telegram-ingest amber check further down) to
-    # re-enable.
-    #
-    # fwd_age = _hb_age_sec("hb_forwarder")
-    # fwd_channels = _meta_get("hb_forwarder_channels") or "?"
-    # if fwd_age is not None and fwd_age < _HB_STALE_AFTER_SEC:
-    #     components.append({
-    #         "name": "forwarder", "state": "ok",
-    #         "detail": f"watching {fwd_channels} channel(s) · heartbeat {int(fwd_age)}s ago",
-    #     })
-    # else:
-    #     components.append({
-    #         "name": "forwarder", "state": "down",
-    #         "detail": "not relaying — signals never reach the bot",
-    #     })
-    #
-    # status, body = _http_probe("http://127.0.0.1:8089/readyz")
-    # if status == 200:
-    #     components.append({"name": "telegram-ingest", "state": "ok", "detail": "polling Telegram"})
-    # elif status == 503:
-    #     components.append({
-    #         "name": "telegram-ingest", "state": "warn",
-    #         "detail": (body or {}).get("detail") or "not ready",
-    #     })
-    # else:
-    #     components.append({"name": "telegram-ingest", "state": "down", "detail": "unreachable (127.0.0.1:8089)"})
 
     status, _ = _http_probe("http://127.0.0.1:8081/health")
     components.append({
@@ -1463,45 +1331,16 @@ def pipeline_status() -> dict:
         "updated_ts": dry_meta.get("updated_ts"),
     })
 
-    # Telegram integration disabled (2026-08-14): the "channels" component is
-    # the Telegram channel registry's enabled/disabled count, which is
-    # meaningless for a TradingView-only stack (and would permanently read
-    # "0 channels enabled" -> a false RED forever). Uncomment to re-enable,
-    # along with the enabled_n/total_n-driven reasons below.
-    #
-    # chans = ts.list_channels()
-    # enabled_n = sum(1 for c in chans if c.get("enabled"))
-    # total_n = len(chans)
-    # components.append({
-    #     "name": "channels",
-    #     "state": "warn" if enabled_n == 0 else "ok",
-    #     "detail": (f"{enabled_n}/{total_n} enabled" if total_n else "no channels registered")
-    #               + ("" if enabled_n else " — no channels are being processed"),
-    #     "enabled": enabled_n, "total": total_n,
-    # })
-
     by_name = {c["name"]: c for c in components}
-    # "forwarder" and "telegram-ingest" dropped from blocking (see the
-    # commented-out components above); re-add both if Telegram is re-enabled.
     blocking = ("ingress", "bridge", "ea-shim", "mt5")
     reasons = [f"{name} down" for name in blocking if by_name[name]["state"] == "down"]
     if dry_on:
         reasons.append("dry-run is on")
-    # if enabled_n == 0:
-    #     reasons.append("0 channels enabled")
 
     if reasons:
         verdict, headline = "red", "SIGNALS NOT REACHING MT5"
     else:
-        amber_reasons = []
-        # if by_name["telegram-ingest"]["state"] == "warn":
-        #     amber_reasons.append("telegram-ingest degraded")
-        # if total_n > enabled_n:
-        #     amber_reasons.append(f"{total_n - enabled_n} channel(s) disabled")
-        if amber_reasons:
-            verdict, headline, reasons = "amber", "SIGNALS REACHING MT5 (degraded)", amber_reasons
-        else:
-            verdict, headline = "green", "SIGNALS REACHING MT5"
+        verdict, headline = "green", "SIGNALS REACHING MT5"
 
     return {
         "verdict": verdict,
@@ -1513,85 +1352,14 @@ def pipeline_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Channel manager -- backs the "Signal channels" section + /api/channels*
-# routes. All writes go through _tradestore's no-throw channel helpers.
-# ---------------------------------------------------------------------------
-
-
-def channels_snapshot() -> dict:
-    # Telegram integration disabled (2026-08-14) -- channel management is the
-    # Telegram-channel registry the (now separated) bot watches, which has no
-    # TradingView equivalent. Uncomment the body below to re-enable.
-    return {"channels": [], "dialogs": [], "unregistered": []}
-    # channels = ts.list_channels()
-    # # Signal sources are channels/groups; the account's ~90 private chats
-    # # (many with no title at all) would bury them in the picker. Free-text
-    # # entry remains available for anything not listed.
-    # dialogs = [
-    #     d
-    #     for d in ts.list_tg_dialogs()
-    #     if (d.get("kind") in ("channel", "group")) and (d.get("title") or "").strip()
-    # ]
-    # dialogs.sort(key=lambda d: (d.get("title") or "").lower())
-    #
-    # cutoff = _cutoff_iso(30)
-    # sig_rows = ts.query(
-    #     "SELECT channel, COUNT(*) AS n, MAX(ts) AS last_ts FROM signals "
-    #     "WHERE ts >= ? AND channel IS NOT NULL AND channel != '' GROUP BY channel",
-    #     (cutoff,),
-    # )
-    # sig_by_channel = {r["channel"]: r for r in sig_rows}
-    # direct_rows = ts.query(
-    #     "SELECT COUNT(*) AS n, MAX(ts) AS last_ts FROM signals "
-    #     "WHERE ts >= ? AND (channel IS NULL OR channel = '')",
-    #     (cutoff,),
-    # )
-    # direct_n = direct_rows[0]["n"] if direct_rows else 0
-    # direct_last = direct_rows[0]["last_ts"] if direct_rows else None
-    #
-    # registered_titles = {
-    #     (c.get("title") or "").strip().lower()
-    #     for c in channels
-    #     if c.get("chat_id") != "direct" and c.get("title")
-    # }
-    # for c in channels:
-    #     if c.get("chat_id") == "direct":
-    #         c["signals_30d"], c["last_signal"] = direct_n, direct_last
-    #     else:
-    #         s = sig_by_channel.get(c.get("title"))
-    #         c["signals_30d"] = s["n"] if s else 0
-    #         c["last_signal"] = s["last_ts"] if s else None
-    #     chat_id = str(c.get("chat_id") or "")
-    #     c["pending_resolution"] = chat_id != "direct" and not chat_id.lstrip("-").isdigit()
-    #
-    # unregistered = [
-    #     {"channel": r["channel"], "signals_30d": r["n"], "last_signal": r["last_ts"]}
-    #     for r in sig_rows
-    #     if (r.get("channel") or "").strip().lower() not in registered_titles
-    # ]
-    # return {"channels": channels, "dialogs": dialogs, "unregistered": unregistered}
-
-
-# ---------------------------------------------------------------------------
 # Message ledger -- the two operator pages that answer "what did the app pass
 # over?" and "what did it actually do?".
 #
-# The two sources record different things, so each page draws from whichever
-# table actually holds the truth for that source:
-#   * Telegram messages land in `signals` (telegram-ingest writes one row per
-#     message it sees, including the ones it ignores).
-#   * TradingView/other arrive as webhooks and only exist here once ingress has
-#     accepted them and issued a trace_id -- so `orders` is their ledger.
+# Signals arrive as TradingView webhooks and only exist here once ingress has
+# accepted them and issued a trace_id -- so `orders` is their ledger (the
+# `signals` table is legacy/unpopulated -- see _trace_id_channels below).
 # ---------------------------------------------------------------------------
 
-_IGNORED_REASON = {
-    "ignored": "not a signal — nothing tradeable in it",
-    "rejected": "grammar rejected",
-    "webhook_error": "webhook error — never reached ingress",
-    "dry_run": "dry-run — not sent to the broker",
-    "tp_update_dry_run": "TP amendment — dry-run, not sent",
-    "tp_update_noop": "TP amendment — nothing open to amend",
-}
 _ACTIONED_STATUSES = ("accepted", "placed", "filled")
 _ACTION_LABEL = {
     "newsltplong": "TP/SL amended on open longs",
@@ -1608,24 +1376,11 @@ def _ledger_window(days: int) -> str:
 
 
 def _trace_id_channels(days: int) -> dict[str, str]:
-    """Map trace_id -> originating Telegram channel name.
-
-    An `orders` row knows only the comment tag it went out with ("tg-AGTP"),
-    which is initials chosen to fit MT5's comment field, not a name an operator
-    should have to decode. The readable name lives on the `signals` row, and
-    the trace_id issued by ingress is the only thing the two share -- so the
-    join goes through that, resolved in one pass here rather than a correlated
-    subquery per order row.
-
-    The signal window is deliberately a day wider than the order window: a
-    signal recorded just before the cutoff can still have placed its orders
-    inside it, and an unresolved trace_id shows as a blank channel, which reads
-    as "this did not come from a channel" -- exactly the wrong answer for a
-    relayed signal.
-
-    Telegram rows with no channel are direct messages to the bot rather than
-    relayed posts; they are labelled "direct", matching the ignored-messages
-    page. Non-Telegram orders never appear here at all.
+    """Map trace_id -> originating channel name, for orders whose signal was
+    recorded in the `signals` table. That table is no longer populated by
+    anything in this stack, so this currently always returns {} -- the query
+    is left in place (harmless against an empty table) rather than
+    special-cased away, in case a future signal source populates it again.
     """
     out: dict[str, str] = {}
     for s in ts.query(
@@ -1645,39 +1400,9 @@ def _trace_id_channels(days: int) -> dict[str, str]:
 
 
 def ignored_messages(days: int = 7, source: str | None = None, limit: int = 500) -> dict:
-    """Messages that arrived and produced NO order at the broker.
-
-    Telegram rows are restricted to channels that are currently ENABLED --
-    including channels with no registry row at all, which telegram-ingest
-    treats as enabled (see is_channel_enabled's fail-open contract). Only an
-    explicit enabled=0 row is filtered out, so the page matches what the relay
-    would actually act on today."""
+    """Messages that arrived and produced NO order at the broker."""
     cutoff = _ledger_window(days)
     rows: list[dict] = []
-
-    # Telegram integration disabled (2026-08-14): the `signals` table is only
-    # ever written by telegram-ingest, so this branch would just keep
-    # re-showing the same stale rows from before it was disabled. Uncomment
-    # to re-enable.
-    # if source in (None, "", "telegram"):
-    #     marks = ",".join("?" * len(_IGNORED_REASON))
-    #     for r in ts.query(
-    #         f"SELECT ts, channel, outcome, symbol, raw FROM signals s "
-    #         f"WHERE ts >= ? AND outcome IN ({marks}) "
-    #         f"AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.enabled = 0 AND ("
-    #         f"    (s.channel IS NULL AND c.chat_id = 'direct') "
-    #         f" OR (c.title = s.channel COLLATE NOCASE))) "
-    #         f"ORDER BY ts DESC LIMIT ?",
-    #         (cutoff, *_IGNORED_REASON.keys(), limit),
-    #     ):
-    #         rows.append({
-    #             "ts": r.get("ts"),
-    #             "source": "telegram",
-    #             "origin": r.get("channel") or "direct",
-    #             "reason": _IGNORED_REASON.get(r.get("outcome") or "", r.get("outcome") or ""),
-    #             "symbol": r.get("symbol") or "",
-    #             "text": r.get("raw") or "",
-    #         })
 
     if source in (None, "", "tradingview", "other"):
         where = ["ts >= ?", "(status = 'rejected' OR (error IS NOT NULL AND error != ''))"]
@@ -1685,8 +1410,6 @@ def ignored_messages(days: int = 7, source: str | None = None, limit: int = 500)
         if source:
             where.append("source = ?")
             params.append(source)
-        else:
-            where.append("source != 'telegram'")
         params.append(limit)
         for r in ts.query(
             "SELECT ts, source, command, symbol, status, error, comment FROM orders "
@@ -1758,322 +1481,6 @@ def actioned_messages(days: int = 7, source: str | None = None, limit: int = 500
     return {"rows": rows, "days": days, "source": source or ""}
 
 
-def request_dialog_refresh() -> dict:
-    """Ask the forwarder to re-read the account's Telegram dialogs, so a
-    channel subscribed to just now shows up in the "add channel" picker
-    without waiting out the 10-minute refresh timer.
-
-    This dashboard has no Telethon session -- only the forwarder is
-    authenticated -- so all it can do is raise a flag and report back what the
-    picker looks like RIGHT NOW. The caller watches those two values for a
-    change to know the request was served.
-
-    A dead forwarder is the one failure worth naming up front: the flag would
-    sit unread forever, and "nothing happened" is a much worse answer than
-    "the thing that does this is down"."""
-    # Telegram integration disabled (2026-08-14) -- the forwarder this talks
-    # to now runs as its own separate project (C:\TelegramBot). Uncomment the
-    # body below to re-enable.
-    return {"ok": False, "count": 0, "refreshed_ts": "", "forwarder_alive": False}
-    # ts.meta_set(ts.DIALOG_REFRESH_REQUEST_KEY, datetime.now(timezone.utc).isoformat())
-    # dialogs = ts.list_tg_dialogs()
-    # hb_age = _age_seconds(ts.meta_get("hb_forwarder"))
-    # return {
-    #     "ok": True,
-    #     "count": len(dialogs),
-    #     "refreshed_ts": max((d.get("refreshed_ts") or "") for d in dialogs) if dialogs else "",
-    #     "forwarder_alive": hb_age is not None and hb_age < _HB_STALE_AFTER_SEC,
-    # }
-
-
-# Columns /api/channels/toggle is allowed to flip. First gate against a
-# client-supplied `field` string that gets passed through to _tradestore's
-# set_channel_flag(); that function has its own matching allowlist
-# (_CHANNEL_FLAG_COLUMNS) as a second, store-level check -- this one exists so
-# a bad request is rejected with a clear 400 here rather than a silent no-op
-# two layers down.
-_CHANNEL_TOGGLE_FIELDS = ("enabled", "partial_book", "breakeven")
-
-
-def add_channel(payload: dict) -> dict:
-    """Add/upsert a channel row. `spec` is whatever the operator gave us --
-    a numeric id (from the dialog picker or typed directly), 'direct', or
-    free text (username/title fragment) the dashboard itself can't resolve
-    (no Telethon session here). A non-numeric spec is stored keyed by the
-    spec text itself and picked up by the forwarder's next registry refresh
-    (see telegram_user_forwarder.refresh_enabled_channels), which resolves
-    it to a real id/title or stamps a "could not resolve" note."""
-    # Telegram integration disabled (2026-08-14) -- adding a channel to watch
-    # is meaningless with the bot running as its own separate project
-    # (C:\TelegramBot). Uncomment the body below to re-enable.
-    raise ValueError("Telegram integration is disabled in this project — see C:\\TelegramBot")
-    # spec = str(payload.get("spec") or "").strip()
-    # if not spec:
-    #     raise ValueError("spec is required")
-    # title = str(payload.get("title") or "").strip() or None
-    # note = payload.get("note")
-    # note = str(note).strip()[:300] or None if note else None
-    # chat_id = spec
-    # ts.upsert_channel(chat_id=chat_id, title=title, spec=spec, enabled=1, note=note)
-    # pending = chat_id != "direct" and not chat_id.lstrip("-").isdigit()
-    # return {"chat_id": chat_id, "title": title, "pending_resolution": pending}
-
-
-# ---------------------------------------------------------------------------
-# "Signals not placed" + preview/resubmit -- signals that never became an
-# MT5 order, and the operator-triggered control to re-send them (or a
-# pasted signal the relay missed entirely). This is the only part of the
-# dashboard that ever POSTs to ingress; see resubmit_signal() for the full
-# set of safety gates. All grammar/command-building is delegated to the
-# telegram-ingest module (`_ingest`, imported above) so this can never drift
-# from what the live poll loop would actually send.
-# ---------------------------------------------------------------------------
-
-_UNPOSTED_REASON = {
-    "rejected": "grammar rejected",
-    "channel_disabled": "channel disabled",
-    "dry_run": "dry-run — not sent",
-    "webhook_error": "webhook error",
-}
-_NO_EXEC_CONFIRMED_AFTER_SEC = 5 * 60
-
-
-def _age_seconds(ts_str: str | None) -> float | None:
-    if not ts_str:
-        return None
-    try:
-        stamp = datetime.fromisoformat(ts_str)
-    except (ValueError, TypeError):
-        return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
-
-
-def _reparse_rejection_detail(raw: str | None) -> str:
-    """The `signals` table only stores the outcome, not the SignalError
-    message that produced it -- best-effort recover the actual rejection
-    reason for display by re-running the stored (possibly-truncated) raw
-    text through the same grammar that rejected it. Never raises; returns
-    "" if the text no longer reproduces a rejection (e.g. truncation ate
-    the part that mattered, or the text simply isn't available)."""
-    if not raw:
-        return ""
-    try:
-        _ingest.parse_signal(raw)
-    except _ingest.SignalError as exc:
-        return str(exc)
-    except Exception:  # noqa: BLE001 - this is a display nicety, never fatal
-        return ""
-    return ""
-
-
-def unposted_signals(days: int = 7) -> dict:
-    """Signals that, within the window, never resulted in a confirmed MT5
-    order. A signal qualifies when, within `days`:
-      (a) outcome in (rejected, webhook_error, channel_disabled, dry_run)
-      (b) outcome=posted but an order for one of its trace_ids came back
-          status=rejected (e.g. the risk-cap check, error LIKE 'risk sizing%')
-      (c) outcome=posted, an order was accepted, but none of its trace_ids
-          ever reported status filled/placed, and the signal is more than
-          _NO_EXEC_CONFIRMED_AFTER_SEC old (grace period for the fill to
-          come back over the normal async path before flagging it)
-    Every row also carries its latest resubmit-ledger entry, if any, so the
-    UI can show "already resubmitted" instead of the action buttons.
-    """
-    # Telegram integration disabled (2026-08-14): the `signals` table this
-    # queries is telegram-only by construction (see the docstring above), so
-    # this would just keep re-showing stale pre-disable rows forever.
-    # Uncomment the body below to re-enable.
-    return {"days": days, "count": 0, "rows": []}
-    # cutoff = _cutoff_iso(days)
-    # sig_rows = ts.query(
-    #     "SELECT id, ts, channel, outcome, symbol, side, entry, sl, tp, trace_ids, raw FROM signals "
-    #     "WHERE ts >= ? ORDER BY ts DESC",
-    #     (cutoff,),
-    # )
-    #
-    # parsed: list[tuple[dict, list[str]]] = []
-    # trace_ids_all: set[str] = set()
-    # for s in sig_rows:
-    #     try:
-    #         tids = json.loads(s.get("trace_ids") or "[]")
-    #         if not isinstance(tids, list):
-    #             tids = []
-    #     except json.JSONDecodeError:
-    #         tids = []
-    #     parsed.append((s, tids))
-    #     trace_ids_all.update(t for t in tids if t)
-    #
-    # orders_by_trace: dict[str, dict] = {}
-    # if trace_ids_all:
-    #     placeholders = ",".join("?" for _ in trace_ids_all)
-    #     order_rows = ts.query(
-    #         f"SELECT trace_id, status, error FROM orders WHERE trace_id IN ({placeholders})",
-    #         tuple(trace_ids_all),
-    #     )
-    #     orders_by_trace = {r["trace_id"]: r for r in order_rows}
-    #
-    # out_rows: list[dict] = []
-    # for s, tids in parsed:
-    #     outcome = s.get("outcome")
-    #     reason = None
-    #     detail = ""
-    #     if outcome in _UNPOSTED_REASON:
-    #         reason = _UNPOSTED_REASON[outcome]
-    #         if outcome == "rejected":
-    #             detail = _reparse_rejection_detail(s.get("raw"))
-    #         elif outcome == "channel_disabled":
-    #             detail = f"channel '{_channel_label(s.get('channel'))}' is disabled in the registry"
-    #         elif outcome == "dry_run":
-    #             detail = "TELEGRAM_INGEST_DRY_RUN was true when this signal arrived"
-    #         elif outcome == "webhook_error":
-    #             detail = "the webhook POST to ingress raised a transport error (see telegram-ingest logs)"
-    #     elif outcome == "posted":
-    #         orders = [orders_by_trace[t] for t in tids if t in orders_by_trace]
-    #         rejected = [o for o in orders if o.get("status") == "rejected"]
-    #         if rejected:
-    #             err = rejected[0].get("error") or ""
-    #             reason = "risk cap rejected" if err.lower().startswith("risk sizing") else "order rejected"
-    #             detail = err
-    #         else:
-    #             has_accepted = any(o.get("status") == "accepted" for o in orders)
-    #             has_filled = any(o.get("status") in ("filled", "placed") for o in orders)
-    #             if has_accepted and not has_filled:
-    #                 age = _age_seconds(s.get("ts"))
-    #                 if age is not None and age > _NO_EXEC_CONFIRMED_AFTER_SEC:
-    #                     reason = "no execution confirmed"
-    #                     detail = f"order accepted {int(age // 60)} min ago, no fill/placement reported yet"
-    #     if reason is None:
-    #         continue
-    #     out_rows.append(
-    #         {
-    #             "signal_id": s.get("id"),
-    #             "ts": s.get("ts"),
-    #             "channel": _channel_label(s.get("channel")),
-    #             "source": "telegram",  # the signals table is telegram-only by construction
-    #             "symbol": s.get("symbol"),
-    #             "side": s.get("side"),
-    #             "entry": s.get("entry"),
-    #             "sl": s.get("sl"),
-    #             "tp": s.get("tp"),
-    #             "outcome": outcome,
-    #             "reason": reason,
-    #             "detail": detail,
-    #         }
-    #     )
-    #
-    # resubmit_map = ts.resubmits_for_signals([r["signal_id"] for r in out_rows])
-    # for r in out_rows:
-    #     rs = resubmit_map.get(r["signal_id"])
-    #     if rs is None:
-    #         r["resubmit"] = None
-    #         continue
-    #     try:
-    #         statuses = json.loads(rs.get("http_statuses") or "[]")
-    #     except json.JSONDecodeError:
-    #         statuses = []
-    #     try:
-    #         trids = json.loads(rs.get("trace_ids") or "[]")
-    #     except json.JSONDecodeError:
-    #         trids = []
-    #     r["resubmit"] = {
-    #         "ts": rs.get("ts"),
-    #         "ok": bool(rs.get("ok")),
-    #         "http_statuses": statuses,
-    #         "trace_ids": trids,
-    #         "note": rs.get("note"),
-    #     }
-    #
-    # return {"days": days, "count": len(out_rows), "rows": out_rows}
-
-
-def _fetch_signal_row(signal_id: int) -> dict | None:
-    rows = ts.query(
-        "SELECT id, ts, chat_id, message_id, channel, outcome, raw FROM signals WHERE id = ?",
-        (signal_id,),
-    )
-    return rows[0] if rows else None
-
-
-def _derive_commands(signal_id: int | None = None, text: str | None = None) -> dict:
-    """Core of preview/resubmit: re-parse a stored or pasted signal with
-    telegram-ingest's own grammar and re-render its webhook command bodies
-    WITHOUT sending anything. Returns RAW (unredacted) commands -- callers
-    that expose this to the network (derive_preview) must redact before
-    responding; resubmit_signal() needs the raw form to actually POST.
-    """
-    # Telegram integration disabled (2026-08-14) -- this re-parses text with
-    # telegram-ingest's own grammar, which has no TradingView equivalent (the
-    # sample-signal tool below builds the wire format directly instead).
-    # Uncomment the body below to re-enable.
-    return {
-        "ok": False, "commands": [], "warnings": [],
-        "errors": ["Telegram integration is disabled in this project — see C:\\TelegramBot"],
-        "channel": None,
-    }
-    # warnings: list[str] = []
-    # errors: list[str] = []
-    # channel_name: str | None = None
-    # raw_text = ""
-    # truncated_hint = False
-    # sig_row: dict | None = None
-    #
-    # if signal_id is not None:
-    #     sig_row = _fetch_signal_row(int(signal_id))
-    #     if sig_row is None:
-    #         return {"ok": False, "commands": [], "warnings": [], "errors": [f"signal {signal_id} not found"], "channel": None}
-    #     raw_text = sig_row.get("raw") or ""
-    #     channel_name = sig_row.get("channel")
-    #     truncated_hint = len(raw_text) >= 500  # signals.raw is stored truncated at 500 chars
-    #     age_sec = _age_seconds(sig_row.get("ts"))
-    #     if age_sec is not None and age_sec >= 3600:
-    #         warnings.append(f"signal is {age_sec / 3600:.1f} hours old — prices may have moved")
-    # else:
-    #     channel_name, raw_text = _ingest.strip_source_tag(text or "")
-    #
-    # if channel_name is not None and not ts.is_channel_enabled(channel_name):
-    #     warnings.append("channel is currently disabled")
-    # if effective_dry_run():
-    #     warnings.append("system is in DRY-RUN")
-    #
-    # try:
-    #     sig = _ingest.parse_signal(raw_text)
-    # except _ingest.SignalError as exc:
-    #     errors.append(str(exc))
-    #     if truncated_hint:
-    #         warnings.append("stored text was truncated at 500 chars")
-    #     return {"ok": False, "commands": [], "warnings": warnings, "errors": errors, "channel": channel_name}
-    # if sig is None:
-    #     errors.append("text is not a recognized signal")
-    #     if truncated_hint:
-    #         warnings.append("stored text was truncated at 500 chars")
-    #     return {"ok": False, "commands": [], "warnings": warnings, "errors": errors, "channel": channel_name}
-    #
-    # comment = f"tg-{_ingest.channel_initials(channel_name)}" if channel_name else None
-    # commands = _ingest.build_commands(sig, comment=comment)
-    # return {
-    #     "ok": True,
-    #     "commands": commands,
-    #     "warnings": warnings,
-    #     "errors": errors,
-    #     "channel": channel_name,
-    #     "signal": {
-    #         "symbol": sig.get("symbol"), "side": sig.get("side"), "entry": sig.get("entry"),
-    #         "sl": sig.get("sl"), "tp": sig.get("tp"),
-    #     },
-    # }
-
-
-def derive_preview(signal_id: int | None = None, text: str | None = None) -> dict:
-    """Network-facing preview: same as _derive_commands but with the webhook
-    secret redacted out of every command body. Nothing is ever sent."""
-    d = _derive_commands(signal_id=signal_id, text=text)
-    out = dict(d)
-    out["commands"] = [_ingest._redact_secret(c) for c in d["commands"]]
-    return out
-
-
 def _post_to_ingress(body: str) -> tuple[int, str, str]:
     """POST one already-built webhook command body to ingress. The ONLY
     function in this file that talks to ingress -- INGRESS_PORT is
@@ -2102,138 +1509,13 @@ def _post_to_ingress(body: str) -> tuple[int, str, str]:
     return status, raw, trace_id
 
 
-def resubmit_signal(payload: dict) -> tuple[int, dict]:
-    """Operator-triggered order placement. Returns (http_status, body). Every
-    safety gate described in the PLAN lives here, in this order:
-
-      1. confirm must be the JSON boolean `true`, exactly -- anything else
-         (missing, false, "true" the string, 1) is refused with 400 and the
-         preview payload instead of being sent. A stray click can never
-         place an order.
-      2. Dry-run being ON refuses with 409 -- the operator deliberately put
-         the system in dry-run (via the banner switch or
-         TELEGRAM_INGEST_DRY_RUN); this control must not be able to bypass
-         that. Read live via effective_dry_run(), so a resubmit racing a
-         just-flipped switch sees the new value, not the boot-time one.
-      3. A disabled source channel is ALLOWED but was already flagged as a
-         warning in the preview (and must have been shown in the confirm
-         modal) -- an explicit operator override is legitimate.
-      4. Idempotency: a signal already resubmitted (any prior ledger row for
-         its signal_id) is refused with 409 naming the earlier attempt,
-         unless the caller passes force=true.
-      5. Only after all of the above does anything get POSTed to ingress --
-         one POST per command, each result recorded individually.
-      6. Every attempt (successful or not, once step 5 is reached) is
-         written to the `resubmits` audit table AND the JSONL txn log,
-         secrets redacted in both.
-    """
-    # Telegram integration disabled (2026-08-14) -- this resends a stored or
-    # pasted Telegram-grammar signal, which has no TradingView equivalent
-    # (see send_test_signal() below for the TradingView-native tool).
-    # Uncomment the body below to re-enable.
-    return 400, {"ok": False, "error": "Telegram integration is disabled in this project — see C:\\TelegramBot"}
-    # signal_id = payload.get("signal_id")
-    # text = payload.get("text")
-    # confirm = payload.get("confirm")
-    # force = bool(payload.get("force"))
-    #
-    # if signal_id is None and not text:
-    #     return 400, {"ok": False, "error": "signal_id or text is required"}
-    #
-    # try:
-    #     signal_id_int = int(signal_id) if signal_id is not None else None
-    # except (TypeError, ValueError):
-    #     return 400, {"ok": False, "error": "signal_id must be an integer"}
-    #
-    # derived = _derive_commands(signal_id=signal_id_int, text=text)
-    # preview = dict(derived)
-    # preview["commands"] = [_ingest._redact_secret(c) for c in derived["commands"]]
-    #
-    # # Gate 1: confirm must be exactly boolean true.
-    # if confirm is not True:
-    #     body = dict(preview)
-    #     body["error"] = "confirm must be true"
-    #     return 400, body
-    #
-    # # Gate 2: dry-run refuses outright, before any idempotency/order-building
-    # # work -- the operator's dry-run switch always wins.
-    # if effective_dry_run():
-    #     return 409, {
-    #         "ok": False,
-    #         "error": "system is in DRY-RUN — resubmit refused (turn dry-run off in the pipeline bar to place orders)",
-    #         "preview": preview,
-    #     }
-    #
-    # if not derived["ok"]:
-    #     body = dict(preview)
-    #     body["error"] = "cannot resubmit: the signal does not parse (see errors)"
-    #     return 400, body
-    #
-    # source = "signal" if signal_id_int is not None else "manual"
-    #
-    # # Gate 4: idempotency -- only meaningful for a stored signal (a pasted
-    # # manual signal has no natural dedupe key).
-    # if signal_id_int is not None and not force:
-    #     prior = ts.latest_resubmit_for_signal(signal_id_int)
-    #     if prior is not None:
-    #         return 409, {
-    #             "ok": False,
-    #             "error": (
-    #                 f"signal {signal_id_int} was already resubmitted at {prior.get('ts')} "
-    #                 f"(ok={bool(prior.get('ok'))}); pass force:true to resubmit again"
-    #             ),
-    #         }
-    #
-    # # Gate 5: the actual sends. `derived["commands"]` are the RAW bodies
-    # # (secret included) -- this is the only place they're used unredacted.
-    # results = []
-    # http_statuses = []
-    # trace_ids = []
-    # all_ok = True
-    # for body_raw in derived["commands"]:
-    #     try:
-    #         status, resp_text, trace_id = _post_to_ingress(body_raw)
-    #     except Exception as exc:  # noqa: BLE001 - a network hiccup must not crash the handler
-    #         status, resp_text, trace_id = 0, str(exc), ""
-    #     ok_one = status == 200
-    #     all_ok = all_ok and ok_one
-    #     http_statuses.append(status)
-    #     trace_ids.append(trace_id)
-    #     results.append({"http_status": status, "trace_id": trace_id, "response": resp_text[:300]})
-    #
-    # # Gate 6: audit, always, redacted.
-    # redacted_commands = preview["commands"]
-    # note = ("warnings: " + "; ".join(preview["warnings"])) if preview.get("warnings") else None
-    # ts.record_resubmit(
-    #     signal_id=signal_id_int,
-    #     source=source,
-    #     commands=redacted_commands,
-    #     http_statuses=http_statuses,
-    #     trace_ids=trace_ids,
-    #     ok=all_ok,
-    #     note=note,
-    # )
-    # log_txn(
-    #     RESUBMIT_TXN_LOG,
-    #     signal_id=signal_id_int,
-    #     source=source,
-    #     channel=preview.get("channel"),
-    #     commands=redacted_commands,
-    #     http_statuses=http_statuses,
-    #     trace_ids=trace_ids,
-    #     ok=all_ok,
-    #     warnings=preview.get("warnings"),
-    # )
-    # return 200, {"ok": all_ok, "results": results, "warnings": preview.get("warnings", [])}
-
-
 # --- "Send a sample TradingView signal" -----------------------------------
 #
 # Builds a raw ExecRelay webhook body in exactly the wire format
 # pine/EMA915_Pullback_Webhook.pine sends (license,COMMAND,symbol,key=value...)
-# and POSTs it straight to ingress via _post_to_ingress -- the same function
-# resubmit_signal() uses -- so "Preview" / "Send" here exercises the real
-# TradingView -> ingress -> bridge -> ea_shim path, not a simulation of it.
+# and POSTs it straight to ingress via _post_to_ingress -- so "Preview" /
+# "Send" here exercises the real TradingView -> ingress -> bridge -> ea_shim
+# path, not a simulation of it.
 
 _WEBHOOK_TEST_COMMANDS = {"BUY", "SELL", "CLOSELONG", "CLOSESHORT"}
 _WEBHOOK_TEST_OPENS = {"BUY", "SELL"}
@@ -2249,7 +1531,7 @@ def build_test_signal_command(fields: dict) -> tuple[str | None, str | None]:
     if not symbol:
         return None, "symbol is required"
 
-    parts = [_ingest.LICENSE_ID, command, symbol]
+    parts = [LICENSE_ID, command, symbol]
 
     if command in _WEBHOOK_TEST_OPENS:
         vol_lots = str(fields.get("vol_lots") or "").strip()
@@ -2279,29 +1561,28 @@ def build_test_signal_command(fields: dict) -> tuple[str | None, str | None]:
     comment = str(fields.get("comment") or "webhook-test").strip()
     if comment:
         parts.append(f"comment={comment}")
-    if _ingest.SECRET:
-        parts.append(f"secret={_ingest.SECRET}")
+    if WEBHOOK_SECRET:
+        parts.append(f"secret={WEBHOOK_SECRET}")
 
     return ",".join(parts), None
 
 
 def send_test_signal(payload: dict) -> tuple[int, dict]:
-    """Operator-triggered TradingView webhook test. Mirrors resubmit_signal()'s
-    safety gates: explicit confirm:true required to actually send, dry-run
-    always refuses. Returns a preview-shaped body ({ok, commands, warnings,
-    errors}) matching derive_preview()'s shape so the dashboard's existing
-    resubmit-confirm modal can render either one unchanged."""
+    """Operator-triggered TradingView webhook test. Safety gates: explicit
+    confirm:true required to actually send, dry-run always refuses. Returns
+    a preview-shaped body ({ok, commands, warnings, errors}) that the
+    dashboard's resubmit-confirm modal renders."""
     warnings: list[str] = []
     if effective_dry_run():
         warnings.append("system is in DRY-RUN")
-    if not _ingest.LICENSE_ID:
-        warnings.append("TELEGRAM_INGEST_LICENSE_ID is not set — ingress will reject with license_rejected")
+    if not LICENSE_ID:
+        warnings.append("DASHBOARD_LICENSE_ID is not set — ingress will reject with license_rejected")
 
     command, err = build_test_signal_command(payload)
     if err:
         return 400, {"ok": False, "commands": [], "warnings": warnings, "errors": [err]}
 
-    redacted = _ingest._redact_secret(command)
+    redacted = _redact(command)
     preview = {"ok": True, "commands": [redacted], "warnings": warnings, "errors": []}
 
     if payload.get("confirm") is not True:
@@ -2332,110 +1613,6 @@ def send_test_signal(payload: dict) -> tuple[int, dict]:
         "results": [{"http_status": status, "trace_id": trace_id, "response": resp_text[:300]}],
         "warnings": warnings,
     }
-
-
-# --- background thread: daily/weekly digest + loss/drawdown alerts ------
-
-
-def _check_digest(now: datetime | None = None) -> None:
-    if not MGMT_DIGEST_TIME:
-        return
-    try:
-        hh, mm = (int(x) for x in MGMT_DIGEST_TIME.split(":", 1))
-    except ValueError:
-        return
-    now = now or datetime.now(timezone.utc)
-    if now.hour != hh or now.minute != mm:
-        return
-    today_key = now.date().isoformat()
-    if _meta_get("mgmt_digest_last_sent") == today_key:
-        return
-    is_weekly = now.strftime("%a") == MGMT_DIGEST_WEEKLY_DAY
-    text = build_digest_text(7 if is_weekly else 1, is_weekly)
-    if MGMT_CHAT_ID:
-        _send_telegram(MGMT_CHAT_ID, text)
-    _meta_set("mgmt_digest_last_sent", today_key)
-
-
-def _cooldown_ok(key: str) -> bool:
-    last = _meta_get(key)
-    if not last:
-        return True
-    try:
-        return (time.time() - float(last)) >= _ALERT_COOLDOWN_SEC
-    except ValueError:
-        return True
-
-
-def _maybe_alert(kind: str, text: str) -> None:
-    key = f"mgmt_alert_last_{kind}"
-    if not _cooldown_ok(key):
-        return
-    if MGMT_CHAT_ID:
-        _send_telegram(MGMT_CHAT_ID, text)
-    _meta_set(key, str(time.time()))
-
-
-def _check_alerts() -> None:
-    if not _ensure_mt5():
-        return
-    acct = mt5.account_info()
-    if acct is None:
-        _mt5_reset()
-        return
-    equity_now = acct.equity
-    now = datetime.now(timezone.utc)
-
-    if MGMT_ALERT_DAILY_LOSS_USD > 0:
-        today_start = now.strftime("%Y-%m-%dT00:00:00")
-        snaps = ts.query(
-            "SELECT equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC LIMIT 1", (today_start,)
-        )
-        if snaps:
-            baseline = snaps[0]["equity"]
-        else:
-            closed_today = ts.query("SELECT profit FROM closed_trades WHERE close_ts >= ?", (today_start,))
-            today_net = sum(c.get("profit") or 0 for c in closed_today)
-            baseline = acct.balance - today_net
-        loss = baseline - equity_now
-        if loss > MGMT_ALERT_DAILY_LOSS_USD:
-            _maybe_alert(
-                "daily_loss",
-                f"DAILY LOSS ALERT: equity {equity_now:.2f} vs today's baseline {baseline:.2f} "
-                f"= loss {loss:.2f} USD, exceeds cap {MGMT_ALERT_DAILY_LOSS_USD:.2f} USD. "
-                f"(formula: baseline - equity_now; baseline = first equity snapshot today, "
-                f"else balance - today's closed net)",
-            )
-
-    if MGMT_ALERT_DRAWDOWN_PCT > 0:
-        cutoff = _cutoff_iso(90)
-        snaps = ts.query("SELECT equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC", (cutoff,))
-        peak = max((s["equity"] for s in snaps), default=equity_now)
-        if equity_now > peak:
-            peak = equity_now
-        if peak:
-            dd_pct = (peak - equity_now) / peak * 100
-            if dd_pct > MGMT_ALERT_DRAWDOWN_PCT:
-                _maybe_alert(
-                    "drawdown",
-                    f"DRAWDOWN ALERT: equity {equity_now:.2f} vs 90-day peak {peak:.2f} "
-                    f"= drawdown {dd_pct:.2f}%, exceeds cap {MGMT_ALERT_DRAWDOWN_PCT:.2f}%. "
-                    f"(formula: (peak - equity_now) / peak * 100; peak from 90-day "
-                    f"equity_snapshots, else current equity)",
-                )
-
-
-def _mgmt_thread_loop() -> None:
-    while True:
-        try:
-            _check_digest()
-        except Exception as exc:  # noqa: BLE001 - must never take the thread down
-            print(f"[mgmt-thread] digest check failed: {exc!r}", file=sys.stderr)
-        try:
-            _check_alerts()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[mgmt-thread] alert check failed: {exc!r}", file=sys.stderr)
-        time.sleep(_MGMT_LOOP_SEC)
 
 
 # --- weekly XLSX export --------------------------------------------------
@@ -2795,8 +1972,7 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .page-tabs button:hover { color: var(--color-text); }
 .page-tabs button.active { color: var(--color-accent, var(--color-text)); border-bottom-color: currentColor; }
 /* Page switching is CSS-only so it never fights the inline display rules the
-   overview's own refreshes set (e.g. hiding Telegram-specific sections for a
-   TradingView source) -- switching back reveals exactly what they left. */
+   overview's own refreshes set -- switching back reveals exactly what they left. */
 main[data-page="overview"] > .ledger-page { display: none !important; }
 main[data-page="ignored"]  > *:not(#page-ignored)  { display: none !important; }
 main[data-page="actioned"] > *:not(#page-actioned) { display: none !important; }
@@ -2855,7 +2031,6 @@ button.actbtn:hover { background: var(--color-primary-glow); }
     <span class="ctrl-label">Source</span>
     <select id="source-filter" class="seg-select">
       <option value="">All sources</option>
-      <option value="telegram">Telegram</option>
       <option value="tradingview">TradingView</option>
       <option value="other">Other EAs</option>
     </select>
@@ -2887,57 +2062,6 @@ button.actbtn:hover { background: var(--color-primary-glow); }
 </nav>
 <main data-page="overview">
   <div class="cards" id="cards"></div>
-
-  <!-- Telegram integration disabled (2026-08-14): "Signal channels" manages
-       which Telegram chats the (now separated) bot watches, and "Signals not
-       placed" + "Submit a signal manually" are backed by the telegram-only
-       `signals` table / telegram-grammar resubmit path (see
-       channels_snapshot()/unposted_signals()/resubmit_signal() in the Python
-       above, all stubbed). Both sections are commented out rather than left
-       rendering permanently-empty tables. Uncomment to re-enable.
-  <section id="section-channels">
-  <h2>Signal channels <span class="chip" id="chip-channels"></span></h2>
-  <div id="unregistered-warnings" class="review-strip"></div>
-  <form class="addchannel-form" id="add-channel-form">
-    <div>
-      <label>From known dialogs</label>
-      <span style="display:flex;gap:.4rem;align-items:center">
-        <select id="ch-dialog-select"><option value="">— pick a dialog —</option></select>
-        <button class="btn-ghost" type="button" id="ch-dialogs-refresh" style="padding:.35rem .7rem;font-size:.72rem;white-space:nowrap"
-                title="Re-read your Telegram account for channels you have just joined">Refresh</button>
-      </span>
-    </div>
-    <div>
-      <label>Or free text (id / @username / title fragment)</label>
-      <input type="text" id="ch-spec-input" placeholder="e.g. -1001234567890, @channel, or a title fragment">
-    </div>
-    <div>
-      <label>Note (optional)</label>
-      <input type="text" id="ch-note-input" placeholder="optional">
-    </div>
-    <button class="btn-primary" type="submit">Add channel</button>
-    <span class="hint" id="ch-dialogs-hint"></span>
-  </form>
-  <div class="tablewrap"><table id="tbl-channels"></table></div>
-  </section>
-
-  <section id="section-unposted">
-    <h2>Signals not placed <span class="chip" id="chip-unposted"></span></h2>
-    <div id="unposted-empty" class="empty-state" style="display:none"></div>
-    <div class="tablewrap" id="wrap-unposted"><table id="tbl-unposted"></table></div>
-    <div class="manual-signal-box">
-      <h3>Submit a signal manually</h3>
-      <p class="muted" style="font-size:0.76rem;margin:0 0 .5rem">
-        Paste the raw channel text (including a leading "[SRC:&lt;channel&gt;]" header, if the message had one)
-        for a signal the relay missed entirely. Preview it before sending — nothing is placed until you confirm.
-      </p>
-      <textarea id="manual-signal-text" placeholder="[SRC:Example Channel]&#10;XAUUSD SELL @ 4099&#10;SL @ 4119&#10;TP @ 4089"></textarea>
-      <div class="modal-actions" style="justify-content:flex-start;margin-top:.6rem">
-        <button class="btn-primary" type="button" id="manual-preview-btn">Preview</button>
-      </div>
-    </div>
-  </section>
-  -->
 
   <section id="section-webhook-test">
     <h2>Send a sample TradingView signal</h2>
@@ -3044,15 +2168,6 @@ button.actbtn:hover { background: var(--color-primary-glow); }
     </section>
   </div>
 
-  <!-- Telegram integration disabled (2026-08-14): raw telegram-ingest
-       message ledger, backed by the now-stubbed _signal_stats(). Uncomment
-       to re-enable.
-  <section id="section-signals">
-    <h2>Telegram signals <span class="chip" id="chip-tg"></span></h2>
-    <div class="tablewrap"><table id="tbl-signals"></table></div>
-  </section>
-  -->
-
   <h2>Closed trades &amp; journal <span class="chip" id="chip-journal"></span>
     <span class="exports">
       <a id="export-trades" href="/api/export/trades.csv">Export trades CSV</a><a id="export-journal" href="/api/export/journal.csv">Export journal CSV</a><a id="export-weekly-xlsx" href="/api/export/weekly.xlsx">Export weekly XLSX</a>
@@ -3098,25 +2213,10 @@ button.actbtn:hover { background: var(--color-primary-glow); }
   </div>
 </div></div>
 
-<!-- Telegram integration disabled (2026-08-14): channel-delete confirmation
-     modal, part of the "Signal channels" feature commented out above.
-<div id="ch-delete-scrim" style="position:fixed;inset:0;background:rgb(0 0 0 / 0.55);display:none;align-items:center;justify-content:center;z-index:50">
-  <div style="width:min(440px,92vw);background:linear-gradient(180deg,var(--color-surface-2),var(--color-surface));border:1px solid var(--color-border-light);border-radius:var(--radius-lg);padding:1.5rem">
-    <h3 style="margin:0 0 .75rem;font-size:0.95rem">Remove channel from registry?</h3>
-    <p class="muted" style="font-size:0.82rem;margin:0 0 .5rem">This only removes the channel from the registry — it does <b>not</b> delete any recorded signal or order history, and it can be re-added later.</p>
-    <p style="font-size:0.85rem;font-weight:600" id="ch-delete-name"></p>
-    <div class="modal-actions">
-      <button class="btn-ghost" type="button" id="ch-delete-cancel">Cancel</button>
-      <button class="btn-danger" type="button" id="ch-delete-confirm">Remove</button>
-    </div>
-  </div>
-</div>
--->
-
 <div id="dryrun-scrim" style="position:fixed;inset:0;background:rgb(0 0 0 / 0.55);display:none;align-items:center;justify-content:center;z-index:70">
   <div style="width:min(460px,92vw);background:linear-gradient(180deg,var(--color-surface-2),var(--color-surface));border:1px solid var(--color-border-light);border-radius:var(--radius-lg);padding:1.5rem">
     <h3 style="margin:0 0 .75rem;font-size:0.95rem">Turn dry-run OFF?</h3>
-    <p class="muted" style="font-size:0.82rem;margin:0 0 .5rem">Every signal from the next message onward will place <b>real orders</b> on the connected account. The change reaches telegram-ingest within about 15 seconds — no restart needed.</p>
+    <p class="muted" style="font-size:0.82rem;margin:0 0 .5rem">The next "Send a sample TradingView signal" you send from this dashboard will place a <b>real order</b> on the connected account. The change applies immediately — no restart needed.</p>
     <p style="font-size:0.85rem;font-weight:600" id="dryrun-acct"></p>
     <div class="modal-actions">
       <button class="btn-ghost" type="button" id="dryrun-cancel">Cancel</button>
@@ -3144,12 +2244,11 @@ const $ = id => document.getElementById(id);
 const money = (v, c) => (v >= 0 ? "+" : "\u2212") + "$" + Math.abs(v).toFixed(2);
 const cls = v => v >= 0 ? "pos" : "neg";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
-const srcBadge = s => s === "telegram" ? '<span class="badge tg">Telegram</span>'
-  : s === "tradingview" ? '<span class="badge tv">TradingView</span>'
+const srcBadge = s => s === "tradingview" ? '<span class="badge tv">TradingView</span>'
   : '<span class="badge neutral">Other EA</span>';
 const sideBadge = s => s === "close" ? '<span class="badge neutral">CLOSE</span>'
   : `<span class="badge ${s}">${s.toUpperCase()}</span>`;
-const sourceLabel = s => s === "telegram" ? "Telegram" : s === "tradingview" ? "TradingView" : s === "other" ? "Other EAs" : "All sources";
+const sourceLabel = s => s === "tradingview" ? "TradingView" : s === "other" ? "Other EAs" : "All sources";
 let lastSummary = null, ratingVal = 0, currentDays = 7, currentSource = "";
 
 // --- global filter state: persisted to localStorage + the URL hash so a
@@ -3157,7 +2256,7 @@ let lastSummary = null, ratingVal = 0, currentDays = 7, currentSource = "";
 const STATE_DAYS_KEY = "execrelay-dashboard-days";
 const STATE_SOURCE_KEY = "execrelay-dashboard-source";
 const VALID_DAYS = [7, 30, 90];
-const VALID_SOURCES = ["", "telegram", "tradingview", "other"];
+const VALID_SOURCES = ["", "tradingview", "other"];
 
 function loadState() {
   let days = null, source = null;
@@ -3212,7 +2311,7 @@ function table(id, header, rows, footer) {
 }
 
 async function refresh() {
-  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshChannels(), refreshUnposted(), refreshLedger()]);
+  await Promise.all([refreshSummary(), refreshScorecard(), refreshCalendar(), refreshPipeline(), refreshLedger()]);
 }
 
 // --- ledger pages: "Ignored messages" / "Actioned in MT5" ----------------
@@ -3234,7 +2333,7 @@ function showPage(name) {
 function ledgerTime(ts) { return esc((ts || "").slice(0, 19).replace("T", " ")) || "—"; }
 
 function sourceBadge(s) {
-  const label = s === "tradingview" ? "TradingView" : (s === "telegram" ? "Telegram" : "Other");
+  const label = s === "tradingview" ? "TradingView" : "Other";
   return `<span class="badge neutral">${esc(label)}</span>`;
 }
 
@@ -3338,7 +2437,7 @@ function renderDryRun(c) {
   $("dryrun-toggle").checked = on;
   $("dryrun-state").textContent = on ? "ON — nothing reaches the broker" : "OFF — LIVE";
   wrap.title = c.source === "env"
-    ? "Following TELEGRAM_INGEST_DRY_RUN — no operator override set yet"
+    ? "Following DASHBOARD_DRY_RUN_DEFAULT — no operator override set yet"
     : "Operator override" + (c.updated_ts ? ", set " + c.updated_ts.slice(0, 19).replace("T", " ") : "");
 }
 
@@ -3378,129 +2477,7 @@ $("dryrun-confirm").addEventListener("click", () => {
   postDryRun(false, true);
 });
 
-// --- channel manager -----------------------------------------------------
-
-function channelStatusBadge(c) {
-  if (!c.pending_resolution) return "";
-  return c.note
-    ? ` <span class="badge bad" title="${esc(c.note)}">could not resolve</span>`
-    : ` <span class="badge neutral">resolving…</span>`;
-}
-
-function channelToggleCell(c, field, checked) {
-  return `<td><label class="toggle-switch"><input type="checkbox" class="ch-toggle" data-chat-id="${esc(c.chat_id)}" data-field="${field}" ${checked ? "checked" : ""}><span class="toggle-slider"></span></label></td>`;
-}
-
-function channelRow(c) {
-  const label = esc(c.title || c.spec || c.chat_id);
-  const isDirect = c.chat_id === "direct";
-  return `<tr>
-    <td>${label}${channelStatusBadge(c)}</td>
-    <td class="muted number">${esc(c.chat_id)}</td>
-    ${channelToggleCell(c, "enabled", c.enabled)}
-    ${channelToggleCell(c, "partial_book", c.partial_book)}
-    ${channelToggleCell(c, "breakeven", c.breakeven)}
-    <td class="number">${c.signals_30d || 0}</td>
-    <td class="muted number">${esc((c.last_signal || "").slice(0, 19).replace("T", " ")) || "—"}</td>
-    <td class="muted" style="white-space:normal;max-width:220px">${!c.pending_resolution ? esc(c.note || "") : ""}</td>
-    <td>${isDirect ? "" : `<button type="button" class="btn-ghost ch-delete" style="padding:.2rem .6rem;font-size:.72rem" data-chat-id="${esc(c.chat_id)}" data-title="${label}">Remove</button>`}</td>
-  </tr>`;
-}
-
-async function refreshChannels() {
-  // Telegram integration disabled (2026-08-14): "Signal channels" managed
-  // which Telegram chats the (now separated) bot watches, and its HTML
-  // section is commented out above -- this is now a no-op so the Promise.all
-  // in refresh() (and the ch-toggle/ch-delete/add-channel-form handlers
-  // further down) still have something safe to call. Uncomment the body
-  // below (and the HTML section) to re-enable.
-  return;
-  // $("section-channels").style.display = (currentSource === "tradingview" || currentSource === "other") ? "none" : "";
-  //
-  // const res = await fetch(withToken("/api/channels"), { headers: authHeaders() });
-  // if (!res.ok) return;
-  // const d = await res.json();
-  // const channels = d.channels || [];
-  // $("chip-channels").textContent = `${channels.filter(c => c.enabled).length}/${channels.length} enabled`;
-  // table("tbl-channels", ["Channel", "Chat ID", "Enabled", "50% book", "Breakeven", "Signals (30d)", "Last signal", "Note", ""], channels.map(channelRow));
-  //
-  // const dialogs = d.dialogs || [];
-  // const sel = $("ch-dialog-select");
-  // const prevVal = sel.value;
-  // sel.innerHTML = '<option value="">— pick a dialog —</option>' +
-  //   dialogs.map(dl => `<option value="${esc(dl.chat_id)}" data-title="${esc(dl.title)}">${esc(dl.title)} — ${esc(dl.chat_id)} (${esc(dl.kind)})</option>`).join("");
-  // if (prevVal) sel.value = prevVal;
-  // $("ch-dialogs-hint").textContent = dialogs.length ? "" : "no dialogs cached yet (forwarder hasn't refreshed) — use free text";
-  //
-  // const unreg = d.unregistered || [];
-  // $("unregistered-warnings").innerHTML = unreg.length ? unreg.map(u =>
-  //   `<div class="review-chip unregistered-row">Unregistered channel "${esc(u.channel)}" produced ${u.signals_30d} signal(s) in 30d — currently fail-open (enabled by default). Last signal ${esc((u.last_signal || "").slice(0, 19).replace("T", " "))}
-  //    <button type="button" class="ch-add-unregistered" data-spec="${esc(u.channel)}">Add to registry</button></div>`
-  // ).join("") : "";
-}
-
-// --- "Signals not placed" + preview/resubmit -----------------------------
-
-let lastUnposted = null;
-
-function unpostedRow(r) {
-  const rs = r.resubmit;
-  let action;
-  if (rs) {
-    action = `<span class="badge ${rs.ok ? "ok" : "bad"}">${rs.ok ? "resubmitted" : "resubmit failed"}</span> <span class="muted">${esc((rs.ts || "").slice(5, 19).replace("T", " "))}</span>`;
-  } else {
-    action = `<button type="button" class="actbtn preview-btn" data-signal-id="${r.signal_id}">Preview</button>` +
-              `<button type="button" class="actbtn resubmit-btn" data-signal-id="${r.signal_id}">Resubmit</button>`;
-  }
-  return `<tr>
-    <td class="muted number">${esc((r.ts || "").slice(5, 19).replace("T", " "))}</td>
-    <td>${esc(r.channel)}</td>
-    <td>${esc(r.symbol || "")}</td>
-    <td>${r.side ? sideBadge(r.side) : ""}</td>
-    <td class="number">${r.entry ?? ""}</td>
-    <td class="number">${r.sl ?? ""}</td>
-    <td class="number">${r.tp ?? ""}</td>
-    <td><span class="badge bad">${esc(r.reason)}</span></td>
-    <td class="muted" style="white-space:normal;max-width:280px">${esc(r.detail || "")}</td>
-    <td style="white-space:nowrap">${action}</td>
-  </tr>`;
-}
-
-async function refreshUnposted() {
-  // Telegram integration disabled (2026-08-14): "Signals not placed" is
-  // backed by the telegram-only `signals` table (see unposted_signals() in
-  // the Python above) and its HTML section is commented out -- this is now
-  // a no-op so confirmResubmit()'s call to it (shared with the webhook-test
-  // tool) still has something safe to call. Uncomment the body below (and
-  // the HTML section) to re-enable.
-  return;
-  // const res = await fetch(withToken("/api/unposted?days=" + currentDays), { headers: authHeaders() });
-  // if (!res.ok) return;
-  // const d = await res.json();
-  // lastUnposted = d;
-  // // Every row here is inherently Telegram-sourced (the signals table only
-  // // ever holds Telegram signals) -- the section itself stays visible for
-  // // every source (TradingView signals can fail too, just not tracked here
-  // // yet), but its rows are filtered to the active source, same principle as
-  // // #section-signals/#section-channels.
-  // const rows = (currentSource && currentSource !== "telegram") ? [] : (d.rows || []);
-  // $("chip-unposted").textContent = `${rows.length} pending`;
-  // if (rows.length) {
-  //   $("wrap-unposted").style.display = "";
-  //   $("unposted-empty").style.display = "none";
-  //   table("tbl-unposted",
-  //     ["time (UTC)", "channel", "symbol", "side", "entry", "SL", "TP", "reason", "detail", "action"],
-  //     rows.map(unpostedRow));
-  // } else {
-  //   $("wrap-unposted").style.display = "none";
-  //   $("unposted-empty").style.display = "block";
-  //   $("unposted-empty").textContent = (currentSource && currentSource !== "telegram")
-  //     ? "No Telegram-sourced signals to show for this source filter."
-  //     : "Nothing pending — every signal in this window reached MT5.";
-  // }
-}
-
-let pendingResubmit = null; // { kind: "signal"|"webhook-test", signal_id, text, fields }
+let pendingResubmit = null; // fields for the webhook-test send, or null
 
 function renderResubmitModal(d) {
   const n = (d.commands || []).length;
@@ -3514,19 +2491,6 @@ function renderResubmitModal(d) {
   btn.disabled = !d.ok;
   btn.textContent = d.ok ? `Place these ${n} order${n === 1 ? "" : "s"}` : "Place orders";
   $("resubmit-scrim").style.display = "flex";
-}
-
-async function openPreview(signalId, text) {
-  pendingResubmit = { kind: "signal", signal_id: signalId ?? null, text: text ?? null };
-  const body = signalId != null ? { signal_id: signalId } : { text };
-  try {
-    const res = await fetch(withToken("/api/signals/preview"), {
-      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body),
-    });
-    renderResubmitModal(await res.json());
-  } catch (e) {
-    renderResubmitModal({ ok: false, commands: [], warnings: [], errors: ["preview request failed: " + e] });
-  }
 }
 
 function gatherWebhookTestFields() {
@@ -3545,7 +2509,7 @@ function gatherWebhookTestFields() {
 
 async function openWebhookTestPreview() {
   const fields = gatherWebhookTestFields();
-  pendingResubmit = { kind: "webhook-test", fields };
+  pendingResubmit = fields;
   try {
     const res = await fetch(withToken("/api/webhook-test/send"), {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(fields),
@@ -3558,15 +2522,11 @@ async function openWebhookTestPreview() {
 
 async function confirmResubmit() {
   if (!pendingResubmit) return;
-  const isWebhookTest = pendingResubmit.kind === "webhook-test";
-  const url = isWebhookTest ? "/api/webhook-test/send" : "/api/signals/resubmit";
-  const body = isWebhookTest
-    ? Object.assign({ confirm: true }, pendingResubmit.fields)
-    : Object.assign({ confirm: true }, pendingResubmit.signal_id != null ? { signal_id: pendingResubmit.signal_id } : { text: pendingResubmit.text });
+  const body = Object.assign({ confirm: true }, pendingResubmit);
   const btn = $("resubmit-confirm");
   btn.disabled = true;
   try {
-    const res = await fetch(withToken(url), {
+    const res = await fetch(withToken("/api/webhook-test/send"), {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body),
     });
     const d = await res.json();
@@ -3574,7 +2534,6 @@ async function confirmResubmit() {
       $("resubmit-results").innerHTML = (d.results || []).map(r =>
         `<div>${r.http_status === 200 ? '<span class="badge ok">sent</span>' : '<span class="badge bad">failed</span>'} trace ${esc(r.trace_id || "-")} (HTTP ${r.http_status})</div>`
       ).join("") || `<div class="${d.ok ? "pos" : "neg"}">${d.ok ? "sent" : "not sent"}</div>`;
-      if (!isWebhookTest) await refreshUnposted();
     } else {
       $("resubmit-results").innerHTML = `<div class="neg">${esc(d.error || ("HTTP " + res.status))}</div>`;
       btn.disabled = false;
@@ -3586,19 +2545,6 @@ async function confirmResubmit() {
 }
 
 document.addEventListener("click", (e) => {
-  // Telegram integration disabled (2026-08-14): "Signals not placed"
-  // preview/resubmit buttons and the manual-signal-text box, both part of
-  // sections commented out above.
-  // const pbtn = e.target.closest(".preview-btn");
-  // if (pbtn) { openPreview(parseInt(pbtn.dataset.signalId, 10), null); return; }
-  // const rbtn = e.target.closest(".resubmit-btn");
-  // if (rbtn) { openPreview(parseInt(rbtn.dataset.signalId, 10), null); return; }
-  // const manualBtn = e.target.closest("#manual-preview-btn");
-  // if (manualBtn) {
-  //   const t = $("manual-signal-text").value;
-  //   if (t.trim()) openPreview(null, t);
-  //   return;
-  // }
   const webhookTestBtn = e.target.closest("#webhook-test-preview-btn");
   if (webhookTestBtn) { openWebhookTestPreview(); return; }
   const rcancel = e.target.closest("#resubmit-cancel");
@@ -3607,139 +2553,12 @@ document.addEventListener("click", (e) => {
 $("resubmit-confirm").addEventListener("click", confirmResubmit);
 $("resubmit-scrim").addEventListener("click", e => { if (e.target.id === "resubmit-scrim") { $("resubmit-scrim").style.display = "none"; pendingResubmit = null; } });
 
-// Telegram integration disabled (2026-08-14): the .ch-toggle change handler
-// (channel enabled/50%-book/breakeven switches), part of "Signal channels".
-// document.addEventListener("change", async (e) => {
-//   if (!e.target.classList.contains("ch-toggle")) return;
-//   const chatId = e.target.dataset.chatId, field = e.target.dataset.field || "enabled", value = e.target.checked;
-//   e.target.disabled = true;
-//   try {
-//     await fetch(withToken("/api/channels/toggle"), {
-//       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
-//       body: JSON.stringify({ chat_id: chatId, field, value }),
-//     });
-//   } finally {
-//     await refreshChannels();
-//     refreshPipeline();
-//   }
-// });
-
-// Telegram integration disabled (2026-08-14): dialog-picker refresh,
-// channel-delete confirmation, and add-channel-form handlers -- all part of
-// the "Signal channels" feature commented out above (HTML section and
-// backend). None of these elements exist in the DOM anymore, so registering
-// listeners on them here would throw immediately at page load; the whole
-// block is commented out rather than left to crash the script. Uncomment
-// together with the HTML sections and channels_snapshot()/add_channel()/
-// request_dialog_refresh() in the Python above to re-enable.
-//
-// // --- "Refresh" for the dialog picker -------------------------------------
-// // Newly joined channels only reach the picker via the forwarder (it holds the
-// // Telegram session). So: raise the flag, then watch the cache until it moves.
-// // Polled rather than pushed because there is no channel back to the browser --
-// // and a bounded wait that reports honestly beats a spinner that never ends.
-//
-// const DIALOG_REFRESH_TIMEOUT_MS = 25000;
-// const DIALOG_POLL_MS = 1500;
-//
-// $("ch-dialogs-refresh").addEventListener("click", async (e) => {
-//   const btn = e.target, hint = $("ch-dialogs-hint");
-//   btn.disabled = true;
-//   const restore = () => { btn.disabled = false; btn.textContent = "Refresh"; };
-//   btn.textContent = "Refreshing…";
-//   try {
-//     const res = await fetch(withToken("/api/dialogs/refresh"), {
-//       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: "{}",
-//     });
-//     if (!res.ok) { hint.textContent = "refresh request failed (HTTP " + res.status + ")"; restore(); return; }
-//     const before = await res.json();
-//     if (!before.forwarder_alive) {
-//       // The flag is set and will be picked up whenever the forwarder returns,
-//       // but saying "done" here would be a lie.
-//       hint.textContent = "forwarder is down — it reads your Telegram account, so the picker cannot update until it is back";
-//       restore();
-//       return;
-//     }
-//     hint.textContent = "asking the forwarder…";
-//     const deadline = Date.now() + DIALOG_REFRESH_TIMEOUT_MS;
-//     while (Date.now() < deadline) {
-//       await new Promise(r => setTimeout(r, DIALOG_POLL_MS));
-//       const c = await fetch(withToken("/api/channels"), { headers: authHeaders() });
-//       if (!c.ok) continue;
-//       const d = await c.json();
-//       const dialogs = d.dialogs || [];
-//       const stamp = dialogs.reduce((m, x) => (x.refreshed_ts || "") > m ? (x.refreshed_ts || "") : m, "");
-//       if (stamp && stamp !== (before.refreshed_ts || "")) {
-//         await refreshChannels();
-//         const added = dialogs.length - before.count;
-//         hint.textContent = `picker updated — ${dialogs.length} dialog(s)` +
-//           (added > 0 ? `, ${added} new` : (added < 0 ? `, ${-added} gone` : ", nothing new"));
-//         restore();
-//         return;
-//       }
-//     }
-//     hint.textContent = "forwarder did not respond in time — it may be reconnecting; try again shortly";
-//   } catch (err) {
-//     hint.textContent = "refresh failed: " + err;
-//   } finally {
-//     restore();
-//   }
-// });
-//
-// let pendingDeleteChatId = null;
-// document.addEventListener("click", (e) => {
-//   const delBtn = e.target.closest(".ch-delete");
-//   if (delBtn) {
-//     pendingDeleteChatId = delBtn.dataset.chatId;
-//     $("ch-delete-name").textContent = delBtn.dataset.title || delBtn.dataset.chatId;
-//     $("ch-delete-scrim").style.display = "flex";
-//     return;
-//   }
-//   const addBtn = e.target.closest(".ch-add-unregistered");
-//   if (addBtn) {
-//     $("ch-spec-input").value = addBtn.dataset.spec;
-//     $("ch-spec-input").focus();
-//   }
-// });
-// $("ch-delete-cancel").addEventListener("click", () => { $("ch-delete-scrim").style.display = "none"; pendingDeleteChatId = null; });
-// $("ch-delete-confirm").addEventListener("click", async () => {
-//   if (!pendingDeleteChatId) return;
-//   await fetch(withToken("/api/channels/delete"), {
-//     method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
-//     body: JSON.stringify({ chat_id: pendingDeleteChatId }),
-//   });
-//   $("ch-delete-scrim").style.display = "none";
-//   pendingDeleteChatId = null;
-//   await refreshChannels();
-//   refreshPipeline();
-// });
-//
-// $("add-channel-form").addEventListener("submit", async (e) => {
-//   e.preventDefault();
-//   const dlSel = $("ch-dialog-select");
-//   const dlOpt = dlSel.selectedOptions[0];
-//   const spec = (dlSel.value || $("ch-spec-input").value || "").trim();
-//   if (!spec) return;
-//   const title = dlSel.value && dlOpt ? (dlOpt.dataset.title || "") : "";
-//   const note = $("ch-note-input").value.trim();
-//   const body = { spec };
-//   if (title) body.title = title;
-//   if (note) body.note = note;
-//   await fetch(withToken("/api/channels"), {
-//     method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
-//     body: JSON.stringify(body),
-//   });
-//   dlSel.value = ""; $("ch-spec-input").value = ""; $("ch-note-input").value = "";
-//   await refreshChannels();
-//   refreshPipeline();
-// });
-
 async function refreshSummary() {
   const res = await fetch(withToken("/api/summary?days=" + currentDays + sourceQS()), { headers: authHeaders() });
   if (!res.ok) { $("meta").textContent = "refresh failed: " + res.status + " " + (await res.text()); return; }
   const s = await res.json();
   lastSummary = s;
-  const bs = s.orders.by_source, tg = bs.telegram, tv = bs.tradingview;
+  const bs = s.orders.by_source, tv = bs.tradingview;
   const c = s.mt5.available ? s.mt5.closed : {count:0,wins:0,losses:0,net:0,buys:0,sells:0,rows:[],by_source:{},daily:[],review_queue:[]};
   const winRate = c.count ? Math.round(100 * c.wins / c.count) : null;
   const timeLabel = s.mt5.available ? (s.mt5.time_label || "broker time") : "UTC";
@@ -3765,20 +2584,9 @@ async function refreshSummary() {
     card("Max drawdown", eqc.max_drawdown_pct.toFixed(2) + "%", eqc.max_drawdown_pct > 0 ? "neg" : "", `current ${eqc.current_drawdown_pct.toFixed(2)}% · account-wide`) +
     card("Risk cap status", capStatus, capStatus === "Breached" ? "neg" : (capStatus === "OK" ? "pos" : ""), comp.cap_usd ? `$${comp.cap_usd.toFixed(2)} cap` : "no cap set");
 
-  // Telegram integration disabled (2026-08-14): "Telegram signals" section
-  // (chip-tg/section-signals/tbl-signals), backed by the now-stubbed
-  // _signal_stats(). Uncomment together with the HTML section to re-enable.
-  // $("chip-tg").textContent = `${s.signals.received} total`;
-  $("chip-orders").textContent = `${tg.total + tv.total} total`;
+  $("chip-orders").textContent = `${tv.total} total`;
   $("chip-journal").textContent = `${s.journal.entries} entries`;
   $("chip-srcpl").textContent = `${currentDays}d window`;
-
-  // $("section-signals").style.display = (currentSource === "tradingview" || currentSource === "other") ? "none" : "";
-  //
-  // table("tbl-signals", ["time (UTC)","channel","outcome","detail"], s.signals.recent.map(r =>
-  //   `<tr><td class="muted number">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${esc(r.channel)}</td>
-  //    <td><span class="badge ${r.outcome==="posted"?"ok":(r.outcome==="rejected"||r.outcome==="webhook_error"?"bad":"neutral")}">${esc(r.outcome)}</span></td>
-  //    <td class="muted" style="white-space:normal;max-width:340px">${esc(r.detail)}</td></tr>`));
 
   table("tbl-orders", ["time (UTC)","source","command","symbol","size","SL","TP","status"], s.orders.recent.map(r =>
     `<tr><td class="muted number">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${srcBadge(r.source)}</td>
@@ -3798,7 +2606,6 @@ async function refreshSummary() {
 
   const bySrc = c.by_source || {};
   $("srcpl").innerHTML =
-    card("Telegram", money(bySrc.telegram || 0), cls(bySrc.telegram || 0), `net over ${currentDays}d`, currentSource === "telegram" ? "highlight" : "") +
     card("TradingView", money(bySrc.tradingview || 0), cls(bySrc.tradingview || 0), `net over ${currentDays}d`, currentSource === "tradingview" ? "highlight" : "") +
     card("Other EA / manual", money(bySrc.other || 0), cls(bySrc.other || 0), `net over ${currentDays}d`, currentSource === "other" ? "highlight" : "");
 
@@ -3869,7 +2676,7 @@ function renderRisk(risk) {
   // Equity curve + margin are account-level and always unfiltered.
   $("chip-equity").textContent = "account-wide" + (eqc.estimated ? " · estimated" : "");
   $("chip-risk").textContent = `${risk.days}d window` +
-    (currentSource ? ` · compliance filtered: ${sourceLabel(currentSource)}` : " · stack-level (telegram+tradingview)");
+    (currentSource ? ` · compliance filtered: ${sourceLabel(currentSource)}` : " · stack-level (tradingview)");
 
   $("risk-cards").innerHTML =
     card("Margin used", live.available ? "$" + live.margin.toFixed(2) : "—", "", live.available ? `free $${live.margin_free.toFixed(2)} · account-wide` : "MT5 offline") +
@@ -4297,11 +3104,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_csv(journal_csv(), "journal.csv")
         elif path == "/api/pipeline":
             self._send(200, json.dumps(pipeline_status(), default=str).encode(), "application/json")
-        elif path == "/api/channels":
-            self._send(200, json.dumps(channels_snapshot(), default=str).encode(), "application/json")
-        elif path == "/api/unposted":
-            days = _parse_days(self.path)
-            self._send(200, json.dumps(unposted_signals(days), default=str).encode(), "application/json")
         elif path == "/api/export/weekly.xlsx":
             days = _parse_days(self.path)
             source = _parse_source(self.path)
@@ -4332,9 +3134,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     _JSON_POST_ROUTES = (
-        "/api/journal", "/api/channels", "/api/channels/toggle", "/api/channels/delete",
-        "/api/signals/preview", "/api/signals/resubmit", "/api/dryrun",
-        "/api/dialogs/refresh", "/api/webhook-test/send",
+        "/api/journal", "/api/dryrun", "/api/webhook-test/send",
     )
 
     def do_POST(self) -> None:
@@ -4359,50 +3159,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/journal":
                 entry = save_journal_entry(payload)
                 self._send(200, json.dumps(entry).encode(), "application/json")
-            elif path == "/api/channels":
-                result = add_channel(payload)
-                self._send(200, json.dumps(result).encode(), "application/json")
-            elif path == "/api/channels/toggle":
-                # Telegram integration disabled (2026-08-14) -- channel
-                # enable/50%-book/breakeven toggles, no TradingView equivalent.
-                raise ValueError("Telegram integration is disabled in this project — see C:\\TelegramBot")
-                # chat_id = str(payload.get("chat_id") or "")
-                # if not chat_id:
-                #     raise ValueError("chat_id is required")
-                # # `field` defaults to "enabled" so the original {chat_id,
-                # # enabled} shape (no field) keeps working unchanged; the two
-                # # new toggles (partial_book, breakeven) pass {chat_id, field,
-                # # value} instead. `value` falls back to `enabled` for the
-                # # same reason.
-                # field = str(payload.get("field") or "enabled")
-                # if field not in _CHANNEL_TOGGLE_FIELDS:
-                #     raise ValueError(
-                #         f"field must be one of {', '.join(_CHANNEL_TOGGLE_FIELDS)}, got {field!r}"
-                #     )
-                # value = payload.get("value", payload.get("enabled"))
-                # if not isinstance(value, bool):
-                #     raise ValueError("value must be true or false")
-                # ts.set_channel_flag(chat_id, field, value)
-                # self._send(200, json.dumps({"ok": True}).encode(), "application/json")
-            elif path == "/api/channels/delete":
-                # Telegram integration disabled (2026-08-14).
-                raise ValueError("Telegram integration is disabled in this project — see C:\\TelegramBot")
-                # chat_id = str(payload.get("chat_id") or "")
-                # if not chat_id:
-                #     raise ValueError("chat_id is required")
-                # ts.delete_channel(chat_id)
-                # self._send(200, json.dumps({"ok": True}).encode(), "application/json")
-            elif path == "/api/signals/preview":
-                result = derive_preview(signal_id=payload.get("signal_id"), text=payload.get("text"))
-                self._send(200, json.dumps(result, default=str).encode(), "application/json")
-            elif path == "/api/signals/resubmit":
-                status, body = resubmit_signal(payload)
-                self._send(status, json.dumps(body, default=str).encode(), "application/json")
             elif path == "/api/dryrun":
                 status, body = set_dry_run_mode(payload)
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
-            elif path == "/api/dialogs/refresh":
-                self._send(200, json.dumps(request_dialog_refresh(), default=str).encode(), "application/json")
             elif path == "/api/webhook-test/send":
                 status, body = send_test_signal(payload)
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
@@ -4437,7 +3196,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    threading.Thread(target=_mgmt_thread_loop, daemon=True, name="mgmt-digest-alerts").start()
     host, port = ADDR.rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), Handler)
     print(time.strftime("%H:%M:%S"), f"trade dashboard listening on http://{ADDR}", flush=True)
@@ -4456,12 +3214,6 @@ def _cli_digest_now() -> None:
     weekly = period_days >= 7
     text = build_digest_text(period_days, weekly)
     print(text)
-    if os.environ.get("MGMT_DIGEST_SEND") == "1":
-        if MGMT_CHAT_ID:
-            sent = _send_telegram(MGMT_CHAT_ID, text)
-            print(f"[sent={sent} chat_id={MGMT_CHAT_ID}]", file=sys.stderr)
-        else:
-            print("[not sent: no MGMT_CHAT_ID/TELEGRAM_INGEST_ALLOWED_CHAT_IDS configured]", file=sys.stderr)
 
 
 if __name__ == "__main__":

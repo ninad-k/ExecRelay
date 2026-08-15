@@ -1,9 +1,9 @@
 # Windows demo stack — `run.ps1`
 
 The Windows-native way to run the full ExecRelay signal path against a live,
-demo-logged-in MT5 terminal: Telegram channel → forwarder → ingest bot →
-ingress → NATS → bridge → EA shim → broker, plus the public TradingView
-webhook and the Rey Capital trade dashboard.
+demo-logged-in MT5 terminal: TradingView webhook → ingress → NATS → bridge →
+EA shim → broker, plus the public TradingView webhook endpoint and the Rey
+Capital trade dashboard.
 
 ```powershell
 .\run.ps1                     # start + follow logs; Ctrl+C stops the stack
@@ -28,11 +28,9 @@ lives in `scripts\local-stack.ps1`.
 |---|---|---|
 | nats | 4222 | Message bus (JetStream) |
 | ml-predictor | 8080 | Signal scoring |
-| ingress | 8081 | Webhook receiver (TradingView + telegram-ingest) |
+| ingress | 8081 | Webhook receiver (TradingView) |
 | bridge | 8082 | EA WebSocket hub |
 | ea-shim | — | Executes signals in the running MT5 terminal |
-| telegram-ingest | 8089 | Parses signal messages from the bot's chat |
-| telegram-forwarder | — | Relays the source channel into the bot's chat using your personal account |
 | trade-dashboard | 8090 | Rey Capital trade dashboard (localhost only) |
 
 Logs are date-stamped under `.local-stack\logs\`; the JSONL audit trail of
@@ -67,34 +65,15 @@ fixed dollar amount, never more:
 - `EA_SHIM_RISK_USD` (.env) — per-ORDER cap applied by the EA shim to any
   order that opens exposure (TradingView alerts included). If even the
   broker's minimum lot would risk more, the order is **rejected**.
-- `TELEGRAM_INGEST_RISK_USD` (.env) — per-SIGNAL budget for Telegram
-  signals. telegram-ingest splits it across every order the signal expands
-  into (`risk=<budget/N>` per order), so a multi-leg signal still risks the
-  budget in total, not per leg.
-- Signals without a stop loss fall back to `TELEGRAM_INGEST_FIXED_LOT`.
-
-## Telegram
-
-- **Ingest bot**: reads the chat(s) in `TELEGRAM_INGEST_ALLOWED_CHAT_IDS`,
-  parses the strict signal grammar, posts to ingress. Notifies the chat when
-  an order is accepted, and (via the shim's position monitor) when a
-  position opens and when it closes with realized P/L.
-- **Forwarder** (`scripts/telegram_user_forwarder.py`): relays a channel you
-  follow into the bot's chat using your own account. One-time login:
-  `python scripts\telegram_user_forwarder.py login` (SMS code) or `qrlogin`
-  (scan from the phone app — also works when code delivery is
-  flood-limited). Configure `TG_FORWARDER_SOURCE_CHAT` (numeric id is
-  rename-proof) and `TG_FORWARDER_TARGET_CHAT` in `.env`; the stack then
-  starts it automatically.
 
 ## Trade dashboard
 
 `http://127.0.0.1:8090` — Rey Capital-branded summary of the whole account:
-signals received/routed, orders by source (Telegram / TradingView / other
-EAs on the same account), open positions, closed trades with win/loss and
-net P/L, and a per-trade **trading journal** (setup, emotion, mistakes,
-rating, notes, reviewed) stored in `.local-stack\journal.json`. The journal
-fields mirror the ReyLens `trades` schema so entries can be migrated there.
+orders by source (TradingView / other EAs on the same account), open
+positions, closed trades with win/loss and net P/L, and a per-trade
+**trading journal** (setup, emotion, mistakes, rating, notes, reviewed)
+stored in `.local-stack\journal.json`. The journal fields mirror the
+ReyLens `trades` schema so entries can be migrated there.
 
 The dashboard binds to localhost only — it shows account balances and has no
 auth. View it in an RDP session; do not expose the port.
@@ -102,11 +81,11 @@ auth. View it in an RDP session; do not expose the port.
 ## Management reporting
 
 The dashboard is backed by a SQLite store, `.local-stack\execrelay.db` (WAL
-mode; module `scripts/_tradestore.py`) — every signal telegram-ingest
-parses, every order the EA shim places/reports, every closed position, and a
-periodic account-equity snapshot lands there, correlated by ExecRelay's
-`trace_id`. Not the production persistence path (that's `apps/persist/app.py`
-via NATS) — dev-harness tooling only, same tier as `_txnlog.py`.
+mode; module `scripts/_tradestore.py`) — every order the EA shim
+places/reports, every closed position, and a periodic account-equity
+snapshot lands there, correlated by ExecRelay's `trace_id`. Not the
+production persistence path (that's `apps/persist/app.py` via NATS) —
+dev-harness tooling only, same tier as `_txnlog.py`.
 
 ```powershell
 python scripts\_tradestore.py backfill   # idempotent import from JSONL txn logs + 90d MT5 closed-deal history
@@ -116,15 +95,13 @@ python scripts\_tradestore.py stats      # row counts per table
 ### Channel scorecard
 
 `GET /api/scorecard?days=N` and a "Channel scorecard" table on the
-dashboard: per Telegram channel (`signals.channel`, blank/`NULL` shown as
-"direct"), signals received / posted / rejected, orders executed (joined via
-`signals.trace_ids` → `orders.trace_id`), and win/loss/net P/L/avg R of the
-closed outcomes. Two synthetic reconciliation rows are always included:
-**tradingview** (orders with `source=tradingview`, which never go through
-the signals table) and **other EAs** (`closed_trades.source=other` — the
-rest of the account, e.g. other EAs or manual trades) — so the section
-totals reconcile against the whole account, not just the Telegram-signal
-slice.
+dashboard: two synthetic reconciliation rows, **tradingview** (orders with
+`source=tradingview`) and **other EAs** (`closed_trades.source=other` — the
+rest of the account, e.g. other EAs or manual trades), each with orders
+executed and win/loss/net P/L/avg R of the closed outcomes, so the section
+totals reconcile against the whole account. (The underlying query also joins
+against a legacy `signals` table from a since-removed signal-ingest path;
+that table is no longer populated, so it never contributes rows today.)
 
 The order → closed-trade join is a heuristic: `orders.broker_order_id ==
 closed_trades.position_id`, which only resolves once MT5 reports a market
@@ -160,38 +137,17 @@ Data is `closed_trades` grouped by UTC close date; the "stack only" /
 "all sources" toggle filters out `source=other` (other EAs / manual trades
 on the same account) or includes everything.
 
-### Telegram digest & loss/drawdown alerts
+### Console digest
 
-A background thread in the dashboard process (started with the server, not
-a separate service) sends a plain-text digest once a day and polls for loss/
-drawdown breaches every 60s. Env keys (`.env`, all optional):
-
-| Key | Default | Meaning |
-|---|---|---|
-| `MGMT_CHAT_ID` | first id in `TELEGRAM_INGEST_ALLOWED_CHAT_IDS` | Telegram chat the digest/alerts go to |
-| `MGMT_DIGEST_TIME` | `20:00` | UTC `HH:MM` send time; empty disables the digest |
-| `MGMT_DIGEST_WEEKLY_DAY` | `Mon` | on this weekday (`%a`) the digest covers the trailing 7 days instead of 1 |
-| `MGMT_ALERT_DAILY_LOSS_USD` | `500` | equity vs today's UTC baseline; `0` disables |
-| `MGMT_ALERT_DRAWDOWN_PCT` | `10` | equity vs 90-day peak equity; `0` disables |
-
-The digest reports: period, signals received/executed, trades closed W/L,
-net P/L (period), per-source split, floating P/L now, equity now vs period
-start, margin level, and risk-cap rejection count. Alerts state the exact
-numbers and the formula used, and are throttled to one send per 6h per alert
-type (last-sent/last-alert timestamps persist in the store's `meta` table so
-a restart doesn't double-send or re-alert immediately).
-
-Sends go through the `telegram-ingest` bot (`TELEGRAM_INGEST_BOT_TOKEN`).
-To preview or manually trigger a digest without waiting for the scheduled
-time:
+`python scripts\trade_dashboard.py --digest-now` prints a plain-text summary
+(period, trades closed W/L, net P/L, per-source split, floating P/L now,
+equity now vs period start, margin level, risk-cap rejection count) to the
+console — useful for a quick check without opening the dashboard UI:
 
 ```powershell
 python scripts\trade_dashboard.py --digest-now                    # prints today's/weekly digest text
 python scripts\trade_dashboard.py --digest-now --period-days 7    # prints a 7-day digest
 ```
-
-`--digest-now` only *prints* by default — it sends only when `MGMT_DIGEST_SEND=1`
-is set in the environment, so it's safe to run while testing.
 
 ### Weekly XLSX export
 
@@ -210,7 +166,6 @@ telling you to install it rather than erroring the whole dashboard.
 ## Broker symbol names
 
 The CFI demo server suffixes instruments with an underscore (`XAUUSD_`, not
-`XAUUSD`). `TELEGRAM_INGEST_SYMBOL_MAP` maps channel jargon to broker names,
-and the EA shim additionally tries `_`, `.`, and `m` suffix variants when a
-symbol is unknown — check `.local-stack\logs\ea-shim-*.log` if an order is
+`XAUUSD`). The EA shim tries `_`, `.`, and `m` suffix variants when a symbol
+is unknown — check `.local-stack\logs\ea-shim-*.log` if an order is
 rejected with a symbol error.

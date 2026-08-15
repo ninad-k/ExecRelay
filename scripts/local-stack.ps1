@@ -1,7 +1,7 @@
 # ExecRelay local stack -- PowerShell start/end scripts (Windows-native
 # counterpart to scripts/local-stack.sh, extended to also cover the Python
-# execution shim and telegram-ingest, i.e. the full stack used for local
-# demo-account testing against a running MT5 terminal).
+# execution shim, i.e. the full stack used for local demo-account testing
+# against a running MT5 terminal).
 #
 #   .\run.ps1 (repo root)                    # the usual entry point: start -Public
 #   scripts\local-stack.ps1 start            # build + start everything, wait healthy
@@ -16,8 +16,7 @@
 # Full guide: docs/development/windows-local-stack.md
 #
 # Services: nats (4222), ml-predictor (8080), ingress (8081), bridge (8082),
-# ea-shim (MT5 execution, no HTTP port), telegram-ingest (8089),
-# telegram-forwarder (personal-account channel relay, no HTTP port),
+# ea-shim (MT5 execution, no HTTP port),
 # trade-dashboard (8090, localhost-only trade summary UI -- now also serves
 # management reporting: channel scorecard, risk/exposure panel, monthly P/L
 # calendar, and a weekly XLSX export backed by .local-stack\execrelay.db,
@@ -69,7 +68,6 @@ $NatsPort = 4222
 $PredictorPort = 8080
 $IngressPort = 8081
 $BridgePort = 8082
-$TelegramIngestPort = 8089
 $DashboardPort = 8090
 $PublicPort = 80   # TradingView only posts webhooks to ports 80/443
 $RetentionDays = 7
@@ -285,39 +283,6 @@ function Invoke-Start {
 
     Start-Tracked -Name "ea-shim" -FilePath $python -ArgumentList @("scripts\ea_shim.py") | Out-Null
 
-    # --- Telegram integration disabled -- TradingView-only, at user's request
-    # (2026-08-14). Both blocks below fed signals into the same /webhook
-    # TradingView also posts to; uncomment both (and the closing #>) to
-    # re-enable the Telegram Bot-API ingest + personal-account forwarder.
-    <#
-    if ($env:TELEGRAM_INGEST_BOT_TOKEN -and $env:TELEGRAM_INGEST_ALLOWED_CHAT_IDS) {
-        # When the perimeter gate is on, every webhook caller (including the
-        # internal ingest module) must carry ?token=<value>.
-        $webhookUrl = "http://127.0.0.1:$IngressPort/webhook"
-        if ($env:INGRESS_PERIMETER_TOKEN) { $webhookUrl += "?token=$($env:INGRESS_PERIMETER_TOKEN)" }
-        Start-Tracked -Name "telegram-ingest" -FilePath $python -ArgumentList @("apps\telegram-ingest\app.py") -Env @{
-            HTTP_ADDR = "0.0.0.0:$TelegramIngestPort"
-            TELEGRAM_INGEST_WEBHOOK_URL = $webhookUrl
-        } | Out-Null
-        Start-Sleep -Seconds 2
-        Wait-Http -Name "telegram-ingest" -Url "http://127.0.0.1:$TelegramIngestPort/health"
-    } else {
-        Write-Warning "skipping telegram-ingest: TELEGRAM_INGEST_BOT_TOKEN / TELEGRAM_INGEST_ALLOWED_CHAT_IDS not set in .env"
-    }
-
-    # Personal-account channel relay. Needs a one-time interactive login
-    # (python scripts\telegram_user_forwarder.py login) done by the account
-    # owner beforehand; if the session isn't authorized the process exits and
-    # the error lands in telegram-forwarder-<date>.err.log.
-    if ($env:TG_FORWARDER_API_ID -and $env:TG_FORWARDER_SOURCE_CHAT -and $env:TG_FORWARDER_TARGET_CHAT) {
-        Start-Tracked -Name "telegram-forwarder" -FilePath $python `
-            -ArgumentList @("scripts\telegram_user_forwarder.py", "run") | Out-Null
-    } else {
-        Write-Warning "skipping telegram-forwarder: TG_FORWARDER_SOURCE_CHAT / TG_FORWARDER_TARGET_CHAT (or API_ID) not set in .env -- Telegram signals will only flow if posted directly to the ingest bot's chat"
-    }
-    #>
-    Write-Warning "Telegram integration is disabled (see 'Telegram integration disabled' in local-stack.ps1 Invoke-Start) -- only TradingView webhook signals are executed"
-
     # Localhost-only (shows account balances; optional bearer-token auth via
     # DASHBOARD_TOKEN in .env) -- keep it off the public interface even
     # though ingress itself is exposed.
@@ -346,14 +311,10 @@ function Invoke-Start {
         }
     }
 
-    # $botUser = if ($env:TELEGRAM_BOT_USERNAME) { $env:TELEGRAM_BOT_USERNAME } else { "TeleGoldSignalsBot" }
     $dashboardUrl = "http://127.0.0.1:$DashboardPort"
     if ($env:DASHBOARD_TOKEN) { $dashboardUrl += "?token=$($env:DASHBOARD_TOKEN)" }
     Write-Host ""
     Write-Host "  trade dashboard:  $dashboardUrl  (local only)"
-    # Telegram integration disabled (2026-08-14) -- see 'Telegram integration
-    # disabled' above. Uncomment together with that block to re-enable.
-    # Write-Host "  telegram bot:     https://t.me/$botUser  (order + open/close notifications)"
     Write-Host ""
     Write-Host "stack is up. EA connects to 127.0.0.1:$BridgePort (instance: test-instance)."
 }
@@ -383,9 +344,8 @@ function Invoke-Status {
     Test-Health -Name "ml-predictor" -Url "http://127.0.0.1:$PredictorPort/readyz"
     Test-Health -Name "ingress" -Url "http://127.0.0.1:$IngressPort/health"
     Test-Health -Name "bridge" -Url "http://127.0.0.1:$BridgePort/health"
-    Test-Health -Name "telegram-ingest" -Url "http://127.0.0.1:$TelegramIngestPort/health"
     Test-Health -Name "trade-dashboard" -Url "http://127.0.0.1:$DashboardPort/health"
-    foreach ($name in @("ea-shim", "telegram-forwarder")) {
+    foreach ($name in @("ea-shim")) {
         $pidFile = Join-Path $Pids "$name.pid"
         if (Test-Path $pidFile) {
             $procId = Get-Content $pidFile | Select-Object -First 1

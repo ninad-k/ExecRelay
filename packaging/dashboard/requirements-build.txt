@@ -1,0 +1,5 @@
+# Build-time dependencies for packaging/dashboard/build_exe.py.
+# Install with: pip install -r packaging/dashboard/requirements-build.txt
+# Windows only -- MetaTrader5 has no Linux/macOS wheel.
+pyinstaller>=6.10
+MetaTrader5

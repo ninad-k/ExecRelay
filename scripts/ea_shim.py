@@ -22,9 +22,6 @@ Environment overrides:
     EA_SHIM_MAGIC        default 20240101 (order magic; isolates shim positions)
     EA_SHIM_RISK_USD     max $ loss per order; sizes the lot from the SL
                          distance, overriding the signal's vol_lots. 0 = off.
-    EA_SHIM_NOTIFY_CHAT_ID  Telegram chat for open/close notifications
-                         (default: first TELEGRAM_INGEST_ALLOWED_CHAT_IDS entry;
-                         sent via TELEGRAM_INGEST_BOT_TOKEN, empty = disabled)
 """
 
 import asyncio
@@ -34,7 +31,6 @@ import os
 import sys
 import threading
 import time
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import MetaTrader5 as mt5
@@ -91,12 +87,6 @@ CANCEL_SIBLINGS_ON_CLOSE = (
     or "true"
 ).lower() in ("true", "1", "yes", "on")
 
-NOTIFY_TOKEN = os.environ.get("TELEGRAM_INGEST_BOT_TOKEN", "")
-_notify_chat_raw = (
-    os.environ.get("EA_SHIM_NOTIFY_CHAT_ID")
-    or os.environ.get("TELEGRAM_INGEST_ALLOWED_CHAT_IDS", "").split(",")[0]
-).strip()
-NOTIFY_CHAT = int(_notify_chat_raw) if _notify_chat_raw.lstrip("-").isdigit() else 0
 POSITION_POLL_SECS = 5
 
 
@@ -170,31 +160,6 @@ def sized_volume(symbol, ref_price, sl, requested, risk_usd):
     return min(vol, info.volume_max)
 
 
-def tg_notify(text):
-    """Telegram integration disabled (2026-08-14) -- the bot now runs as its
-    own separate project (C:\\TelegramBot). Kept as a no-op choke point
-    (rather than commenting out every call site) so the position-open/close
-    notifications stay callable without any other code changes. Uncomment
-    the body below to re-enable."""
-    return
-    # if not (NOTIFY_TOKEN and NOTIFY_CHAT):
-    #     return
-    # try:
-    #     req = urllib.request.Request(
-    #         f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
-    #         data=json.dumps({"chat_id": NOTIFY_CHAT, "text": text}).encode(),
-    #         headers={"Content-Type": "application/json"},
-    #         method="POST",
-    #     )
-    #     with urllib.request.urlopen(req, timeout=10):
-    #         pass
-    # except Exception as e:
-    #     log(f"telegram notify failed: {short_exc(e)}")
-
-
-def _fmt_position(p):
-    side = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
-    return f"{side} {p.symbol} {p.volume:g} lot @ {p.price_open:g}"
 
 
 def _closed_result(ticket):
@@ -291,12 +256,6 @@ def _cancel_siblings_after_close(ticket, position, close_reason):
                 close_reason=hit,
                 cancelled=removed,
                 comment=position.comment,
-            )
-            tg_notify(
-                f"🚫 Pending order cancelled\n"
-                f"{position.symbol} hit {hit}, so the other entry from the "
-                f"same signal was withdrawn\n"
-                f"Ticket(s) {', '.join(removed)}"
             )
         for f in failures:
             log(f"could not cancel sibling pending {f}")
@@ -406,12 +365,6 @@ def _move_siblings_to_breakeven(ticket, position, sibling_ids):
                 moved=moved,
                 comment=position.comment,
             )
-            tg_notify(
-                f"🛡️ Breakeven\n"
-                f"{position.symbol} booked 50% at TP, so the rest of this "
-                f"signal's open position(s) were moved to breakeven\n"
-                f"Ticket(s) {', '.join(moved)}"
-            )
         for f in failures:
             log(f"could not move sibling to breakeven {f}")
     except Exception as e:  # noqa: BLE001 - monitor loop must survive
@@ -469,10 +422,9 @@ def _handle_close_oco(ticket, position, close_reason):
 
 
 def position_monitor():
-    """Notify Telegram when a shim-owned position opens (market fill or a
-    pending order triggering) and when one closes (with realized P/L). Also
-    persists closed positions to the trade store and, every ~5 minutes,
-    an account equity snapshot."""
+    """Track shim-owned positions opening (market fill or a pending order
+    triggering) and closing (with realized P/L). Persists closed positions
+    to the trade store and, every ~5 minutes, an account equity snapshot."""
     known = None
     iteration = 0
     while True:
@@ -481,21 +433,9 @@ def position_monitor():
                 p.ticket: p for p in (mt5.positions_get() or []) if p.magic == MAGIC
             }
             if known is not None:
-                for ticket, p in current.items():
-                    if ticket not in known:
-                        tg_notify(
-                            f"🟢 Trade opened\n{_fmt_position(p)}\n"
-                            f"SL {p.sl:g} | TP {p.tp:g}"
-                        )
                 for ticket, p in known.items():
                     if ticket not in current:
                         profit, close_price, close_reason = _closed_result(ticket)
-                        sign = "+" if profit >= 0 else "-"
-                        tg_notify(
-                            f"{'✅' if profit >= 0 else '❌'} Trade closed\n"
-                            f"{_fmt_position(p)} -> {close_price:g}\n"
-                            f"P/L {sign}${abs(profit):.2f}"
-                        )
                         side = "buy" if p.type == mt5.POSITION_TYPE_BUY else "sell"
                         log_txn(
                             TXN_LOG,
@@ -519,7 +459,7 @@ def position_monitor():
                             profit=round(profit, 2),
                             magic=p.magic,
                             comment=p.comment,
-                            source="telegram" if str(p.comment).startswith("tg-") else "tradingview",
+                            source="tradingview",
                         )
                         if CANCEL_SIBLINGS_ON_CLOSE and close_reason in (
                             mt5.DEAL_REASON_TP,
@@ -722,9 +662,9 @@ def execute(trace_id, command, symbol, params):
     cmd = command.lower()
 
     # $-risk sizing for every order that opens exposure. A per-order `risk`
-    # param (how telegram-ingest splits its per-signal budget across legs)
-    # wins over the env-level default. The reference price is the stated
-    # entry for pendings, the current market for the rest.
+    # param (how a multi-leg signal splits its budget across legs) wins over
+    # the env-level default. The reference price is the stated entry for
+    # pendings, the current market for the rest.
     _opens = {"buy", "sell", "closelongopenshort", "closeshortopenlong"}
     if cmd in _opens or cmd in _PENDING_TYPES:
         risk_usd = fnum(params, "risk", default=RISK_USD)
@@ -904,7 +844,7 @@ async def run_session():
                     _comment = params.get("comment") or ""
                     record_order(
                         trace_id=fill["trace_id"],
-                        source="telegram" if str(_comment).startswith("tg-") else "tradingview",
+                        source="tradingview",
                         command=command,
                         symbol=symbol,
                         requested_risk=fnum(params, "risk") or None,
@@ -928,12 +868,8 @@ async def main():
     init_mt5()
     if RISK_USD > 0:
         log(f"risk sizing active: max ${RISK_USD:g} loss per order")
-    if NOTIFY_TOKEN and NOTIFY_CHAT:
-        # Telegram notifications (tg_notify) are disabled as of 2026-08-14 --
-        # this thread still starts because it also persists closed trades and
-        # runs the breakeven SL move, neither of which are Telegram-specific.
-        threading.Thread(target=position_monitor, daemon=True).start()
-        log("position monitor active (Telegram notifications disabled)")
+    threading.Thread(target=position_monitor, daemon=True).start()
+    log("position monitor active")
     while True:
         try:
             await run_session()

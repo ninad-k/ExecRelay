@@ -34,22 +34,6 @@ export interface Fill {
   filled_at: string
 }
 
-export interface TelegramStatus {
-  linked: boolean
-  linked_at: string | null
-  chat_id: string | null
-  notify_fills: boolean
-  notify_timeouts: boolean
-  failed_last_24h: number
-  last_delivery_status: string | null
-}
-
-export interface TelegramLink {
-  deep_link: string
-  link_token: string
-  expires_at: string
-}
-
 export interface TraceTimeline {
   trace_id: string
   signal: {

@@ -1,12 +1,12 @@
 """_tradestore — durable SQLite persistence for the local dev-harness trading
-path (telegram-ingest + ea_shim), so management reporting has one queryable
-store instead of scraping JSONL logs and MT5 history on every dashboard hit.
+path (ea_shim, plus writes from trade_dashboard.py itself), so management
+reporting has one queryable store instead of scraping JSONL logs and MT5
+history on every dashboard hit.
 
-DB file: .local-stack/execrelay.db (WAL mode). Every signal telegram-ingest
-parses, every order ea_shim places/reports, every closed position, and a
-periodic account-equity snapshot lands here, correlated by ExecRelay's
-`trace_id` (issued by ingress on webhook accept, carried through the bridge
-to the EA's fill report).
+DB file: .local-stack/execrelay.db (WAL mode). Every order ea_shim
+places/reports, every closed position, and a periodic account-equity
+snapshot lands here, correlated by ExecRelay's `trace_id` (issued by ingress
+on webhook accept, carried through the bridge to the EA's fill report).
 
 Not the production persistence path -- see apps/persist/app.py for that
 (ingress -> NATS -> persist, a separate service/DB). This module is dev-
@@ -14,12 +14,12 @@ harness tooling only, same tier as _txnlog.py.
 
 CONTRACT: every public helper below (record_*, query, get_conn) swallows all
 of its own exceptions, printing a one-line warning to stderr instead. A
-SQLite hiccup (locked file, disk full, corrupt DB) must never take down the
-telegram-ingest poll loop or an ea_shim fill report -- those are the actual
-trading path. Callers should never need a try/except around these calls.
+SQLite hiccup (locked file, disk full, corrupt DB) must never take down an
+ea_shim fill report -- that is the actual trading path. Callers should never
+need a try/except around these calls.
 
-Multiple OS processes (telegram-ingest, ea_shim, and this module's own CLI)
-open the database concurrently, so every write is a short-lived
+Multiple OS processes (ea_shim, trade_dashboard.py, and this module's own
+CLI) open the database concurrently, so every write is a short-lived
 connect -> PRAGMA -> statement -> commit -> close cycle (no long-held
 connections, no cross-thread connection sharing) with a 5s busy_timeout to
 absorb writer contention under WAL.
@@ -119,17 +119,15 @@ _SCHEMA_SQL = (
         floating     REAL
     )
     """,
-    # channels: the operator-facing signal-source registry (schema v2). Keyed
-    # by the resolved numeric Telegram chat id (as text), or the literal
-    # 'direct' pseudo-channel for messages posted straight to the bot with no
-    # [SRC:...] tag. A row whose chat_id is neither 'direct' nor purely
-    # numeric is "pending resolution" -- it was added by spec text the
-    # dashboard couldn't resolve itself (no Telethon session); the forwarder
-    # resolves it to a real id/title on its next refresh and renames the row
-    # (see resolve_channel / mark_channel_resolution_error below).
+    # channels: a per-channel signal-source registry (schema v2), keyed by a
+    # chat id (as text) or the literal 'direct' pseudo-channel. Historically
+    # populated by a since-removed signal-ingest path and its dashboard UI;
+    # row management for it has been retired along with that path, but
+    # the table stays because ea_shim still reads partial_book/breakeven off
+    # any rows that already exist (see channel_flags() below).
     # partial_book / breakeven (schema v4): per-channel switches for the split-
-    # TP "book 50%" feature -- see channel_flags() and telegram-ingest's
-    # build_commands(split_tp=...) / ea_shim's half-vs-full TP close handling.
+    # TP "book 50%" feature -- see channel_flags() / ea_shim's half-vs-full
+    # TP close handling.
     # Declared here so a brand-new DB gets them straight from CREATE TABLE;
     # an already-existing DB gets them from the ALTER TABLE migration below
     # (CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so the
@@ -147,10 +145,9 @@ _SCHEMA_SQL = (
         breakeven     INTEGER NOT NULL DEFAULT 0
     )
     """,
-    # tg_dialogs: forwarder-populated cache of the account's Telegram dialogs
-    # (scripts/telegram_user_forwarder.py, refreshed every ~10min), so the
-    # dashboard's "add channel" picker can offer real titles/ids instead of
-    # making the operator type a numeric chat id from memory.
+    # tg_dialogs: legacy cache table for a since-removed dialog picker.
+    # Nothing reads or writes it anymore; kept only so an existing DB file
+    # doesn't need a migration to drop it.
     """
     CREATE TABLE IF NOT EXISTS tg_dialogs (
         chat_id       TEXT PRIMARY KEY,
@@ -159,14 +156,10 @@ _SCHEMA_SQL = (
         refreshed_ts  TEXT
     )
     """,
-    # resubmits: audit ledger for the dashboard's operator-triggered
-    # "resubmit"/"submit manually" action (schema v3) -- see
-    # trade_dashboard.py's resubmit_signal(). One row per attempt (never
-    # updated in place), so the history of what an operator did/when is
-    # never lost even if they resubmit the same signal twice with force.
-    # commands/http_statuses/trace_ids are JSON arrays, index-aligned with
-    # each other; commands are ALWAYS secret-redacted before being stored
-    # here (never the raw webhook body).
+    # resubmits: legacy audit ledger for the dashboard's now-removed
+    # operator-triggered "resubmit"/"submit manually" action (schema v3).
+    # Nothing writes to it anymore; kept only so an existing DB file doesn't
+    # need a migration to drop it.
     """
     CREATE TABLE IF NOT EXISTS resubmits (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,8 +198,8 @@ def _utcnow_iso() -> str:
 
 def _env_dotenv_value(key: str) -> str:
     """Read one key from the repo's .env directly (this module has no
-    _load_dotenv of its own, unlike telegram_user_forwarder.py) -- used only
-    to seed the channel registry once, on first migration to schema v2.
+    dotenv loader of its own) -- used only to seed the channel registry
+    once, on first migration to schema v2.
     os.environ wins if already set (e.g. under local-stack.ps1, which
     exports .env into the process before spawning children)."""
     if os.environ.get(key):
@@ -499,13 +492,11 @@ def record_order(
     comment: str | None = None,
     error: str | None = None,
 ) -> None:
-    """Upsert one order row keyed by trace_id. telegram-ingest calls this
-    first (status="accepted", requested fields) when the webhook accepts a
-    command; ea_shim calls it again later with the same trace_id (executed
-    volume, status=filled/placed/rejected, broker_order_id, error) when the
-    fill comes back. Any field left None on a given call keeps its previous
-    value rather than being overwritten (COALESCE), so the two callers can
-    each supply a partial picture."""
+    """Upsert one order row keyed by trace_id. ea_shim calls this once it has
+    a fill result (executed volume, status=filled/placed/rejected,
+    broker_order_id, error). Any field left None on a given call keeps its
+    previous value rather than being overwritten (COALESCE), so a caller can
+    supply a partial picture without clobbering fields it doesn't know."""
     conn = None
     try:
         conn = get_conn()
@@ -641,123 +632,6 @@ def record_equity(
                 pass
 
 
-def record_resubmit(
-    signal_id: int | None,
-    source: str,
-    commands: list,
-    http_statuses: list,
-    trace_ids: list,
-    ok: bool,
-    note: str | None = None,
-) -> None:
-    """Append one row to the resubmit audit ledger -- called exactly once per
-    operator-triggered resubmit/manual-submit attempt (trade_dashboard.py's
-    resubmit_signal()). Never updates an existing row: every attempt, even a
-    forced re-attempt of the same signal, gets its own row so the history is
-    never lost. `commands` must already be secret-redacted by the caller --
-    this module makes no attempt to redact on the way in."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        conn.execute(
-            """
-            INSERT INTO resubmits (ts, signal_id, source, commands, http_statuses, trace_ids, ok, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                _utcnow_iso(),
-                signal_id,
-                source,
-                json.dumps(commands),
-                json.dumps(http_statuses),
-                json.dumps(trace_ids),
-                1 if ok else 0,
-                note,
-            ),
-        )
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"record_resubmit failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def latest_resubmit_for_signal(signal_id: int) -> dict | None:
-    """Most recent resubmit attempt for one signal, or None if it was never
-    resubmitted. Used for the idempotency check in resubmit_signal()."""
-    rows = query(
-        "SELECT id, ts, source, commands, http_statuses, trace_ids, ok, note "
-        "FROM resubmits WHERE signal_id = ? ORDER BY id DESC LIMIT 1",
-        (signal_id,),
-    )
-    return rows[0] if rows else None
-
-
-def resubmits_for_signals(signal_ids: list) -> dict:
-    """Latest resubmit attempt per signal_id, batched into one query for the
-    "Signals not placed" table (avoids one query per row). Returns
-    {signal_id: row}; signals never resubmitted are simply absent. Empty
-    dict on no ids given or any DB failure -- never raises."""
-    ids = [i for i in signal_ids if i is not None]
-    if not ids:
-        return {}
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = conn.execute(
-            f"SELECT id, ts, signal_id, source, commands, http_statuses, trace_ids, ok, note "
-            f"FROM resubmits WHERE signal_id IN ({placeholders}) ORDER BY id ASC",
-            tuple(ids),
-        ).fetchall()
-        out: dict = {}
-        for row in rows:
-            # ORDER BY id ASC + plain dict assignment -> later (higher id)
-            # rows overwrite earlier ones, so each signal_id ends up mapped
-            # to its most recent attempt.
-            out[row["signal_id"]] = dict(row)
-        return out
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"resubmits_for_signals failed: {exc!r}")
-        return {}
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def meta_get(key: str) -> str | None:
-    """Read one value from the meta table. None if absent or on any DB
-    failure -- callers (e.g. a heartbeat freshness check) must treat None
-    the same as "missing"."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return None
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else None
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"meta_get failed: {exc!r}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
 def meta_set(key: str, value: str) -> None:
     """Upsert one meta key/value. No-throw -- used for cross-process
     heartbeats (hb_forwarder, hb_ea_shim, ...) where a DB hiccup must never
@@ -785,213 +659,11 @@ def meta_set(key: str, value: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Channel registry -- see the `channels` table docstring above _SCHEMA_SQL.
-# All no-throw per this module's contract.
+# All no-throw per this module's contract. The registry's own management
+# functions (list/add/enable/disable/delete a channel) were removed along
+# with the dashboard UI that drove them; channel_flags() is the one reader
+# still live, consulted by ea_shim for any rows that already exist.
 # ---------------------------------------------------------------------------
-
-
-def list_channels() -> list[dict]:
-    return query(
-        "SELECT chat_id, title, spec, enabled, added_ts, updated_ts, note, "
-        "partial_book, breakeven FROM channels "
-        "ORDER BY CASE WHEN chat_id='direct' THEN 0 ELSE 1 END, "
-        "COALESCE(title, spec, chat_id) COLLATE NOCASE"
-    )
-
-
-def upsert_channel(
-    chat_id: str,
-    title: str | None = None,
-    spec: str | None = None,
-    enabled: int | bool = 1,
-    note: str | None = None,
-) -> None:
-    """Insert or fully overwrite one channel row -- the dashboard's
-    add-channel action and the schema v2 seed. Overwrites title/spec/note
-    unconditionally (last write wins), matching this module's other
-    upsert-style writers. For the forwarder's own resolution-in-place
-    updates (pending spec -> real id/title) use resolve_channel() /
-    mark_channel_resolution_error() instead, which preserve enabled."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        now = _utcnow_iso()
-        conn.execute(
-            """
-            INSERT INTO channels (chat_id, title, spec, enabled, added_ts, updated_ts, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                title=excluded.title,
-                spec=excluded.spec,
-                enabled=excluded.enabled,
-                updated_ts=excluded.updated_ts,
-                note=excluded.note
-            """,
-            (str(chat_id), title, spec, 1 if enabled else 0, now, now, note),
-        )
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"upsert_channel failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-# Boolean columns on `channels` an operator can flip at runtime, shared by
-# set_channel_flag()'s allowlist below. `field` ends up interpolated into SQL
-# (sqlite3 can't parameterize identifiers), so this gate is load-bearing, not
-# decorative -- keep it in sync with the channels schema.
-_CHANNEL_FLAG_COLUMNS = ("enabled", "partial_book", "breakeven")
-
-
-def set_channel_enabled(chat_id: str, enabled: bool) -> None:
-    set_channel_flag(chat_id, "enabled", enabled)
-
-
-def set_channel_flag(chat_id: str, field: str, value: bool) -> None:
-    """Flip one boolean column on a channel row -- shared setter behind
-    set_channel_enabled() and the dashboard's partial_book/breakeven toggles.
-
-    `field` MUST be one of _CHANNEL_FLAG_COLUMNS. The dashboard validates the
-    same allowlist before calling in (see trade_dashboard.py's
-    /api/channels/toggle handler); this check is the second, store-level
-    gate -- defense in depth, since an f-string column name is the one place
-    in this module SQL injection would actually be possible."""
-    if field not in _CHANNEL_FLAG_COLUMNS:
-        _warn(f"set_channel_flag: rejected unknown field {field!r}")
-        return
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        conn.execute(
-            f"UPDATE channels SET {field}=?, updated_ts=? WHERE chat_id=?",
-            (1 if value else 0, _utcnow_iso(), str(chat_id)),
-        )
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"set_channel_flag failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def delete_channel(chat_id: str) -> None:
-    """Removes the registry row only -- signals/orders history referencing
-    this channel's title is untouched (the dashboard makes this explicit to
-    the operator before calling delete)."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        conn.execute("DELETE FROM channels WHERE chat_id=?", (str(chat_id),))
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"delete_channel failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def resolve_channel(pending_chat_id: str, resolved_chat_id: str, resolved_title: str) -> None:
-    """Called by the forwarder once it resolves a channel's stored spec to a
-    real Telegram id/title. If the row was already keyed by its numeric id
-    (only the title was missing), updates title in place. If it was keyed by
-    the raw spec text (pending resolution), renames the row's primary key to
-    the resolved id, preserving enabled/spec/note. Clears any previous
-    "could not resolve" note. No-op if the row was deleted meanwhile."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        now = _utcnow_iso()
-        if str(pending_chat_id) == str(resolved_chat_id):
-            conn.execute(
-                "UPDATE channels SET title=?, updated_ts=?, note=NULL WHERE chat_id=?",
-                (resolved_title, now, str(pending_chat_id)),
-            )
-        else:
-            row = conn.execute(
-                "SELECT spec, enabled FROM channels WHERE chat_id=?", (str(pending_chat_id),)
-            ).fetchone()
-            if row is None:
-                return
-            conn.execute(
-                """
-                INSERT INTO channels (chat_id, title, spec, enabled, added_ts, updated_ts, note)
-                VALUES (?, ?, ?, ?, ?, ?, NULL)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    title=excluded.title, spec=excluded.spec, enabled=excluded.enabled,
-                    updated_ts=excluded.updated_ts, note=NULL
-                """,
-                (str(resolved_chat_id), resolved_title, row["spec"], row["enabled"], now, now),
-            )
-            conn.execute("DELETE FROM channels WHERE chat_id=?", (str(pending_chat_id),))
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"resolve_channel failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def mark_channel_resolution_error(chat_id: str, error: str) -> None:
-    """Stamps a "could not resolve" note on a still-pending channel row
-    (channel not found / account not subscribed) so the dashboard can show a
-    red state instead of "resolving..." forever."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        conn.execute(
-            "UPDATE channels SET note=?, updated_ts=? WHERE chat_id=?",
-            (str(error)[:300], _utcnow_iso(), str(chat_id)),
-        )
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"mark_channel_resolution_error failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def is_channel_enabled(channel_name: str | None) -> bool:
-    """Hot-path check for telegram-ingest: is this channel allowed to place
-    trades? `channel_name` is the [SRC:<title>] tag's title, or None/empty
-    for a message posted straight to the bot (matched against the 'direct'
-    pseudo-channel row).
-
-    Fail-open by design: a channel with NO registry row at all (a tagged
-    channel the operator hasn't registered yet) is treated as enabled --
-    a missing config row must never silently stop trading. Only an explicit
-    enabled=0 row skips the message. Never raises (query() doesn't)."""
-    if channel_name:
-        rows = query("SELECT enabled FROM channels WHERE title = ? COLLATE NOCASE", (channel_name,))
-    else:
-        rows = query("SELECT enabled FROM channels WHERE chat_id = 'direct'")
-    if not rows:
-        return True
-    return bool(rows[0].get("enabled"))
 
 
 def channel_flags(channel_name: str | None) -> dict:
@@ -1021,33 +693,6 @@ def channel_flags(channel_name: str | None) -> dict:
     }
 
 
-def recent_symbols_for_channel(channel_name: str | None, days: int = 7) -> list[str]:
-    """Distinct symbols this channel has actually traded in the last `days`.
-
-    Follow-up messages ("TP set @ 4346 for both trade") name a new price but no
-    instrument, so the instrument has to come from what the channel already has
-    working. Ordered most-recently-traded first; empty list on any failure,
-    which callers must treat as "address nothing" rather than "address
-    everything"."""
-    if not channel_name:
-        rows = query(
-            "SELECT symbol, MAX(ts) AS last_ts FROM signals "
-            "WHERE channel IS NULL AND outcome IN ('posted', 'dry_run') "
-            "AND symbol IS NOT NULL AND symbol != '' AND ts >= ? "
-            "GROUP BY symbol ORDER BY last_ts DESC",
-            ((datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),),
-        )
-    else:
-        rows = query(
-            "SELECT symbol, MAX(ts) AS last_ts FROM signals "
-            "WHERE channel = ? COLLATE NOCASE AND outcome IN ('posted', 'dry_run') "
-            "AND symbol IS NOT NULL AND symbol != '' AND ts >= ? "
-            "GROUP BY symbol ORDER BY last_ts DESC",
-            (channel_name, (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()),
-        )
-    return [str(r["symbol"]) for r in rows if r.get("symbol")]
-
-
 def sibling_order_rows(broker_order_id: str) -> list[dict]:
     """Every order belonging to the same signal as `broker_order_id`,
     INCLUDING the order asked about itself -- unlike sibling_broker_order_ids
@@ -1063,11 +708,10 @@ def sibling_order_rows(broker_order_id: str) -> list[dict]:
     those trace_ids. So the walk is ticket -> trace_id -> signal -> every
     trace_id on that signal -> every leg's order row.
 
-    That indirection is the point. The MT5 comment identifies the CHANNEL
-    ("tg-VGTA"), not the signal, so matching on it would sweep in a
-    different, still-live signal from the same channel on the same symbol --
-    something these channels do routinely. Only the store knows which legs
-    were one message.
+    That indirection is the point. The MT5 comment identifies the CHANNEL,
+    not the signal, so matching on it would sweep in a different, still-live
+    signal from the same channel on the same symbol -- something these
+    channels do routinely. Only the store knows which legs were one message.
 
     Each row: {broker_order_id, trace_id, command, tp, entry, symbol,
     channel}. `channel` is the signals row's channel value, copied onto every
@@ -1140,20 +784,13 @@ def sibling_broker_order_ids(broker_order_id: str) -> list[str]:
 # restart. Stored in the `meta` kv table, so there is no schema change here:
 # `meta` predates schema v1 and a new key is a row, not a migration.
 #
-# Currently just the dry-run kill switch: the dashboard writes it, and
-# telegram-ingest re-reads it on its hot path (cached ~10s) instead of
-# trusting the TELEGRAM_INGEST_DRY_RUN value it booted with.
+# Currently just the dry-run kill switch: trade_dashboard.py both writes and
+# re-reads it, so an operator toggle takes effect on the dashboard's own next
+# request without a restart.
 # ---------------------------------------------------------------------------
 
 _DRY_RUN_KEY = "dry_run"
 _DRY_RUN_TS_KEY = "dry_run_updated_ts"
-
-# Set by the dashboard, consumed by the forwarder: "re-read the account's
-# Telegram dialogs now". The dashboard has no Telethon session of its own --
-# only the forwarder is authenticated -- so a newly joined channel can only
-# reach the picker by asking the forwarder to look. Named here so the two
-# processes cannot drift apart on the spelling.
-DIALOG_REFRESH_REQUEST_KEY = "tg_dialogs_refresh_requested"
 
 _TRUEISH = ("1", "true", "yes", "on")
 _FALSEISH = ("0", "false", "no", "off")
@@ -1161,12 +798,12 @@ _FALSEISH = ("0", "false", "no", "off")
 
 def get_dry_run(default: bool) -> bool:
     """Effective dry-run state: the operator's stored override if one has ever
-    been set, otherwise `default` (the caller's TELEGRAM_INGEST_DRY_RUN value).
+    been set, otherwise `default` (the caller's own env-var default).
 
-    Fail-SAFE, deliberately unlike is_channel_enabled()'s fail-open: any store
-    problem (missing row, unreadable DB, junk value) falls back to `default`,
-    and that env default is itself `true`. A broken store can therefore only
-    ever leave the stack in dry-run -- never silently put it live."""
+    Fail-SAFE: any store problem (missing row, unreadable DB, junk value)
+    falls back to `default`, and that env default is itself `true`. A broken
+    store can therefore only ever leave the stack in dry-run -- never
+    silently put it live."""
     rows = query("SELECT value FROM meta WHERE key=?", (_DRY_RUN_KEY,))
     if not rows:
         return default
@@ -1192,8 +829,9 @@ def get_dry_run_meta(default: bool) -> dict:
 
 
 def set_dry_run(enabled: bool) -> None:
-    """Persist the operator's dry-run choice. Takes effect on telegram-ingest's
-    next cache expiry (~10s) -- no restart, same as a channel toggle."""
+    """Persist the operator's dry-run choice. Takes effect immediately -- the
+    dashboard re-reads it (via get_dry_run/get_dry_run_meta) on every
+    request, no restart needed."""
     conn = None
     try:
         conn = get_conn()
@@ -1210,50 +848,6 @@ def set_dry_run(enabled: bool) -> None:
         conn.commit()
     except Exception as exc:  # noqa: BLE001
         _warn(f"set_dry_run failed: {exc!r}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# tg_dialogs -- forwarder-populated cache backing the dashboard's "add
-# channel" picker. Written only by telegram_user_forwarder.py (it's the only
-# process with a Telethon session); read by the dashboard.
-# ---------------------------------------------------------------------------
-
-
-def list_tg_dialogs() -> list[dict]:
-    return query("SELECT chat_id, title, kind, refreshed_ts FROM tg_dialogs ORDER BY title COLLATE NOCASE")
-
-
-def replace_tg_dialogs(dialogs: list[tuple[str, str, str]]) -> None:
-    """Full refresh of the tg_dialogs picker list in one transaction, so
-    readers never see a half-updated set. `dialogs` is a list of
-    (chat_id, title, kind) tuples. No-throw; a failure here just means a
-    stale picker list, never anything relay/trading-affecting."""
-    conn = None
-    try:
-        conn = get_conn()
-        if conn is None:
-            return
-        now = _utcnow_iso()
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM tg_dialogs")
-        conn.executemany(
-            "INSERT INTO tg_dialogs (chat_id, title, kind, refreshed_ts) VALUES (?, ?, ?, ?)",
-            [(str(cid), title, kind, now) for cid, title, kind in dialogs],
-        )
-        conn.execute("COMMIT")
-    except Exception as exc:  # noqa: BLE001
-        _warn(f"replace_tg_dialogs failed: {exc!r}")
-        try:
-            if conn is not None:
-                conn.execute("ROLLBACK")
-        except Exception:
-            pass
     finally:
         if conn is not None:
             try:
@@ -1300,90 +894,6 @@ def _as_float(v) -> float | None:
         return None
 
 
-def _backfill_telegram_signals() -> tuple[int, int]:
-    files = sorted(LOG_DIR.glob("telegram-signals.log*"))
-    grouped: dict[tuple[int, int], list[dict]] = {}
-    for rec in _iter_jsonl(files):
-        chat_id = rec.get("chat_id")
-        message_id = rec.get("message_id")
-        if chat_id is None or message_id is None:
-            continue
-        grouped.setdefault((int(chat_id), int(message_id)), []).append(rec)
-
-    n_signals = 0
-    n_orders = 0
-    for (chat_id, message_id), recs in grouped.items():
-        rejected = [r for r in recs if r.get("outcome") == "rejected"]
-        if rejected:
-            r = rejected[0]
-            record_signal(
-                chat_id=chat_id,
-                message_id=message_id,
-                channel=r.get("channel"),
-                outcome="rejected",
-                n_commands=0,
-                raw=(r.get("raw_text") or "")[:500],
-            )
-            n_signals += 1
-            continue
-
-        first = recs[0]
-        sig = first.get("signal") or {}
-        outcomes = {r.get("outcome") for r in recs}
-        outcome = "posted" if "posted" in outcomes else (
-            "dry_run" if "dry_run" in outcomes else (next(iter(outcomes), "other") or "other")
-        )
-        raw = None
-        for r in recs:
-            if r.get("command"):
-                raw = r["command"][:500]
-                break
-        record_signal(
-            chat_id=chat_id,
-            message_id=message_id,
-            channel=first.get("channel"),
-            outcome=outcome,
-            symbol=sig.get("symbol"),
-            side=sig.get("side"),
-            entry=sig.get("entry"),
-            sl=sig.get("sl"),
-            tp=sig.get("tp"),
-            n_commands=len(recs),
-            raw=raw,
-        )
-        n_signals += 1
-
-        for r in recs:
-            if r.get("outcome") != "posted" or r.get("http_status") != 200:
-                continue
-            try:
-                trace_id = json.loads(r.get("response") or "{}").get("trace_id", "")
-            except (json.JSONDecodeError, AttributeError):
-                trace_id = ""
-            if not trace_id:
-                continue
-            body = r.get("command", "")
-            parts = body.split(",", 3)
-            command = parts[1] if len(parts) > 1 else None
-            symbol = parts[2] if len(parts) > 2 else None
-            append_signal_trace(chat_id, message_id, trace_id)
-            record_order(
-                trace_id=trace_id,
-                source="telegram",
-                command=command,
-                symbol=symbol,
-                requested_risk=_as_float(_cmd_field(body, "risk")),
-                volume=_as_float(_cmd_field(body, "vol_lots")),
-                sl=_as_float(_cmd_field(body, "sl")),
-                tp=_as_float(_cmd_field(body, "tp")),
-                entry=_as_float(_cmd_field(body, "entry_price")),
-                status="accepted",
-                comment=_cmd_field(body, "comment") or None,
-            )
-            n_orders += 1
-    return n_signals, n_orders
-
-
 def _backfill_mt5_fills() -> int:
     files = sorted(LOG_DIR.glob("mt5-fills.log*"))
     n = 0
@@ -1392,7 +902,7 @@ def _backfill_mt5_fills() -> int:
         if not trace_id or r.get("event") == "position_closed":
             continue
         comment = r.get("comment") or ""
-        source = "telegram" if str(comment).startswith("tg-") else "tradingview"
+        source = "tradingview"
         record_order(
             trace_id=trace_id,
             source=source,
@@ -1462,11 +972,7 @@ def _backfill_mt5_closed(days: int = 90) -> int:
                     entry_price = round(sum(x.price * x.volume for x in in_deals) / tot_vol, 5)
 
             close_ts = datetime.fromtimestamp(last.time, tz=timezone.utc).isoformat()
-            source = (
-                ("telegram" if str(last.comment).startswith("tg-") else "tradingview")
-                if last.magic == magic
-                else "other"
-            )
+            source = "tradingview" if last.magic == magic else "other"
             record_closed_trade(
                 position_id=str(pos_id),
                 close_ts=close_ts,
@@ -1490,12 +996,9 @@ def _backfill_mt5_closed(days: int = 90) -> int:
 
 
 def backfill() -> dict:
-    n_signals, n_orders_tg = _backfill_telegram_signals()
     n_orders_mt5 = _backfill_mt5_fills()
     n_closed = _backfill_mt5_closed()
     return {
-        "signals": n_signals,
-        "orders_from_telegram_log": n_orders_tg,
         "orders_from_mt5_log": n_orders_mt5,
         "closed_trades_from_mt5": n_closed,
     }

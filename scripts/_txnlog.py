@@ -1,16 +1,16 @@
 """Shared daily-rotating transaction log for local demo/dev testing.
 
-Used by ea_shim.py and telegram-ingest to keep a JSON-lines audit trail of
-every signal and order that passed through them, independent of the
-per-service debug logs in .local-stack/logs/*.log. One physical file per
-logger name under .local-stack/logs/transactions/, rotated at UTC midnight;
-files older than RETENTION_DAYS are deleted, both via the stdlib handler's
-own rollover pruning and an explicit purge on startup (so a file that's
-stale because the process was simply off for a while is still cleaned up
-the next time it starts, not just on the next live rollover).
+Used by ea_shim.py to keep a JSON-lines audit trail of every signal and
+order that passed through it, independent of the per-service debug logs in
+.local-stack/logs/*.log. One physical file per logger name under
+.local-stack/logs/transactions/, rotated at UTC midnight; files older than
+RETENTION_DAYS are deleted, both via the stdlib handler's own rollover
+pruning and an explicit purge on startup (so a file that's stale because the
+process was simply off for a while is still cleaned up the next time it
+starts, not just on the next live rollover).
 
 Not used by the production bridge/EA path — this is dev-harness tooling
-(ea_shim.py, telegram-ingest) only.
+(ea_shim.py) only.
 """
 
 from __future__ import annotations

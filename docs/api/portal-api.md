@@ -160,28 +160,6 @@ curl 'https://api.example.com/journal/export?from=2026-01-01&to=2026-04-01&forma
 
 Hard cap: 200,000 rows per request. For larger exports, page by date range.
 
-### Telegram notifications
-
-Account-level (not per-license) Telegram linking; the bot itself runs in the
-`tasks` service. See
-[`docs/customer/telegram-notifications.md`](../customer/telegram-notifications.md)
-for the user flow.
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/me/telegram/link` | Mint a one-time link token (15-min TTL); returns `{deep_link, link_token, expires_at}`. Re-calling rotates the token. `503` if the deployment has no `TELEGRAM_BOT_USERNAME`. Rate-limited 10/min. |
-| `GET` | `/me/telegram` | Link status: `{linked, linked_at, chat_id, notify_fills, notify_timeouts, failed_last_24h, last_delivery_status}` — the last two power the portal's delivery-warning badge |
-| `PATCH` | `/me/telegram` | Update preferences: any of `{"notify_fills": bool, "notify_timeouts": bool}`. `404` if link was never set up. |
-| `DELETE` | `/me/telegram` | Remove the link entirely (equivalent to sending `/stop` to the bot). `204`. |
-
-```sh
-curl -s -X POST https://api.example.com/me/telegram/link \
-  -H "Authorization: Bearer $TOKEN"
-# → {"deep_link":"https://t.me/YourBot?start=abc...","link_token":"abc...",
-#    "expires_at":"2026-07-24T12:15:00Z"}
-# Open deep_link in Telegram and tap Start to finish linking.
-```
-
 ---
 
 ## Error responses

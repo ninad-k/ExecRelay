@@ -1,0 +1,21 @@
+{
+  "_comment": "Local machine settings for the Windows-only dev tools (scripts/trade_dashboard.py, scripts/ea_shim.py, packaging/dashboard/, scripts/generate-dev-certs.py). Copy to config.json (gitignored) and edit for your machine. This is NOT how apps/* services are configured -- those read .env / process env, see .env.example. Never put real MT5 login/password pairs here; the Windows local stack authenticates against whichever MT5 terminal is already logged in, it does not read credentials from this file.",
+
+  "dashboard": {
+    "addr": "127.0.0.1:8090",
+    "token": "",
+    "ea_shim_magic": 20240101
+  },
+
+  "mt5": {
+    "terminal_search_paths": [
+      "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+    ]
+  },
+
+  "dev_certs": {
+    "out_dir": "certs",
+    "common_name": "localhost",
+    "days": 825
+  }
+}
