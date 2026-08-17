@@ -1,17 +1,29 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="05. Portal API" type="PythonConfigurationType" factoryName="Python">
-    <module name="execrelay" />
+    <module name="ExecRelay" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
     <env name="PYTHONUNBUFFERED" value="1" />
+    <env name="ENV" value="development" />
     <env name="DEBUG" value="true" />
     <env name="HTTP_ADDR" value="0.0.0.0:8084" />
     <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+    <env name="NATS_URL" value="nats://execrelay:execrelay_nats_dev@localhost:4222" />
+    <env name="JWT_SECRET" value="changeme-in-production" />
+    <env name="PORTAL_ALLOWED_ORIGINS" value="*" />
+    <env name="INGRESS_URL" value="http://localhost:8080" />
+    <env name="SIGNALS_STREAM" value="SIGNALS" />
     <envs>
       <env name="PYTHONUNBUFFERED" value="1" />
+      <env name="ENV" value="development" />
       <env name="DEBUG" value="true" />
       <env name="HTTP_ADDR" value="0.0.0.0:8084" />
       <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+      <env name="NATS_URL" value="nats://execrelay:execrelay_nats_dev@localhost:4222" />
+      <env name="JWT_SECRET" value="changeme-in-production" />
+      <env name="PORTAL_ALLOWED_ORIGINS" value="*" />
+      <env name="INGRESS_URL" value="http://localhost:8080" />
+      <env name="SIGNALS_STREAM" value="SIGNALS" />
     </envs>
     <option name="SDK_HOME" value="" />
     <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />

@@ -1,5 +1,16 @@
 <component name="ProjectRunConfigurationManager">
+  <!--
+    Both compounds assume Docker infra (postgres, nats, redis, minio, etc.)
+    is already up: run the "Docker: Start Infra" External Tool (Tools menu >
+    ExecRelay, or `docker compose up -d` / `make up`) first. Compound run
+    configurations launch every member at once; they do NOT wait for one
+    member to become healthy before starting the next, so the toRun order
+    below only approximates the real dependency chain (ML Predictor and the
+    Go edge services first, Postgres/NATS consumers next, portal-web last).
+    See .idea/README.md for the full explanation and manual startup order.
+  -->
   <configuration default="false" name="00. All Services (Compound)" type="CompoundRunConfigurationType">
+    <toRun name="12. ML Predictor" type="PythonConfigurationType" />
     <toRun name="01. Ingress" type="GoApplicationRunConfiguration" />
     <toRun name="02. Bridge" type="GoApplicationRunConfiguration" />
     <toRun name="03. DXTrade" type="GoApplicationRunConfiguration" />
@@ -11,7 +22,18 @@
     <toRun name="09. Reports" type="PythonConfigurationType" />
     <toRun name="10. Backtester" type="PythonConfigurationType" />
     <toRun name="11. ML Feature Extractor" type="PythonConfigurationType" />
+    <toRun name="13. Portal Web (npm dev)" type="js.build_tools.npm" />
+    <method v="2" />
+  </configuration>
+  <configuration default="false" name="00b. Backend Services Only (Compound)" type="CompoundRunConfigurationType">
     <toRun name="12. ML Predictor" type="PythonConfigurationType" />
+    <toRun name="01. Ingress" type="GoApplicationRunConfiguration" />
+    <toRun name="02. Bridge" type="GoApplicationRunConfiguration" />
+    <toRun name="03. DXTrade" type="GoApplicationRunConfiguration" />
+    <toRun name="04. Persist" type="PythonConfigurationType" />
+    <toRun name="05. Portal API" type="PythonConfigurationType" />
+    <toRun name="06. Risk" type="PythonConfigurationType" />
+    <toRun name="07. Tasks" type="PythonConfigurationType" />
     <method v="2" />
   </configuration>
 </component>

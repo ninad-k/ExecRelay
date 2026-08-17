@@ -1,19 +1,29 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="07. Tasks" type="PythonConfigurationType" factoryName="Python">
-    <module name="execrelay" />
+    <module name="ExecRelay" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
     <env name="PYTHONUNBUFFERED" value="1" />
+    <env name="ENV" value="development" />
     <env name="DEBUG" value="true" />
     <env name="HTTP_ADDR" value="0.0.0.0:8086" />
     <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
     <env name="FILL_TIMEOUT_SECS" value="30" />
+    <env name="FILL_CHECK_INTERVAL" value="60" />
     <env name="RETENTION_DAYS" value="90" />
+    <env name="RETENTION_INTERVAL" value="86400" />
+    <env name="TASK_POLL_INTERVAL" value="10" />
     <envs>
       <env name="PYTHONUNBUFFERED" value="1" />
+      <env name="ENV" value="development" />
       <env name="DEBUG" value="true" />
       <env name="HTTP_ADDR" value="0.0.0.0:8086" />
       <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+      <env name="FILL_TIMEOUT_SECS" value="30" />
+      <env name="FILL_CHECK_INTERVAL" value="60" />
+      <env name="RETENTION_DAYS" value="90" />
+      <env name="RETENTION_INTERVAL" value="86400" />
+      <env name="TASK_POLL_INTERVAL" value="10" />
     </envs>
     <option name="SDK_HOME" value="" />
     <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />

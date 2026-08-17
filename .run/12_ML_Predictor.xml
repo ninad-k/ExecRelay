@@ -1,17 +1,17 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="12. ML Predictor" type="PythonConfigurationType" factoryName="Python">
-    <module name="execrelay" />
+    <module name="ExecRelay" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
     <env name="PYTHONUNBUFFERED" value="1" />
     <env name="DEBUG" value="true" />
     <env name="HTTP_PORT" value="8091" />
-    <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+    <env name="ML_THRESHOLD" value="0.50" />
     <envs>
       <env name="PYTHONUNBUFFERED" value="1" />
       <env name="DEBUG" value="true" />
       <env name="HTTP_PORT" value="8091" />
-      <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+      <env name="ML_THRESHOLD" value="0.50" />
     </envs>
     <option name="SDK_HOME" value="" />
     <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />

@@ -11,14 +11,17 @@
     <option name="IS_MODULE_SDK" value="true" />
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
-    <element name="module" value="execrelay" />
+    <element name="module" value="ExecRelay" />
     <element name="envs">
       <env name="DEBUG" value="true" />
       <env name="HTTP_ADDR" value=":8080" />
-      <env name="NATS_URL" value="nats://localhost:4222" />
-      <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
+      <env name="NATS_URL" value="nats://execrelay:execrelay_nats_dev@localhost:4222" />
+      <env name="INGRESS_REGION" value="local" />
+      <env name="MAX_BODY_BYTES" value="4096" />
       <env name="WEBHOOK_RATE_LIMIT" value="1000" />
       <env name="WEBHOOK_TIMESTAMP_WINDOW_SECS" value="30" />
+      <env name="ML_PREDICTOR_URL" value="http://localhost:8091" />
+      <env name="EXECRELAY_LICENSES" value="550e8400-e29b-41d4-a716-446655440000:test-secret:test-hmac-secret:test-instance:mt5" />
     </element>
     <kind value="DIRECTORY" />
     <filePath value="$PROJECT_DIR$/apps/ingress/cmd/ingress/main.go" />

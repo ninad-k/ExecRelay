@@ -11,15 +11,14 @@
     <option name="IS_MODULE_SDK" value="true" />
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
-    <element name="module" value="execrelay" />
+    <element name="module" value="ExecRelay" />
     <element name="envs">
       <env name="DEBUG" value="true" />
       <env name="HTTP_ADDR" value=":8081" />
-      <env name="NATS_URL" value="nats://localhost:4222" />
-      <env name="DATABASE_URL" value="postgresql://execrelay:execrelay_dev_password@localhost:5432/execrelay" />
-      <env name="EA_CONNECTION_TIMEOUT_SECS" value="10" />
-      <env name="CIRCUIT_BREAKER_FAILURE_THRESHOLD" value="5" />
-      <env name="CIRCUIT_BREAKER_SUCCESS_THRESHOLD" value="2" />
+      <env name="NATS_URL" value="nats://execrelay:execrelay_nats_dev@localhost:4222" />
+      <env name="BRIDGE_REGION" value="local" />
+      <env name="SIGNALS_STREAM" value="SIGNALS" />
+      <env name="SIGNALS_CONSUMER" value="bridge" />
     </element>
     <kind value="DIRECTORY" />
     <filePath value="$PROJECT_DIR$/apps/bridge/cmd/bridge/main.go" />
