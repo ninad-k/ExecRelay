@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,6 +255,107 @@ func TestWebhookPerimeterGateRejectsWrongToken(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// captureSlog swaps slog's default logger for one writing JSON to the
+// returned buffer, restoring the previous logger via t.Cleanup.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestWebhookPerimeterGateAuditsMissingToken(t *testing.T) {
+	logs := captureSlog(t)
+	handler := perimeterHandler(&capturePublisher{}, "gate-secret").Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	line := logs.String()
+	if !strings.Contains(line, `"msg":"signal_audit"`) {
+		t.Fatalf("expected a signal_audit log line, got: %s", line)
+	}
+	if !strings.Contains(line, `"reason_code":"perimeter_rejected"`) {
+		t.Fatalf("expected reason_code=perimeter_rejected, got: %s", line)
+	}
+	if !strings.Contains(line, `"token_detail":"missing"`) {
+		t.Fatalf("expected token_detail=missing, got: %s", line)
+	}
+	if !strings.Contains(line, `"token_supplied":false`) {
+		t.Fatalf("expected token_supplied=false, got: %s", line)
+	}
+	// The rejected signal's own content must still be visible for audit,
+	// with the secret scrubbed rather than the field just being empty.
+	if !strings.Contains(line, "60123456789,buy,EURUSD") {
+		t.Fatalf("expected the rejected body to be captured for audit, got: %s", line)
+	}
+	if strings.Contains(line, "alert-secret") {
+		t.Fatalf("secret must be redacted from the audited body, got: %s", line)
+	}
+}
+
+func TestWebhookPerimeterGateAuditsWrongToken(t *testing.T) {
+	logs := captureSlog(t)
+	handler := perimeterHandler(&capturePublisher{}, "gate-secret").Routes()
+	body := "60123456789,buy,EURUSD,vol_lots=0.1,secret=alert-secret"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?token=wrong", bytes.NewBufferString(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	line := logs.String()
+	if !strings.Contains(line, `"token_detail":"invalid"`) {
+		t.Fatalf("expected token_detail=invalid, got: %s", line)
+	}
+	if !strings.Contains(line, `"token_supplied":true`) {
+		t.Fatalf("expected token_supplied=true (a token WAS sent, just the wrong one), got: %s", line)
+	}
+	// The supplied token value itself must never be logged, only that it was
+	// wrong -- "wrong" (the value used above) must not appear anywhere.
+	if strings.Contains(line, "wrong") {
+		t.Fatalf("the supplied token value must never be logged, got: %s", line)
+	}
+}
+
+func TestRedactBody(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"flat form", "60123,BUY,EURUSD,vol_lots=0.1,secret=topsecret", "60123,BUY,EURUSD,vol_lots=0.1,secret=***"},
+		{"flat form mid-body", "60123,BUY,EURUSD,secret=topsecret,comment=x", "60123,BUY,EURUSD,secret=***,comment=x"},
+		{"json form", `{"license_id":"60123","secret":"topsecret","action":"buy"}`, `{"license_id":"60123","secret":"***","action":"buy"}`},
+		{"no secret present", "60123,CLOSELONG,EURUSD", "60123,CLOSELONG,EURUSD"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactBody([]byte(c.in))
+			if got != c.want {
+				t.Fatalf("redactBody(%q) = %q, want %q", c.in, got, c.want)
+			}
+			if strings.Contains(got, "topsecret") {
+				t.Fatalf("secret leaked through redaction: %q", got)
+			}
+		})
+	}
+}
+
+func TestRedactBodyTruncatesOversizedInput(t *testing.T) {
+	huge := strings.Repeat("x", auditBodyMaxLen*3)
+	got := redactBody([]byte(huge))
+	if len(got) > auditBodyMaxLen+len("...(truncated)") {
+		t.Fatalf("expected redactBody to cap length, got %d chars", len(got))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Fatalf("expected truncation marker, got: %q", got[len(got)-30:])
 	}
 }
 

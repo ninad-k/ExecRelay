@@ -103,6 +103,17 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// pollPaths are hit repeatedly forever by health checks / metrics scrapers
+// (local-stack.ps1's readiness wait, the dashboard's ~10s pipeline poll,
+// container orchestrators, Prometheus) and carry no operational signal on
+// their own -- logging every one of them at INFO drowns out everything
+// else in the console/log file. Quieted only while they're succeeding
+// (status < 400); a health check that starts FAILING still logs, since
+// that's exactly the kind of thing an operator needs to see.
+var pollPaths = map[string]bool{
+	"/health": true, "/healthz": true, "/readyz": true, "/metrics": true,
+}
+
 // Middleware returns an http.Handler that:
 //   - assigns or honors X-Request-ID
 //   - propagates X-ExecRelay-Trace-ID (also accepts W3C traceparent's trace-id)
@@ -110,8 +121,16 @@ func (r *statusRecorder) Flush() {
 //   - sets both headers on the response so the caller can correlate
 //
 // `service` is included in every log line so a multi-service log stream
-// remains pivotable.
-func Middleware(service string) func(http.Handler) http.Handler {
+// remains pivotable. `alwaysQuietPaths` are paths the caller's own handler
+// already logs a richer, purpose-built line for on every outcome (e.g.
+// ingress's per-signal audit log) -- this middleware's generic line would
+// just be a redundant second entry for the same event, so those paths are
+// skipped here unconditionally, not just while succeeding.
+func Middleware(service string, alwaysQuietPaths ...string) func(http.Handler) http.Handler {
+	alwaysQuiet := make(map[string]bool, len(alwaysQuietPaths))
+	for _, p := range alwaysQuietPaths {
+		alwaysQuiet[p] = true
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rid := strings.TrimSpace(r.Header.Get(HeaderRequestID))
@@ -136,6 +155,11 @@ func Middleware(service string) func(http.Handler) http.Handler {
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			start := time.Now()
 			next.ServeHTTP(rec, r)
+
+			if alwaysQuiet[r.URL.Path] || (pollPaths[r.URL.Path] && rec.status < 400) {
+				return
+			}
+
 			latencyMS := float64(time.Since(start).Microseconds()) / 1000.0
 
 			attrs := []any{

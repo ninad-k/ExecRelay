@@ -14,6 +14,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,7 +139,10 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/webhook/ml", h.webhookML)
 	mux.HandleFunc("/admin/kill-switch", h.killSwitch)
 	mux.Handle("/metrics", promhttp.Handler())
-	return obs.Middleware("ingress")(metricsMiddleware(mux))
+	// /webhook and /webhook/ml already get a complete, per-outcome line from
+	// recordRequestEvent's "signal_audit" log -- the generic access log here
+	// would just be a redundant second entry for the same request.
+	return obs.Middleware("ingress", "/webhook", "/webhook/ml")(metricsMiddleware(mux))
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
@@ -279,11 +283,13 @@ func (h *Handler) recordKillSwitchEvent(ctx context.Context, clientAddr string, 
 // the deferred publishRequestEvent. The handler updates these fields as it
 // learns more (license_key, trace_id, body_hash, reason_code).
 type webhookCtx struct {
-	requestID  string
-	traceID    string
-	licenseKey string
-	bodySHA256 string
-	reasonCode string
+	requestID    string
+	traceID      string
+	licenseKey   string
+	bodySHA256   string
+	redactedBody string // secret= / "secret":".." scrubbed, capped -- for the audit log only
+	tokenDetail  string // "missing" | "invalid", set only when the perimeter gate rejects; "" otherwise
+	reasonCode   string
 }
 
 func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
@@ -382,11 +388,20 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 }
 
 // gatingPreamble runs the perimeter checks shared by every ingress webhook
-// route, in the order the ADR 0008 spec requires: method, perimeter token,
-// kill-switch, per-IP rate limit, CIDR allowlist, timestamp window, then the
-// raw body read (bounded by maxBodyBytes). It writes the appropriate error
-// response and sets wctx.reasonCode itself on rejection. Callers (webhook,
-// webhookML) parse the returned body in their own wire format afterwards.
+// route: method, raw body read (bounded by maxBodyBytes), perimeter token,
+// kill-switch, per-IP rate limit, CIDR allowlist, timestamp window. It writes
+// the appropriate error response and sets wctx.reasonCode itself on
+// rejection. Callers (webhook, webhookML) parse the returned body in their
+// own wire format afterwards.
+//
+// The body read happens right after the method check -- deliberately ahead
+// of every other gate, including the perimeter token -- so that EVERY signal
+// that reaches this handler is captured into wctx (redactedBody/bodySHA256)
+// for the audit log in recordRequestEvent, not just ones that pass every
+// check. This is what makes a missing- or wrong-token request auditable: the
+// caller can still be shown exactly what was sent, not just that something
+// was rejected. r.Body can only be read once, so every later gate reuses
+// this same `body` slice rather than touching r.Body again.
 func (h *Handler) gatingPreamble(w http.ResponseWriter, r *http.Request, wctx *webhookCtx, clientAddr string) ([]byte, bool) {
 	if r.Method != http.MethodPost {
 		if h.debug {
@@ -398,12 +413,38 @@ func (h *Handler) gatingPreamble(w http.ResponseWriter, r *http.Request, wctx *w
 		return nil, false
 	}
 
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
+	if err != nil {
+		if h.debug {
+			slog.Debug("failed to read body", "client", clientAddr, "err", err)
+		}
+		wctx.reasonCode = "body_too_large"
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
+		return nil, false
+	}
+	if len(body) > 0 {
+		hash := sha256.Sum256(body)
+		wctx.bodySHA256 = hex.EncodeToString(hash[:])
+		wctx.redactedBody = redactBody(body)
+	}
+	if h.debug {
+		slog.Debug("body received", "client", clientAddr, "size", len(body))
+	}
+
 	if len(h.perimeterToken) > 0 {
-		// Constant-time check; never log the supplied token value.
+		// Constant-time check; never log the supplied token value itself --
+		// only whether one was present at all (tokenDetail), so the audit
+		// trail can distinguish "forgot the token" from "sent a wrong one"
+		// without ever persisting the real token or a guess at it.
 		got := r.URL.Query().Get("token")
 		if !hmac.Equal([]byte(got), h.perimeterToken) {
+			if got == "" {
+				wctx.tokenDetail = "missing"
+			} else {
+				wctx.tokenDetail = "invalid"
+			}
 			if h.debug {
-				slog.Debug("perimeter token rejected", "client", clientAddr)
+				slog.Debug("perimeter token rejected", "client", clientAddr, "detail", wctx.tokenDetail)
 			}
 			recordRejection("perimeter_rejected")
 			wctx.reasonCode = "perimeter_rejected"
@@ -467,23 +508,6 @@ func (h *Handler) gatingPreamble(w http.ResponseWriter, r *http.Request, wctx *w
 		if h.debug {
 			slog.Debug("timestamp valid", "client", clientAddr)
 		}
-	}
-
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
-	if err != nil {
-		if h.debug {
-			slog.Debug("failed to read body", "client", clientAddr, "err", err)
-		}
-		wctx.reasonCode = "body_too_large"
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "body_too_large"})
-		return nil, false
-	}
-	if len(body) > 0 {
-		hash := sha256.Sum256(body)
-		wctx.bodySHA256 = hex.EncodeToString(hash[:])
-	}
-	if h.debug {
-		slog.Debug("body received", "client", clientAddr, "size", len(body))
 	}
 
 	return body, true
@@ -600,14 +624,18 @@ func (r *webhookRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// recordRequestEvent publishes one events.ingress.request message per
-// webhook attempt (accept or reject). persist consumes the subject and
-// writes the row to request_log so `GET /requests/{request_id}` returns
-// full context for any past call.
+// recordRequestEvent is the single place every webhook attempt -- accepted
+// or rejected, for any reason, at any gate -- is accounted for. It always
+// (a) writes an unconditional, non-debug-gated audit log line so the record
+// exists locally even when nothing consumes NATS events (no persist service
+// running, e.g. this stack's local dev/demo deployment), and (b) publishes
+// events.ingress.request for any deployment that does have a persist
+// consumer wired up (writes request_log so GET /requests/{request_id} can
+// look up full context later). Every signal that reaches this handler is
+// logged here BEFORE the accept/reject decision is what "processes" it
+// further -- the audit trail and the processing decision are deliberately
+// decoupled, so a rejection never means "never logged".
 func (h *Handler) recordRequestEvent(r *http.Request, rec *webhookRecorder, wctx *webhookCtx, clientAddr string, start time.Time) {
-	if h.eventPublisher == nil {
-		return
-	}
 	outcome := "error"
 	switch {
 	case rec.status >= 200 && rec.status < 300:
@@ -617,6 +645,33 @@ func (h *Handler) recordRequestEvent(r *http.Request, rec *webhookRecorder, wctx
 	}
 	if wctx.reasonCode == "" {
 		wctx.reasonCode = outcome
+	}
+
+	// Unconditional audit line -- "signal_audit" is a distinct msg from the
+	// generic "http_request" access log, so it's easy to grep/filter on its
+	// own (e.g. `Select-String -Pattern signal_audit`). token_supplied /
+	// token_detail make a missing-token request distinguishable from a
+	// wrong-token one without ever logging the token itself.
+	slog.Info("signal_audit",
+		"request_id", wctx.requestID,
+		"trace_id", wctx.traceID,
+		"license_key", wctx.licenseKey,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"client_ip", clientAddr,
+		"status", rec.status,
+		"outcome", outcome,
+		"reason_code", wctx.reasonCode,
+		"token_supplied", r.URL.Query().Get("token") != "",
+		"token_detail", wctx.tokenDetail,
+		"body", wctx.redactedBody,
+		"body_sha256", wctx.bodySHA256,
+		"latency_ms", int(time.Since(start).Milliseconds()),
+		"user_agent", truncateStr(r.UserAgent(), 240),
+	)
+
+	if h.eventPublisher == nil {
+		return
 	}
 	evt := map[string]any{
 		"service":     "ingress",
@@ -650,6 +705,27 @@ func truncateStr(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+var (
+	secretFlatRe = regexp.MustCompile(`(?i)secret=[^,]*`)
+	secretJSONRe = regexp.MustCompile(`(?i)"secret"\s*:\s*"[^"]*"`)
+)
+
+const auditBodyMaxLen = 500
+
+// redactBody returns a copy of the raw signal body safe to persist in an
+// audit log: the secret is scrubbed in both wire formats this ingress
+// accepts -- the flat webhook's `secret=xxx` and /webhook/ml's JSON
+// `"secret":"xxx"` -- and the result is capped so an oversized or garbage
+// POST (a scanner, a misconfigured caller) can't bloat the log file.
+func redactBody(body []byte) string {
+	s := secretFlatRe.ReplaceAllString(string(body), "secret=***")
+	s = secretJSONRe.ReplaceAllString(s, `"secret":"***"`)
+	if len(s) > auditBodyMaxLen {
+		s = s[:auditBodyMaxLen] + "...(truncated)"
+	}
+	return s
 }
 
 func (h *Handler) publishRejection(licenseID, reason string, body []byte) {
