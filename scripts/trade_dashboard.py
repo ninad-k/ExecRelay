@@ -173,6 +173,63 @@ def set_dry_run_mode(payload: dict) -> tuple[int, dict]:
     )
     return 200, {"ok": after == enabled, "dry_run": after}
 
+
+# --- symbol alias map ------------------------------------------------------
+#
+# Operator-managed alias -> broker-symbol table (many aliases per broker
+# symbol, e.g. GOLD and XAUUSD both -> XAUUSD_). Stored in the trade store's
+# meta table; ea_shim re-reads it on every signal, so edits here apply to the
+# next order with no restart. Changing where orders land is a control action,
+# so every accepted edit is written to the control audit log like dry-run.
+
+_SYMBOL_NAME_RE = re.compile(r"^[A-Za-z0-9._#\-]{1,24}$")
+_SYMBOL_NAME_HELP = "must be 1-24 characters: letters, digits, . _ - #"
+
+
+def update_symbol_map(payload: dict) -> tuple[int, dict]:
+    """Upsert ({alias, broker}) or delete ({alias, delete: true}) one entry.
+    Returns (http_status, body); body always carries the resulting map so the
+    UI can re-render without a second request."""
+    alias = str(payload.get("alias") or "").strip().upper()
+    if not _SYMBOL_NAME_RE.match(alias):
+        return 400, {"ok": False, "error": f"alias {_SYMBOL_NAME_HELP}"}
+
+    current = ts.get_symbol_map()
+
+    if payload.get("delete") is True:
+        if alias not in current:
+            return 404, {"ok": False, "error": f"no mapping for {alias}", "map": current}
+        removed = current.pop(alias)
+        ts.set_symbol_map(current)
+        after = ts.get_symbol_map()
+        ok = alias not in after
+        log_txn(
+            CONTROL_TXN_LOG,
+            action="symbol_map_delete",
+            alias=alias,
+            broker=removed,
+            ok=ok,
+        )
+        return 200, {"ok": ok, "map": after}
+
+    broker = str(payload.get("broker") or "").strip()
+    if not _SYMBOL_NAME_RE.match(broker):
+        return 400, {"ok": False, "error": f"broker symbol {_SYMBOL_NAME_HELP}"}
+    before = current.get(alias)
+    current[alias] = broker
+    ts.set_symbol_map(current)
+    after = ts.get_symbol_map()
+    ok = after.get(alias) == broker
+    log_txn(
+        CONTROL_TXN_LOG,
+        action="symbol_map_set",
+        alias=alias,
+        broker=broker,
+        before=before,
+        ok=ok,
+    )
+    return (200 if ok else 500), {"ok": ok, "map": after}
+
 # ---------------------------------------------------------------------------
 # INGRESS_PORT is independently configurable (default 8081, matching
 # local-stack.ps1's $IngressPort) so tests can point it at a local stub
@@ -542,6 +599,7 @@ def _mt5_stats(journal: dict, days: int, source: str | None = None) -> dict:
         open_rows_all.append(
             {
                 "ticket": p.ticket,
+                "opened": datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
                 "symbol": p.symbol,
                 "side": "buy" if p.type == mt5.POSITION_TYPE_BUY else "sell",
                 "volume": p.volume,
@@ -770,21 +828,18 @@ def _cutoff_iso(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
-def _channel_label(channel: str | None) -> str:
-    c = (channel or "").strip()
-    return c if c else "direct"
-
-
 def scorecard(days: int = 30) -> dict:
-    """Per-channel signal->order->closed-trade funnel. The `signals` table
-    this joins against (signals.channel / signals.trace_ids -> orders.trace_id)
-    is no longer populated by anything in this stack, so in practice this
-    reduces to two synthetic rows: "tradingview", covering orders.source=
-    "tradingview", and "other EAs", covering closed_trades.source="other" --
-    together they reconcile the section's totals against the whole account,
-    not just the signal-driven slice. The signals-table join is left in place
-    (harmless against an empty table) rather than special-cased away, so a
-    future signal source can populate it again without code changes here.
+    """Reconciles this stack's own order flow against the whole account: two
+    rows, "tradingview" (orders.source="tradingview") and "other EAs"
+    (closed_trades.source="other").
+
+    The `signals` table this used to join against (signals.channel /
+    signals.trace_ids -> orders.trace_id) predates the TradingView-only stack
+    and is no longer populated by anything here -- its rows are frozen
+    leftovers from the retired Telegram-ingest channels, so they are not
+    surfaced as scorecard rows (they would only ever show stale
+    received/posted counts next to permanently-zero executed/win/loss
+    columns, since nothing can join them to current orders anymore).
 
     Order -> closed-trade join is a heuristic: orders.broker_order_id ==
     closed_trades.position_id, which only resolves once MT5 reports a market
@@ -793,11 +848,9 @@ def scorecard(days: int = 30) -> dict:
     "open/pending" rather than wins/losses.
     """
     cutoff = _cutoff_iso(days)
-    sig_rows = ts.query("SELECT channel, outcome, trace_ids FROM signals WHERE ts >= ?", (cutoff,))
     order_rows = ts.query(
-        "SELECT trace_id, source, status, requested_risk, broker_order_id FROM orders WHERE ts >= ?", (cutoff,)
+        "SELECT source, status, requested_risk, broker_order_id FROM orders WHERE ts >= ?", (cutoff,)
     )
-    orders_by_trace = {r["trace_id"]: r for r in order_rows if r["trace_id"]}
     closed_rows = ts.query("SELECT position_id, profit, source FROM closed_trades WHERE close_ts >= ?", (cutoff,))
     closed_by_pos = {r["position_id"]: r for r in closed_rows}
 
@@ -832,25 +885,6 @@ def scorecard(days: int = 30) -> dict:
         if risk:
             b["r_values"].append(profit / risk)
 
-    for s in sig_rows:
-        b = bucket(_channel_label(s.get("channel")))
-        b["received"] += 1
-        outcome = s.get("outcome")
-        if outcome == "posted":
-            b["posted"] += 1
-        elif outcome == "rejected":
-            b["rejected"] += 1
-        try:
-            trace_ids = json.loads(s.get("trace_ids") or "[]")
-            if not isinstance(trace_ids, list):
-                trace_ids = []
-        except json.JSONDecodeError:
-            trace_ids = []
-        for tid in trace_ids:
-            o = orders_by_trace.get(tid)
-            if o:
-                _apply_order(b, o)
-
     tv = bucket("tradingview")
     for o in order_rows:
         if o.get("source") == "tradingview":
@@ -884,10 +918,7 @@ def scorecard(days: int = 30) -> dict:
                 "avg_r": avg_r,
             }
         )
-    # Real signal channels first (alphabetical), synthetic reconciliation
-    # rows last in a fixed order.
-    _synthetic_order = {"tradingview": 1, "other EAs": 2}
-    rows.sort(key=lambda r: (_synthetic_order.get(r["channel"], 0), r["channel"]))
+    rows.sort(key=lambda r: r["channel"])
     return {
         "days": days,
         "rows": rows,
@@ -1066,7 +1097,11 @@ def calendar_month(month: str, stack_only: bool = True, source: str | None = Non
     if source:
         rows = [r for r in rows if r.get("source") == source]
     elif stack_only:
-        rows = [r for r in rows if r.get("source") != "other"]
+        # Allowlist, not blocklist: a stray/legacy source value (e.g. old
+        # "telegram" rows from before that source was retired) must never be
+        # silently counted as "stack" activity just because it isn't literally
+        # "other".
+        rows = [r for r in rows if r.get("source") == "tradingview"]
 
     daily: dict[str, dict] = {}
     for r in rows:
@@ -1338,9 +1373,9 @@ def pipeline_status() -> dict:
         reasons.append("dry-run is on")
 
     if reasons:
-        verdict, headline = "red", "SIGNALS NOT REACHING MT5"
+        verdict, headline = "red", "Signals are not reaching MT5"
     else:
-        verdict, headline = "green", "SIGNALS REACHING MT5"
+        verdict, headline = "green", "Signals are reaching MT5"
 
     return {
         "verdict": verdict,
@@ -1878,6 +1913,11 @@ h2 .chip { font-size: 0.65rem; letter-spacing: normal; text-transform: none; bor
 table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
 thead { background: var(--color-surface-2); }
 th { text-align: left; padding: 0.5rem 0.75rem; color: var(--color-text-muted); font-weight: 500; font-size: 0.72rem; white-space: nowrap; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--color-primary); }
+th.sortable::after { content: "\2195"; display: inline-block; margin-left: 0.35rem; opacity: 0.35; font-size: 0.9em; }
+th.sortable.sort-asc::after { content: "\2191"; opacity: 1; color: var(--color-primary); }
+th.sortable.sort-desc::after { content: "\2193"; opacity: 1; color: var(--color-primary); }
 td { padding: 0.45rem 0.75rem; border-top: 1px solid var(--color-border); white-space: nowrap; }
 tfoot td { border-top: 1px solid var(--color-border-light); font-weight: 600; }
 .pos { color: var(--color-profit); } .neg { color: var(--color-loss); } .warn { color: var(--color-warning); }
@@ -1947,18 +1987,50 @@ button.jbtn:hover { background: var(--color-primary-glow); }
 .cal-cell .d { color: var(--color-text-muted); font-size: 0.68rem; }
 .cal-cell .amt { font-weight: 600; margin-top: 0.15rem; }
 
-.pipeline-banner { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; padding: 0.75rem 1.5rem; border-bottom: 1px solid var(--color-border); background: color-mix(in srgb, var(--color-surface) 92%, transparent); }
-.pipeline-pill { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 0.85rem; letter-spacing: 0.02em; padding: 0.5rem 1.15rem; border-radius: 999px; white-space: nowrap; }
-.pipeline-pill.green { background: var(--color-profit-dim); color: var(--color-profit); border: 1px solid color-mix(in srgb, var(--color-profit) 40%, transparent); }
-.pipeline-pill.amber { background: rgb(255 181 46 / 0.16); color: var(--color-warning); border: 1px solid color-mix(in srgb, var(--color-warning) 45%, transparent); }
+.pipeline-banner {
+  display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap;
+  padding: 0.85rem 1.5rem; border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+}
+.pipeline-headline { display: flex; flex-direction: column; gap: 0.15rem; }
+.pipeline-pill { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 0.92rem; padding: 0.45rem 1.1rem; border-radius: 999px; white-space: nowrap; width: fit-content; }
+.pipeline-pill.green { background: var(--color-profit-dim); color: var(--color-profit); border: 1px solid color-mix(in srgb, var(--color-profit) 40%, transparent); animation: pipeline-pulse-green 3s ease-in-out infinite; }
+.pipeline-pill.amber { background: rgb(255 181 46 / 0.16); color: var(--color-warning); border: 1px solid color-mix(in srgb, var(--color-warning) 45%, transparent); animation: pipeline-pulse-amber 1.4s ease-in-out infinite; }
 .pipeline-pill.red { background: var(--color-loss-dim); color: var(--color-loss); border: 1px solid color-mix(in srgb, var(--color-loss) 55%, transparent); animation: pipeline-pulse-red 2s ease-in-out infinite; }
 @keyframes pipeline-pulse-red { 0%, 100% { box-shadow: 0 0 8px color-mix(in srgb, var(--color-loss) 25%, transparent); } 50% { box-shadow: 0 0 22px color-mix(in srgb, var(--color-loss) 60%, transparent); } }
-.pipeline-chips { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.pipeline-chip { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.72rem; padding: 0.28rem 0.7rem; border-radius: 999px; border: 1px solid var(--color-border-light); }
-.pipeline-chip .dot { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: currentColor; flex-shrink: 0; }
-.pipeline-chip.ok { color: var(--color-profit); }
-.pipeline-chip.warn { color: var(--color-warning); }
-.pipeline-chip.down { color: var(--color-loss); }
+@keyframes pipeline-pulse-amber { 0%, 100% { box-shadow: 0 0 8px color-mix(in srgb, var(--color-warning) 25%, transparent); } 50% { box-shadow: 0 0 20px color-mix(in srgb, var(--color-warning) 55%, transparent); } }
+@keyframes pipeline-pulse-green { 0%, 100% { box-shadow: 0 0 5px color-mix(in srgb, var(--color-profit) 15%, transparent); } 50% { box-shadow: 0 0 14px color-mix(in srgb, var(--color-profit) 35%, transparent); } }
+.pipeline-subtext { font-size: 0.74rem; color: var(--color-text-muted); padding-left: 0.3rem; }
+.pipeline-chips { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+.pipeline-chip {
+  display: flex; flex-direction: column; gap: 0.1rem; font-size: 0.78rem;
+  padding: 0.4rem 0.85rem; border-radius: var(--radius); border: 1px solid var(--color-border-light);
+  background: color-mix(in srgb, var(--color-surface-2) 55%, transparent);
+}
+.pipeline-chip .chip-name { display: inline-flex; align-items: center; gap: 0.42rem; font-weight: 600; color: var(--color-text); white-space: nowrap; }
+.pipeline-chip .chip-detail { font-size: 0.68rem; color: var(--color-text-muted); white-space: nowrap; padding-left: 0.9rem; }
+.pipeline-chip .dot { position: relative; width: 0.5rem; height: 0.5rem; border-radius: 999px; background: currentColor; flex-shrink: 0; }
+.pipeline-chip.ok .chip-name { color: var(--color-profit); }
+.pipeline-chip.warn .chip-name { color: var(--color-warning); }
+.pipeline-chip.down .chip-name { color: var(--color-loss); }
+.pipeline-chip.down { border-color: color-mix(in srgb, var(--color-loss) 45%, var(--color-border-light)); }
+/* "Live" ping: a radiating ring on healthy chips, the visual cue that data
+   is actively flowing through this stage right now (not just "last known
+   good"). Warn chips get a slower, dimmer version; down chips get none --
+   the pill's own red pulse above already carries the alarm. */
+.pipeline-chip.ok .dot::after, .pipeline-chip.warn .dot::after {
+  content: ""; position: absolute; inset: 0; border-radius: 999px; background: currentColor;
+  animation: chip-ping 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.pipeline-chip.warn .dot::after { animation-duration: 2.6s; opacity: 0.6; }
+@keyframes chip-ping { 0% { transform: scale(1); opacity: 0.55; } 75%, 100% { transform: scale(2.6); opacity: 0; } }
+/* Connector between chips -- makes the row read as a left-to-right flow
+   (signal source -> ... -> broker) rather than an unordered set of badges. */
+.pipeline-flow-arrow { color: var(--color-text-muted); font-size: 0.85rem; opacity: 0.6; flex-shrink: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-pill.green, .pipeline-pill.amber, .pipeline-pill.red,
+  .pipeline-chip.ok .dot::after, .pipeline-chip.warn .dot::after { animation: none; }
+}
 .dryrun-control { display: inline-flex; align-items: center; gap: 0.55rem; margin-left: auto; padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--color-border-light); background: var(--color-surface-2); }
 .dryrun-control[hidden] { display: none; }
 .dryrun-control .dryrun-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); }
@@ -1988,6 +2060,26 @@ main[data-page="actioned"] > *:not(#page-actioned) { display: none !important; }
 .toggle-switch input:checked + .toggle-slider { background: var(--color-profit); }
 .toggle-switch input:checked + .toggle-slider:before { transform: translateX(0.95rem); }
 .toggle-switch input:disabled + .toggle-slider { opacity: 0.5; cursor: default; }
+
+.admin-tools {
+  margin: 2.5rem 0 1rem; border: 1px dashed var(--color-border-light); border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--color-surface-2) 45%, transparent), transparent);
+  padding: 0 1.25rem;
+}
+.admin-tools summary {
+  cursor: pointer; padding: 0.9rem 0; font-size: 0.82rem; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-dim);
+  list-style: none; display: flex; align-items: center; gap: 0.5rem;
+}
+.admin-tools summary::-webkit-details-marker { display: none; }
+.admin-tools summary::before {
+  content: "\25B8"; display: inline-block; color: var(--color-text-muted); transition: transform .15s;
+}
+.admin-tools[open] summary::before { transform: rotate(90deg); }
+.admin-tools summary:hover { color: var(--color-primary); }
+.admin-tools[open] { padding-bottom: 1.25rem; }
+.admin-tools h2 { margin-top: 1.5rem; }
+.admin-tools section:first-of-type h2 { margin-top: 0; }
 
 .addchannel-form { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end; margin-bottom: 1rem; }
 .addchannel-form > div { display: flex; flex-direction: column; }
@@ -2030,8 +2122,8 @@ button.actbtn:hover { background: var(--color-primary-glow); }
   <div class="ctrl-group">
     <span class="ctrl-label">Source</span>
     <select id="source-filter" class="seg-select">
+      <option value="tradingview" selected>TradingView</option>
       <option value="">All sources</option>
-      <option value="tradingview">TradingView</option>
       <option value="other">Other EAs</option>
     </select>
   </div>
@@ -2047,7 +2139,10 @@ button.actbtn:hover { background: var(--color-primary-glow); }
 </div>
 </div>
 <div class="pipeline-banner">
-  <div class="pipeline-pill" id="pipeline-pill">checking pipeline…</div>
+  <div class="pipeline-headline">
+    <div class="pipeline-pill" id="pipeline-pill">Checking pipeline…</div>
+    <div class="pipeline-subtext" id="pipeline-subtext"></div>
+  </div>
   <div class="pipeline-chips" id="pipeline-chips"></div>
   <div class="dryrun-control" id="dryrun-control" hidden>
     <span class="dryrun-label">Dry run</span>
@@ -2063,58 +2158,26 @@ button.actbtn:hover { background: var(--color-primary-glow); }
 <main data-page="overview">
   <div class="cards" id="cards"></div>
 
-  <section id="section-webhook-test">
-    <h2>Send a sample TradingView signal</h2>
+  <section id="section-symbol-map">
+    <h2>Symbol mapping <span class="chip" id="chip-symbol-map"></span></h2>
     <p class="muted" style="font-size:0.76rem;margin:0 0 .5rem">
-      Builds a webhook body in the exact format the TradingView strategy sends and posts it to
-      the real ingress endpoint — the same path a live TradingView alert takes. This can place a
-      real order; nothing is sent until you confirm, and it's refused outright while dry-run is on.
+      Renames incoming signal symbols to your broker's instrument names before execution — several
+      aliases may point at the same broker symbol (e.g. GOLD and XAUUSD both &#8594; XAUUSD_).
+      Applied by the execution shim to every signal source; changes take effect on the next signal,
+      no restart needed. Unmapped symbols still fall back to automatic suffix guessing (_, ., m).
     </p>
-    <form class="addchannel-form" id="webhook-test-form" onsubmit="return false">
+    <div class="tablewrap" style="max-width:34rem;margin-bottom:.5rem"><table id="tbl-symbol-map"></table></div>
+    <form class="addchannel-form" id="symbol-map-form" onsubmit="return false">
       <div>
-        <label>Command</label>
-        <select id="wt-command">
-          <option value="BUY">Buy</option>
-          <option value="SELL">Sell</option>
-          <option value="CLOSELONG">Close long</option>
-          <option value="CLOSESHORT">Close short</option>
-        </select>
+        <label>Alias (as sent by signal)</label>
+        <input type="text" id="sm-alias" placeholder="e.g. GOLD" style="min-width:8rem">
       </div>
       <div>
-        <label>Symbol</label>
-        <input type="text" id="wt-symbol" value="XAUUSD" style="min-width:8rem">
+        <label>Broker symbol (MT5)</label>
+        <input type="text" id="sm-broker" placeholder="e.g. XAUUSD_" style="min-width:8rem">
       </div>
-      <div id="wt-open-fields" style="display:contents">
-        <div>
-          <label>Volume (lots)</label>
-          <input type="text" id="wt-vol-lots" value="0.01" style="min-width:6rem">
-        </div>
-        <div>
-          <label>Risk sizing</label>
-          <select id="wt-risk-mode">
-            <option value="bypass">Exact lots (risk=0)</option>
-            <option value="stack">Stack $-risk sizing</option>
-            <option value="custom">Custom $ risk</option>
-          </select>
-        </div>
-        <div id="wt-risk-custom-field" style="display:none">
-          <label>Risk ($)</label>
-          <input type="text" id="wt-risk" value="25" style="min-width:6rem">
-        </div>
-        <div>
-          <label>Stop loss (price)</label>
-          <input type="text" id="wt-sl" placeholder="e.g. 4398" style="min-width:8rem">
-        </div>
-        <div>
-          <label>Take profit (price)</label>
-          <input type="text" id="wt-tp" placeholder="e.g. 4368" style="min-width:8rem">
-        </div>
-      </div>
-      <div>
-        <label>Comment</label>
-        <input type="text" id="wt-comment" value="webhook-test" style="min-width:8rem">
-      </div>
-      <button class="btn-primary" type="button" id="webhook-test-preview-btn">Preview</button>
+      <button class="btn-primary" type="button" id="symbol-map-add-btn">Add / update</button>
+      <span class="muted" id="sm-msg" style="font-size:0.76rem;align-self:center"></span>
     </form>
   </section>
 
@@ -2136,10 +2199,6 @@ button.actbtn:hover { background: var(--color-primary-glow); }
           <button type="button" class="navbtn" id="cal-prev">&#8592;</button>
           <span class="cal-label" id="cal-label">—</span>
           <button type="button" class="navbtn" id="cal-next">&#8594;</button>
-        </span>
-        <span class="seg" id="seg-cal-source">
-          <button type="button" data-source="stack" class="active">Stack only</button>
-          <button type="button" data-source="all">All sources</button>
         </span>
       </h2>
       <div id="cal-grid" class="cal-grid"></div>
@@ -2175,6 +2234,65 @@ button.actbtn:hover { background: var(--color-primary-glow); }
   </h2>
   <div class="review-strip" id="review-strip" style="display:none"></div>
   <div class="tablewrap"><table id="tbl-closed"></table></div>
+
+  <details class="admin-tools">
+    <summary>Admin &amp; testing tools</summary>
+
+    <section id="section-webhook-test">
+      <h2>Send a sample TradingView signal</h2>
+      <p class="muted" style="font-size:0.76rem;margin:0 0 .5rem">
+        Builds a webhook body in the exact format the TradingView strategy sends and posts it to
+        the real ingress endpoint — the same path a live TradingView alert takes. This can place a
+        real order; nothing is sent until you confirm, and it's refused outright while dry-run is on.
+      </p>
+      <form class="addchannel-form" id="webhook-test-form" onsubmit="return false">
+        <div>
+          <label>Command</label>
+          <select id="wt-command">
+            <option value="BUY">Buy</option>
+            <option value="SELL">Sell</option>
+            <option value="CLOSELONG">Close long</option>
+            <option value="CLOSESHORT">Close short</option>
+          </select>
+        </div>
+        <div>
+          <label>Symbol</label>
+          <input type="text" id="wt-symbol" value="XAUUSD" style="min-width:8rem">
+        </div>
+        <div id="wt-open-fields" style="display:contents">
+          <div>
+            <label>Volume (lots)</label>
+            <input type="text" id="wt-vol-lots" value="0.01" style="min-width:6rem">
+          </div>
+          <div>
+            <label>Risk sizing</label>
+            <select id="wt-risk-mode">
+              <option value="bypass">Exact lots (risk=0)</option>
+              <option value="stack">Stack $-risk sizing</option>
+              <option value="custom">Custom $ risk</option>
+            </select>
+          </div>
+          <div id="wt-risk-custom-field" style="display:none">
+            <label>Risk ($)</label>
+            <input type="text" id="wt-risk" value="25" style="min-width:6rem">
+          </div>
+          <div>
+            <label>Stop loss (price)</label>
+            <input type="text" id="wt-sl" placeholder="e.g. 4398" style="min-width:8rem">
+          </div>
+          <div>
+            <label>Take profit (price)</label>
+            <input type="text" id="wt-tp" placeholder="e.g. 4368" style="min-width:8rem">
+          </div>
+        </div>
+        <div>
+          <label>Comment</label>
+          <input type="text" id="wt-comment" value="webhook-test" style="min-width:8rem">
+        </div>
+        <button class="btn-primary" type="button" id="webhook-test-preview-btn">Preview</button>
+      </form>
+    </section>
+  </details>
 
   <div id="meta"></div>
   <section class="ledger-page" id="page-ignored">
@@ -2249,12 +2367,14 @@ const srcBadge = s => s === "tradingview" ? '<span class="badge tv">TradingView<
 const sideBadge = s => s === "close" ? '<span class="badge neutral">CLOSE</span>'
   : `<span class="badge ${s}">${s.toUpperCase()}</span>`;
 const sourceLabel = s => s === "tradingview" ? "TradingView" : s === "other" ? "Other EAs" : "All sources";
-let lastSummary = null, ratingVal = 0, currentDays = 7, currentSource = "";
+let lastSummary = null, ratingVal = 0, currentDays = 7, currentSource = "tradingview";
 
 // --- global filter state: persisted to localStorage + the URL hash so a
 // reload (or a shared link) keeps the same days/source selection. -------
 const STATE_DAYS_KEY = "execrelay-dashboard-days";
-const STATE_SOURCE_KEY = "execrelay-dashboard-source";
+// v2: default flipped from "" (All sources) to "tradingview" -- a new key
+// so a value auto-persisted under the old default doesn't mask the new one.
+const STATE_SOURCE_KEY = "execrelay-dashboard-source-v2";
 const VALID_DAYS = [7, 30, 90];
 const VALID_SOURCES = ["", "tradingview", "other"];
 
@@ -2272,7 +2392,10 @@ function loadState() {
     try { const v = localStorage.getItem(STATE_SOURCE_KEY); if (VALID_SOURCES.includes(v)) source = v; } catch (e) {}
   }
   currentDays = VALID_DAYS.includes(days) ? days : 7;
-  currentSource = VALID_SOURCES.includes(source) ? source : "";
+  // Default (no stored preference / no shared-link hash yet): TradingView
+  // only. An explicit prior choice -- including "" (All sources) -- is
+  // still honored, so this only affects a genuinely first-ever visit.
+  currentSource = VALID_SOURCES.includes(source) ? source : "tradingview";
 }
 function persistState() {
   try {
@@ -2308,6 +2431,80 @@ function table(id, header, rows, footer) {
   $(id).innerHTML = "<thead><tr>" + header.map(h => `<th>${h}</th>`).join("") + "</tr></thead><tbody>" +
     (rows.length ? rows.join("") : `<tr><td colspan="${header.length}" class="muted">none yet</td></tr>`) + "</tbody>" +
     (footer ? "<tfoot>" + footer + "</tfoot>" : "");
+}
+
+// --- generic click-to-sort tables ------------------------------------------
+// Every table on the page is built fresh from scratch on each refresh (the
+// table() helper above replaces the whole <thead>/<tbody>), which would
+// normally wipe out any header click handlers and reset the sort a viewer
+// picked -- makeSortable() re-attaches the handlers and re-applies whatever
+// this table was last sorted by every time it's called, so a chosen sort
+// survives the 10s auto-refresh and filter changes instead of snapping back.
+//
+// A cell's sort key is its `data-sort` attribute when present (needed for
+// anything whose displayed text isn't itself sortable: money formatting
+// with a unicode minus, or a date column truncated to "MM-DD HH:MM:SS" for
+// display while the real comparison needs the full timestamp) -- otherwise
+// the cell's own text, numeric if it looks like a bare number.
+const sortState = {}; // tableId -> {col, dir: "asc"|"desc"}
+
+function sortValueOf(td) {
+  if (!td) return "";
+  if (td.dataset.sort !== undefined) {
+    const raw = td.dataset.sort;
+    const n = parseFloat(raw);
+    return raw !== "" && !isNaN(n) ? n : raw.toLowerCase();
+  }
+  const txt = td.textContent.trim();
+  const n = parseFloat(txt);
+  return txt !== "" && !isNaN(n) && /^-?[\\d.]+$/.test(txt) ? n : txt.toLowerCase();
+}
+
+function sortTableRows(tableId, col, dir) {
+  const t = document.getElementById(tableId);
+  if (!t) return;
+  const tbody = t.querySelector("tbody");
+  if (!tbody) return;
+  const rows = [...tbody.querySelectorAll("tr")];
+  if (!rows.length || rows[0].querySelector("td[colspan]")) return; // "none yet" placeholder
+  const mult = dir === "asc" ? 1 : -1;
+  rows.sort((a, b) => {
+    const av = sortValueOf(a.children[col]), bv = sortValueOf(b.children[col]);
+    if (av < bv) return -mult;
+    if (av > bv) return mult;
+    return 0;
+  });
+  rows.forEach(r => tbody.appendChild(r));
+  t.querySelectorAll("thead th").forEach((th, i) => {
+    th.classList.remove("sort-asc", "sort-desc");
+    if (i === col) th.classList.add("sort-" + dir);
+  });
+}
+
+// defaultCol/defaultDir: the sort applied the very first time this table is
+// ever rendered (before a viewer has clicked anything) -- pass the date
+// column descending so the newest entry shows first, per the dashboard's
+// convention. dateCol (defaults to defaultCol): clicking that specific
+// column fresh (it wasn't already the active sort) starts descending, since
+// "most recent first" is what a first click on a date column should do;
+// every other column starts ascending on a fresh click, then toggles.
+function makeSortable(tableId, defaultCol, defaultDir, dateCol) {
+  if (dateCol === undefined) dateCol = defaultCol;
+  const t = document.getElementById(tableId);
+  if (!t) return;
+  t.querySelectorAll("thead th").forEach((th, i) => {
+    if (th.dataset.nosort !== undefined || !th.textContent.trim()) return;
+    th.classList.add("sortable");
+    th.onclick = () => {
+      const cur = sortState[tableId];
+      const dir = cur && cur.col === i ? (cur.dir === "asc" ? "desc" : "asc") : (i === dateCol ? "desc" : "asc");
+      sortState[tableId] = { col: i, dir };
+      sortTableRows(tableId, i, dir);
+    };
+  });
+  const state = sortState[tableId] || { col: defaultCol, dir: defaultDir };
+  sortState[tableId] = state;
+  sortTableRows(tableId, state.col, state.dir);
 }
 
 async function refresh() {
@@ -2346,13 +2543,14 @@ async function refreshIgnored() {
   $("ignored-note").innerHTML = d.note ? `<div class="muted" style="font-size:0.76rem">${esc(d.note)}</div>` : "";
   $("ignored-empty").textContent = rows.length ? "" : "Nothing was ignored in this window.";
   table("tbl-ignored", ["When", "Source", "From", "Why it was ignored", "Symbol", "Message"], rows.map(r => `<tr>
-    <td class="muted number">${ledgerTime(r.ts)}</td>
-    <td>${sourceBadge(r.source)}</td>
+    <td class="muted number" data-sort="${esc(r.ts || "")}">${ledgerTime(r.ts)}</td>
+    <td data-sort="${esc(r.source || "")}">${sourceBadge(r.source)}</td>
     <td>${esc(r.origin || "—")}</td>
     <td class="ledger-reason">${esc(r.reason || "")}</td>
     <td>${esc(r.symbol || "—")}</td>
     <td class="ledger-text">${esc(r.text || "")}</td>
   </tr>`));
+  makeSortable("tbl-ignored", 0, "desc");
 }
 
 async function refreshActioned() {
@@ -2364,8 +2562,8 @@ async function refreshActioned() {
   $("actioned-empty").textContent = rows.length ? "" : "Nothing has been sent to the broker in this window.";
   const num = v => (v === null || v === undefined || v === "") ? "—" : esc(String(v));
   table("tbl-actioned", ["When", "Source", "From", "Action", "Symbol", "Lots", "Entry", "SL", "TP", "Status", "Broker ID", "Tag"], rows.map(r => `<tr>
-    <td class="muted number">${ledgerTime(r.ts)}</td>
-    <td>${sourceBadge(r.source)}</td>
+    <td class="muted number" data-sort="${esc(r.ts || "")}">${ledgerTime(r.ts)}</td>
+    <td data-sort="${esc(r.source || "")}">${sourceBadge(r.source)}</td>
     <td>${esc(r.channel || "—")}</td>
     <td>${esc(r.action || "")}</td>
     <td>${esc(r.symbol || "—")}</td>
@@ -2377,6 +2575,7 @@ async function refreshActioned() {
     <td class="muted number">${esc(r.broker_order_id || "—")}</td>
     <td class="muted">${esc(r.origin || "—")}</td>
   </tr>`));
+  makeSortable("tbl-actioned", 0, "desc");
 }
 
 async function refreshLedger() {
@@ -2394,14 +2593,42 @@ document.getElementById("page-tabs").addEventListener("click", (e) => {
 });
 
 // --- pipeline status banner --------------------------------------------
+// Plain-language layer over the API's stable internal names (ingress/bridge/
+// ea-shim/mt5) -- a first-time viewer should understand this row without
+// hovering anything. "dry-run" is deliberately left out of the chip row: the
+// dedicated toggle right next to the pill already covers it, so a second
+// passive chip saying the same thing would just be duplicate noise.
+
+// `ok` present -> shown verbatim when healthy. `ok` absent -> falls back to
+// the backend's own detail text (e.g. ea-shim's heartbeat age, which is
+// already specific). `ok: ""` -> suppressed entirely (mt5's badge already
+// says everything the detail line would repeat).
+const PIPELINE_LABELS = {
+  "ingress":  { name: "Signal Gateway",  ok: "Receiving TradingView alerts" },
+  "bridge":   { name: "Order Relay",     ok: "Routing signals to your broker" },
+  "ea-shim":  { name: "Trade Executor" },
+  "mt5":      { name: "Broker Connection", ok: "" },
+};
+const PIPELINE_REASONS = {
+  "ingress down": "the signal gateway is offline",
+  "bridge down": "the order relay is offline",
+  "ea-shim down": "the trade executor is offline",
+  "mt5 down": "the broker connection is down",
+  "dry-run is on": "dry-run mode is on",
+};
 
 function pipelineChip(c) {
   const stateCls = c.state === "ok" ? "ok" : (c.state === "warn" ? "warn" : "down");
+  const label = PIPELINE_LABELS[c.name] || { name: c.name };
   let extra = "";
   if (c.name === "mt5" && c.account) {
     extra = ` <span class="badge ${c.demo ? "demo" : "live"}">${c.demo ? "DEMO" : "LIVE"}</span> #${esc(c.account)}`;
   }
-  return `<span class="pipeline-chip ${stateCls}" title="${esc(c.detail || "")}"><span class="dot"></span>${esc(c.name)}${extra}</span>`;
+  const detailText = c.state === "ok" ? ("ok" in label ? label.ok : c.detail) : c.detail;
+  return `<span class="pipeline-chip ${stateCls}">
+    <span class="chip-name"><span class="dot"></span>${esc(label.name)}${extra}</span>
+    ${detailText ? `<span class="chip-detail">${esc(detailText)}</span>` : ""}
+  </span>`;
 }
 
 async function refreshPipeline() {
@@ -2411,8 +2638,15 @@ async function refreshPipeline() {
     const p = await res.json();
     const pill = $("pipeline-pill");
     pill.className = "pipeline-pill " + p.verdict;
-    pill.textContent = p.headline + (p.reasons && p.reasons.length ? " — " + p.reasons.join("; ") : "");
-    $("pipeline-chips").innerHTML = p.components.map(pipelineChip).join("");
+    pill.textContent = p.headline;
+    const reasons = (p.reasons || []).map(r => PIPELINE_REASONS[r] || r);
+    $("pipeline-subtext").textContent = reasons.length
+      ? "Trading is paused right now — " + reasons.join(", ") + "."
+      : "Your TradingView alerts are flowing through to MetaTrader 5 in real time.";
+    const chips = (p.components || []).filter(c => c.name !== "dry-run");
+    $("pipeline-chips").innerHTML = chips.map(pipelineChip).join(
+      '<span class="pipeline-flow-arrow">&#8594;</span>'
+    );
     renderDryRun(p.components.find(c => c.name === "dry-run"));
     const mt5 = p.components.find(c => c.name === "mt5");
     $("dryrun-acct").textContent = (mt5 && mt5.account)
@@ -2550,6 +2784,50 @@ document.addEventListener("click", (e) => {
   const rcancel = e.target.closest("#resubmit-cancel");
   if (rcancel) { $("resubmit-scrim").style.display = "none"; pendingResubmit = null; return; }
 });
+
+// --- symbol mapping panel ------------------------------------------------
+
+function renderSymbolMap(m) {
+  const aliases = Object.keys(m).sort();
+  $("chip-symbol-map").textContent = aliases.length ? `${aliases.length} alias${aliases.length === 1 ? "" : "es"}` : "none yet";
+  table("tbl-symbol-map", ["Alias", "Broker symbol", ""], aliases.map(a => `<tr>
+    <td>${esc(a)}</td>
+    <td class="number">${esc(m[a])}</td>
+    <td style="text-align:right"><button type="button" class="btn-ghost sm-del" data-alias="${esc(a)}">Remove</button></td>
+  </tr>`));
+  makeSortable("tbl-symbol-map", 0, "asc");
+}
+
+async function refreshSymbolMap() {
+  try {
+    const res = await fetch(withToken("/api/symbol-map"), { headers: authHeaders() });
+    if (!res.ok) return;
+    renderSymbolMap((await res.json()).map || {});
+  } catch (e) {}
+}
+
+async function postSymbolMap(body) {
+  $("sm-msg").textContent = "";
+  try {
+    const res = await fetch(withToken("/api/symbol-map"), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body),
+    });
+    const d = await res.json();
+    $("sm-msg").textContent = d.ok ? "saved" : (d.error || ("HTTP " + res.status));
+    if (d.map) renderSymbolMap(d.map);
+    if (d.ok && !body.delete) { $("sm-alias").value = ""; $("sm-broker").value = ""; }
+  } catch (e) {
+    $("sm-msg").textContent = "request failed: " + e;
+  }
+}
+
+$("symbol-map-add-btn").addEventListener("click", () =>
+  postSymbolMap({ alias: $("sm-alias").value, broker: $("sm-broker").value }));
+$("tbl-symbol-map").addEventListener("click", (e) => {
+  const del = e.target.closest("button.sm-del");
+  if (del) postSymbolMap({ alias: del.dataset.alias, delete: true });
+});
+refreshSymbolMap();
 $("resubmit-confirm").addEventListener("click", confirmResubmit);
 $("resubmit-scrim").addEventListener("click", e => { if (e.target.id === "resubmit-scrim") { $("resubmit-scrim").style.display = "none"; pendingResubmit = null; } });
 
@@ -2589,20 +2867,23 @@ async function refreshSummary() {
   $("chip-srcpl").textContent = `${currentDays}d window`;
 
   table("tbl-orders", ["time (UTC)","source","command","symbol","size","SL","TP","status"], s.orders.recent.map(r =>
-    `<tr><td class="muted number">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${srcBadge(r.source)}</td>
-     <td>${sideBadge(_sideOf(r.command))} <span class="muted">${esc(r.command)}</span></td><td>${esc(r.symbol)}</td>
+    `<tr><td class="muted number" data-sort="${esc(r.ts||"")}">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td data-sort="${esc(r.source||"")}">${srcBadge(r.source)}</td>
+     <td data-sort="${esc(r.command||"")}">${sideBadge(_sideOf(r.command))} <span class="muted">${esc(r.command)}</span></td><td>${esc(r.symbol)}</td>
      <td class="number">${r.risk ? "risk $"+esc(r.risk) : esc(r.volume)}</td>
      <td class="number">${esc(r.sl)}</td><td class="number">${esc(r.tp)}</td>
-     <td><span class="badge ${r.status==="rejected"?"bad":"ok"}">${esc(r.status)}</span>${r.error?` <span class="neg" title="${esc(r.error)}">!</span>`:""}</td></tr>`));
+     <td data-sort="${esc(r.status||"")}"><span class="badge ${r.status==="rejected"?"bad":"ok"}">${esc(r.status)}</span>${r.error?` <span class="neg" title="${esc(r.error)}">!</span>`:""}</td></tr>`));
+  makeSortable("tbl-orders", 0, "desc");
 
   const openRows = s.mt5.open || [];
   const floatTotal = s.mt5.available ? (s.mt5.open_floating || 0) : 0;
   $("chip-open").textContent = `${openRows.length} open`;
-  table("tbl-open", ["ticket","source","symbol","side","lot","entry","SL","TP","floating P/L"], openRows.map(p =>
-    `<tr><td class="muted number">${p.ticket}</td><td>${srcBadge(p.source)}</td><td>${esc(p.symbol)}</td><td>${sideBadge(p.side)}</td>
+  table("tbl-open", ["opened","ticket","source","symbol","side","lot","entry","SL","TP","floating P/L"], openRows.map(p =>
+    `<tr><td class="muted number" data-sort="${esc(p.opened||"")}">${esc((p.opened||"").slice(5,19).replace("T"," "))}</td>
+     <td class="muted number">${p.ticket}</td><td data-sort="${esc(p.source||"")}">${srcBadge(p.source)}</td><td>${esc(p.symbol)}</td><td data-sort="${esc(p.side||"")}">${sideBadge(p.side)}</td>
      <td class="number">${p.volume}</td><td class="number">${p.entry}</td><td class="number">${p.sl}</td><td class="number">${p.tp}</td>
-     <td class="number ${cls(p.profit)}">${money(p.profit)}</td></tr>`),
-    openRows.length ? `<tr><td colspan="8" class="muted">Total floating</td><td class="number ${cls(floatTotal)}">${money(floatTotal)}</td></tr>` : "");
+     <td class="number ${cls(p.profit)}" data-sort="${p.profit}">${money(p.profit)}</td></tr>`),
+    openRows.length ? `<tr><td colspan="9" class="muted">Total floating</td><td class="number ${cls(floatTotal)}">${money(floatTotal)}</td></tr>` : "");
+  makeSortable("tbl-open", 0, "desc");
 
   const bySrc = c.by_source || {};
   $("srcpl").innerHTML =
@@ -2630,15 +2911,16 @@ async function refreshSummary() {
   const closedHeader = [`closed (${timeLabel})`,"source","symbol","side","lot","entry","close","P/L","setup","emotion","rating","",""];
   table("tbl-closed", closedHeader, c.rows.map(r => {
     const j = r.journal || {};
-    return `<tr><td class="muted number">${esc((r.time||"").slice(5,19).replace("T"," "))}</td><td>${srcBadge(r.source)}</td>
-     <td>${esc(r.symbol)}</td><td>${sideBadge(r.side)}</td><td class="number">${r.volume}</td>
+    return `<tr><td class="muted number" data-sort="${esc(r.time||"")}">${esc((r.time||"").slice(5,19).replace("T"," "))}</td><td data-sort="${esc(r.source||"")}">${srcBadge(r.source)}</td>
+     <td>${esc(r.symbol)}</td><td data-sort="${esc(r.side||"")}">${sideBadge(r.side)}</td><td class="number">${r.volume}</td>
      <td class="number">${r.entry ?? ""}</td><td class="number">${r.close}</td>
-     <td class="number ${cls(r.profit)}">${money(r.profit)}</td>
+     <td class="number ${cls(r.profit)}" data-sort="${r.profit}">${money(r.profit)}</td>
      <td>${esc(j.setup||"")}</td><td class="muted">${esc(j.emotion||"")}</td>
      <td class="stars">${j.rating ? "\u2605".repeat(j.rating) : ""}</td>
      <td>${j.reviewed ? '<span class="badge ok">reviewed</span>' : ""}</td>
      <td><button class="jbtn" type="button" data-ticket="${esc(r.ticket)}">Journal</button></td></tr>`;
   }));
+  makeSortable("tbl-closed", 0, "desc");
 
   $("export-trades").href = withToken("/api/export/trades.csv?days=" + currentDays + sourceQS());
   $("export-journal").href = withToken("/api/export/journal.csv");
@@ -2656,8 +2938,9 @@ function renderScorecard(sc) {
        <td class="number">${r.rejected}</td><td class="number">${r.orders_executed}</td>
        <td class="number muted">${r.orders_open_pending}</td>
        <td class="number pos">${r.wins}</td><td class="number neg">${r.losses}</td>
-       <td class="number ${cls(r.net_pl)}">${money(r.net_pl)}</td>
+       <td class="number ${cls(r.net_pl)}" data-sort="${r.net_pl}">${money(r.net_pl)}</td>
        <td class="number">${(r.avg_r === null || r.avg_r === undefined) ? "—" : r.avg_r.toFixed(2)}</td></tr>`));
+  makeSortable("tbl-scorecard", 0, "asc");
 }
 
 async function refreshScorecard() {
@@ -2697,8 +2980,9 @@ function renderRisk(risk) {
 
   const rej = (comp.risk_cap_rejections || {}).rows || [];
   table("tbl-risk-rejections", ["time (UTC)","symbol","trace id","rejection reason"], rej.map(r =>
-    `<tr><td class="muted number">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${esc(r.symbol)}</td>
+    `<tr><td class="muted number" data-sort="${esc(r.ts||"")}">${esc((r.ts||"").slice(5,19).replace("T"," "))}</td><td>${esc(r.symbol)}</td>
      <td class="muted">${esc((r.trace_id||"").slice(0,10))}…</td><td class="neg">${esc(r.error)}</td></tr>`));
+  makeSortable("tbl-risk-rejections", 0, "desc");
 }
 
 function renderEquityCurve(points, estimated) {
@@ -2853,10 +3137,13 @@ function renderDonutBuySell(buys, sells) {
   );
 }
 
-let calMonth = null, calStackOnly = true, lastCalendar = null;
+let calMonth = null, lastCalendar = null;
 
+// stack_only is fixed off: the global Source selector (currentSource /
+// sourceQS()) is the single filter for the whole page, calendar included --
+// no separate per-section toggle to fall out of sync with it.
 function calQuery() {
-  return "?stack_only=" + (calStackOnly ? "1" : "0") + (calMonth ? "&month=" + encodeURIComponent(calMonth) : "") + sourceQS();
+  return "?stack_only=0" + (calMonth ? "&month=" + encodeURIComponent(calMonth) : "") + sourceQS();
 }
 
 async function refreshCalendar() {
@@ -2977,12 +3264,6 @@ document.addEventListener("click", e => {
   if (calPrev) { calMonth = lastCalendar ? lastCalendar.prev : null; refreshCalendar(); return; }
   const calNext = e.target.closest("#cal-next");
   if (calNext) { calMonth = lastCalendar ? lastCalendar.next : null; refreshCalendar(); return; }
-  const calSrcBtn = e.target.closest("#seg-cal-source button");
-  if (calSrcBtn) {
-    calStackOnly = calSrcBtn.getAttribute("data-source") === "stack";
-    document.querySelectorAll("#seg-cal-source button").forEach(b => b.classList.toggle("active", b === calSrcBtn));
-    refreshCalendar();
-  }
 });
 document.addEventListener("change", e => {
   if (e.target.id === "source-filter") {
@@ -3104,6 +3385,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_csv(journal_csv(), "journal.csv")
         elif path == "/api/pipeline":
             self._send(200, json.dumps(pipeline_status(), default=str).encode(), "application/json")
+        elif path == "/api/symbol-map":
+            self._send(200, json.dumps({"ok": True, "map": ts.get_symbol_map()}).encode(), "application/json")
         elif path == "/api/export/weekly.xlsx":
             days = _parse_days(self.path)
             source = _parse_source(self.path)
@@ -3134,7 +3417,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     _JSON_POST_ROUTES = (
-        "/api/journal", "/api/dryrun", "/api/webhook-test/send",
+        "/api/journal", "/api/dryrun", "/api/webhook-test/send", "/api/symbol-map",
     )
 
     def do_POST(self) -> None:
@@ -3164,6 +3447,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
             elif path == "/api/webhook-test/send":
                 status, body = send_test_signal(payload)
+                self._send(status, json.dumps(body, default=str).encode(), "application/json")
+            elif path == "/api/symbol-map":
+                status, body = update_symbol_map(payload)
                 self._send(status, json.dumps(body, default=str).encode(), "application/json")
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(400, str(exc).encode(), "text/plain")
