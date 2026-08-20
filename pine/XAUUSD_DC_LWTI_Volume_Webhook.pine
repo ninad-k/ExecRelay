@@ -1,0 +1,688 @@
+//@version=6
+// =============================================================================
+// Title      : XAUUSD DC(96) + LWTI + Volume Breakout [M15] — V3
+// Purpose    : Long/short breakout of a *flat* Donchian channel (length 96),
+//              confirmed by Larry Williams Large Trade Index (LWTI) direction
+//              and above-average volume. Wick-based stop, 1:2 reward:risk, and
+//              move-to-breakeven once price reaches 1R.
+// Market/TF  : Designed for GOLD (XAUUSD), 15-minute chart. All values tunable.
+// Author     : AlgoTradingBot-Rey
+// Version    : V3 — consolidates every prior filter and adds: (1) the LWTI
+//              flip-window filter — after LWTI flips regime (red->green or
+//              green->red) entries are permitted only for the next N candles;
+//              beyond that, wait for the next flip; and (2) two selectable LWTI
+//              slope filters — V1 (no-counter-slope) and V2
+//              (strict uptrend=buy / downtrend=sell). All AND-combined.
+//              V3.1 — LWTI slope V1 now compares the window endpoints (LWTI now
+//              vs N candles ago) instead of every bar-to-bar step, so LWTI may
+//              oscillate within the window while staying the same regime; and
+//              adds an optional ADX trend-strength filter (minimum, optional
+//              maximum cap, and optional +DI/-DI directional confirmation).
+//              V3.2 — EVERY confirmation/filter is now individually optional via
+//              its own toggle: the DC-flat requirement and the LWTI-direction
+//              requirement gained on/off switches (both default ON to preserve
+//              behavior). The only non-optional element is the raw Donchian body
+//              breakout — the strategy's base entry trigger. The LWTI flip-window
+//              filter now defaults OFF (it silently blocked mid-trend breakouts).
+//              V3.3 — diagnostic only: orange "skip" dots (and a "Skipped (pos)"
+//              debug row) mark bars where a fully-valid breakout fired but no
+//              trade opened because a position was already running. No trading
+//              behavior change.
+//              V3.4 — LWTI slope V1 redefined to match intent: it is now a
+//              regime-persistence check (Buy needs LWTI green (>50) on every one
+//              of the last N candles; Sell needs red (<50)) rather than the V3.1
+//              endpoint net-slope check. LWTI may dip in value while staying the
+//              same colour and still pass; only a cross of the 50 midline fails.
+//              (The strategy's LWTI formula is identical to the LWTI [Loxx]
+//              indicator, so values read off that pane match what V1 evaluates.)
+//              V3.5 — V1 and V2 finalised against a full 12-case truth table
+//              (docs/strategies/xauusd_dc_lwti_V1_V2_logic.xlsx), signed off by
+//              the user. Both now require the colour to hold across the window,
+//              and differ on the shape of the move:
+//                V1 = NOT a one-way move AGAINST the trade. Oscillation inside
+//                     the colour (up-then-down, down-then-up) passes; only a
+//                     monotonic fade (buy) / climb (sell) is rejected.
+//                V2 = a one-way move WITH the trade. Buy needs a monotonic climb
+//                     while green, Sell a monotonic fade while red.
+//              V2 is strictly tighter than V1 (V2 implies V1), so enabling both
+//              is equivalent to V2 alone — use one or the other.
+//              V3.6 — V1 relaxed to allow LWTI colour FLIPS, signed off against a
+//              full 24-case truth table (every physically possible 3-bar LWTI
+//              configuration). V1 now checks the colour of the ENTRY BAR only,
+//              instead of demanding the colour hold across the whole window, so
+//              red,red,green admits a buy on the flip bar. The not-a-one-way-move-
+//              against test is unchanged, and rows 1-12 (single-colour windows)
+//              behave exactly as before — no regression. V2 is untouched: it
+//              still requires the colour held across the window plus a monotonic
+//              move, so it alone rejects flips.
+//              V3.7 — V2 given the same relaxation, signed off against its own
+//              24-case truth table: it now checks the colour of the ENTRY BAR
+//              only (was: colour held across the window), keeping the monotonic
+//              requirement. So a fresh flip with a clean one-way move qualifies.
+//              V2 Buy passes R,G,G and R,R,G climbs; V2 Sell passes G,R,R and
+//              G,G,R fades. V1 is unchanged by this revision. Both filters now
+//              check only the entry bar's colour and differ solely in the shape
+//              they demand: V1 rejects a one-way move AGAINST the trade (lenient),
+//              V2 demands a one-way move WITH it (strict). V2 still implies V1.
+//              V3.8 — wired to ExecRelay: entries/exits now carry an
+//              alert_message (Order fills events) that sends the trade straight
+//              to the ExecRelay webhook, same mechanism as
+//              pine/EMA915_Pullback_Webhook.pine. No trading-logic change; see
+//              the "ExecRelay Webhook Alerts" input group and pine/README.md.
+// Disclaimer : Research only — not financial advice. Trading involves substantial
+//              risk of loss. Backtest results do not guarantee future performance.
+// =============================================================================
+strategy("XAUUSD DC(96) + LWTI + Volume Breakout [M15] V3",
+     shorttitle="DC-LWTI-VOL V3",
+     overlay=true,
+     pyramiding=0,                       // one position at a time
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     commission_type=strategy.commission.percent, commission_value=0.0,
+     max_labels_count=500)
+
+// ----------------------------- Inputs ---------------------------------------
+grpDC      = "Donchian Channel"
+grpLWTI    = "LWTI"
+grpVol     = "Volume"
+grpFilt    = "Entry Filter"
+grpRisk    = "Risk & Exits"
+grpWebhook = "ExecRelay Webhook Alerts"
+grpViz     = "UI Options"
+
+dcLen    = input.int(96, "DC Length", minval=1, group=grpDC)
+useDCflat = input.bool(true, "Require flat DC before breakout", group=grpDC,
+     tooltip="When ON, the Donchian line must be flat (unchanged) for the N bars before the breakout candle — i.e. enter only on breakouts out of consolidation. Turn OFF to allow any body-close break of the DC line, including mid-trend continuation breakouts.")
+flatBars = input.int(3, "Flat bars before breakout", minval=2, group=grpDC,
+     tooltip="How many bars the DC line must stay unchanged before the breakout candle. Only used when 'Require flat DC before breakout' is ON.")
+
+lwtiPer     = input.int(25, "Period", minval=1, group=grpLWTI)
+useLwtiDir  = input.bool(true, "Require LWTI direction (green=buy / red=sell)", group=grpLWTI,
+     tooltip="When ON, Buy needs LWTI bullish (>50) and Sell needs LWTI bearish (<50). Turn OFF to ignore LWTI regime for entries (LWTI is still drawn and still drives the flip-window filter).")
+lwtiSmooth  = input.bool(false, "Smooth LWTI?", group=grpLWTI)
+lwtiType    = input.string("SMA", "Smoothing Type", options=["EMA", "WMA", "RMA", "SMA"], group=grpLWTI)
+lwtiSmthPer = input.int(20, "Smoothing Period", minval=1, group=grpLWTI)
+
+volMaLen = input.int(30, "Volume MA Length", minval=1, group=grpVol)
+
+maxCandle       = input.float(20.0, "Max entry candle size (high-low)", minval=0.0, step=0.5, group=grpFilt,
+     tooltip="Entry allowed only if the signal candle's full range (high-low) is below this value, in price units ($ on gold).")
+useCandleFilter = input.bool(true, "Require candle range < max", group=grpFilt)
+useVolFilter    = input.bool(true, "Require volume > MA", group=grpFilt,
+     tooltip="Turn OFF if the symbol/feed has no real volume (many XAUUSD feeds report 0/na volume, which would block every trade).")
+breakInclusive  = input.bool(false, "Break uses >= (inclusive)", group=grpFilt,
+     tooltip="If ON, a close exactly touching the flat DC line counts as a breakout.")
+
+grpTrend = "Trend / Momentum Filters (optional)"
+grpSess  = "Sessions (per-direction, optional)"
+
+useEMA       = input.bool(false, "EMA trend filter", group=grpTrend,
+     tooltip="Buy only if close > EMA; Sell only if close < EMA.")
+emaLen       = input.int(200, "EMA length", minval=1, group=grpTrend)
+useADX       = input.bool(false, "ADX trend-strength filter", group=grpTrend,
+     tooltip="Only take trades when ADX >= the minimum, i.e. the market is trending strongly enough (filters out chop). Optionally also require the dominant DI to agree with the trade direction.")
+adxLen       = input.int(14, "ADX DI length", minval=1, group=grpTrend)
+adxSmooth    = input.int(14, "ADX smoothing", minval=1, group=grpTrend)
+adxThresh    = input.float(20.0, "ADX minimum", minval=0.0, step=0.5, group=grpTrend)
+useADXmax    = input.bool(false, "Cap ADX at a maximum", group=grpTrend,
+     tooltip="When on, also block trades once ADX rises above the maximum — avoids entering over-extended / exhausted trends. Trades then fire only when ADX minimum <= ADX <= ADX maximum.")
+adxMax       = input.float(50.0, "ADX maximum", minval=0.0, step=0.5, group=grpTrend)
+useADXdi     = input.bool(false, "Require +DI/-DI direction", group=grpTrend,
+     tooltip="Buy only if +DI > -DI; Sell only if -DI > +DI. AND-combined with the ADX strength gate.")
+useLwtiSlope = input.bool(false, "LWTI slope filter V1 (colour on entry bar + no one-way move against)", group=grpTrend,
+     tooltip="V1 — Buy needs BOTH: (1) LWTI green (>50) on the ENTRY bar, and (2) LWTI did NOT fall on every single step of the last N candles. Sell needs red (<50) on the entry bar and NOT rising on every step. Only the entry bar's colour is checked, so a fresh flip into the trade's direction (e.g. red,red,green) qualifies for a buy. Oscillation PASSES — only a straight one-way move against the trade blocks it.")
+lwtiSlopeLen = input.int(3, "V1 lookback (candles)", minval=1, group=grpTrend)
+useLwtiSlopeV2 = input.bool(false, "LWTI slope filter V2 (strict one-way trend)", group=grpTrend,
+     tooltip="V2 — the strictest LWTI gate. Buy needs LWTI green (>50) on the ENTRY bar AND rising on EVERY step of the last N candles (a clean monotonic climb). Sell needs red (<50) on the entry bar AND falling on EVERY step. Like V1, only the entry bar's colour is checked, so a fresh flip qualifies if the move is monotonic. Any oscillation is rejected. V1 only rejects a one-way move AGAINST the trade; V2 demands a one-way move WITH it, so V2 implies V1 — enabling both is the same as V2 alone.")
+lwtiSlopeLenV2 = input.int(3, "V2 lookback (candles)", minval=1, group=grpTrend)
+useFlipWindow = input.bool(false, "LWTI flip-window filter", group=grpTrend,
+     tooltip="After LWTI flips regime (red->green or green->red), entries are allowed only for the next N candles (the flip candle counts as candle 1). Beyond that window, no trade is taken until the next flip. AND-combined with the LWTI slope filter.")
+flipWindow    = input.int(5, "Flip window (candles after flip)", minval=1, group=grpTrend)
+useBrkFilter = input.bool(false, "Breakout = strongest close in N bars", group=grpTrend,
+     tooltip="Buy: close must be the highest close of the last N bars. Sell: lowest close of the last N bars.")
+brkLen       = input.int(6, "Breakout lookback (bars)", minval=1, group=grpTrend)
+useCandleStr = input.bool(false, "Candle strength filter", group=grpTrend,
+     tooltip="Breakout candle must be decisive: body >= X% of the total range, OR the close sits in the strong end of the candle (green: above the Y% level; red: below the (100-Y)% level).")
+bodyThresh   = input.float(0.65, "Min body fraction of range", minval=0.0, maxval=1.0, step=0.05, group=grpTrend)
+closeThresh  = input.float(0.70, "Close position fraction", minval=0.0, maxval=1.0, step=0.05, group=grpTrend)
+
+useSession = input.bool(false, "Enable session filter", group=grpSess,
+     tooltip="When on, a trade is only taken if the bar falls in an enabled session that permits that direction. Times use the chart's exchange timezone.")
+// Sydney
+sydOn   = input.bool(true,  "Sydney", inline="syd1", group=grpSess)
+sydTime = input.session("2100-0600", "", inline="syd1", group=grpSess)
+sydBuy  = input.bool(true,  "Buy",  inline="syd2", group=grpSess)
+sydSell = input.bool(true,  "Sell", inline="syd2", group=grpSess)
+// Tokyo
+tokOn   = input.bool(true,  "Tokyo",  inline="tok1", group=grpSess)
+tokTime = input.session("0000-0900", "", inline="tok1", group=grpSess)
+tokBuy  = input.bool(true,  "Buy",  inline="tok2", group=grpSess)
+tokSell = input.bool(true,  "Sell", inline="tok2", group=grpSess)
+// London
+lonOn   = input.bool(true,  "London", inline="lon1", group=grpSess)
+lonTime = input.session("0800-1700", "", inline="lon1", group=grpSess)
+lonBuy  = input.bool(true,  "Buy",  inline="lon2", group=grpSess)
+lonSell = input.bool(true,  "Sell", inline="lon2", group=grpSess)
+// New York
+nyOn    = input.bool(true,  "New York", inline="ny1", group=grpSess)
+nyTime  = input.session("1300-2200", "", inline="ny1", group=grpSess)
+nyBuy   = input.bool(true,  "Buy",  inline="ny2", group=grpSess)
+nySell  = input.bool(true,  "Sell", inline="ny2", group=grpSess)
+
+rr        = input.float(2.0, "Reward : Risk", minval=0.1, step=0.1, group=grpRisk)
+lotSize   = input.float(1.0, "Lot size (contracts)", minval=0.01, step=0.01, group=grpRisk,
+     tooltip="Fixed position size per trade. 1 = one contract/lot. Backtest-only -- the broker order sizing that actually reaches MT5 is the separate 'MT5 Volume In Lots' input below.")
+useBE     = input.bool(true, "Move SL to breakeven at 1R", group=grpRisk)
+beTrigger = input.float(1.0, "Breakeven trigger (x risk)", minval=0.1, step=0.1, group=grpRisk)
+
+// ExecRelay webhook alerts (no effect on trade logic) ------------------------
+// Wires this strategy's entries/exits to the ExecRelay stack over the same
+// "Order fills events" alert_message mechanism as EMA915_Pullback_Webhook.pine.
+// Fill in License ID + Secret, then create ONE alert on this strategy with
+// condition "Order fills events" and Message = {{strategy.order.alert_message}}
+// -- NOT "Any alert() function call" (that trigger only fires the informational
+// DC-LWTI-VOL|BUY|... text further down, which ExecRelay cannot parse).
+whLicenseId = input.string("", "ExecRelay License ID", group = grpWebhook)
+whSecret    = input.string("", "ExecRelay Body Secret | blank = none", group = grpWebhook)
+whSymbol    = input.string("", "MT5 Symbol Override | blank = chart symbol", group = grpWebhook)
+whLots      = input.float(0.01, "MT5 Volume In Lots", minval = 0.01, step = 0.01, group = grpWebhook)
+whFixedLots = input.bool(false, "Force Exact Lots | Bypass Stack $-Risk Sizing", group = grpWebhook,
+     tooltip = "OFF (recommended): the stack sizes the lot from the SL distance to cap loss at EA_SHIM_RISK_USD ($100/order by default) -- appropriate here since the stop is a wick distance that varies bar to bar, unlike a fixed-distance SL. ON: always send exactly the lots above regardless of stop distance.")
+whComment   = input.string("DCLW", "Order Comment Tag | max 5 chars, longer is silently rejected by ingress", group = grpWebhook,
+     tooltip = "Broker order comment prefix. Keep distinct from other strategies' tags (e.g. an EMA pullback strategy's) so ExecRelay's per-channel SL/TP-move and close scoping never crosses between strategies sharing a symbol. ExecRelay's ingress hard-caps the whole comment field at 20 characters -- the close-comment suffix alone (\"x-<13-digit bar time>\") already eats 15 of those, so this tag must stay to 5 characters or fewer or EVERY signal gets silently rejected (400 parse_error). whCommentSafe below truncates automatically as a backstop.")
+whSendCloseAlerts = input.bool(true, "Send Close Alert On Every Exit Refresh", group = grpWebhook,
+     tooltip = "Also sends CLOSELONG/CLOSESHORT whenever the resting TP/SL/breakeven order is (re)placed. The broker already holds that TP/SL directly, so this is a redundant safety net that re-syncs MT5 with TradingView -- recommended ON.")
+
+// --- Webhook message helpers (strings only, never touches signals) ---
+whSym        = whSymbol == "" ? syminfo.ticker : whSymbol
+whSecretPart = whSecret != "" ? ",secret=" + whSecret : ""
+whRiskPart   = whFixedLots ? ",risk=0" : ""
+whLotsStr    = str.tostring(whLots, "#.####")
+// Hard backstop for the 20-char ingress comment limit -- see whComment's
+// tooltip. Silently truncates rather than letting a too-long tag reject
+// every signal; still worth fixing the input if this ever actually trims it.
+whCommentSafe = str.length(whComment) > 5 ? str.substring(whComment, 0, 5) : whComment
+
+f_px(_p) =>
+    str.tostring(_p, format.mintick)
+
+// Unique per-bar suffix so no two alert bodies are ever byte-identical.
+whBarTag = str.tostring(time, "#")
+
+showSignals  = input.bool(true, "Show signals?", group=grpViz)
+showBlocked  = input.bool(true, "Mark breakouts blocked by open position", group=grpViz,
+     tooltip="Orange 'skip' dot on bars where a fully-valid breakout signal fired but no trade was opened because a position was already running (the single-position gate). Diagnostic only — does not change trading.")
+showDCfill   = input.bool(true, "Fill Donchian channel", group=grpViz)
+showLWTIbg   = input.bool(true, "LWTI regime background", group=grpViz,
+     tooltip="Tints the chart background green when LWTI>50 (bullish) and red when LWTI<50 (bearish).")
+showVolMark  = input.bool(true, "Mark above-avg volume", group=grpViz,
+     tooltip="Small dot under bars whose volume is above the volume MA.")
+showFlipMark = input.bool(true, "Mark LWTI flips", group=grpViz,
+     tooltip="Diamond above the bar where LWTI flips regime (start of a new flip window).")
+enableAlerts = input.bool(true, "Enable alerts?", group=grpViz)
+showDebug    = input.bool(true, "Show debug counters", group=grpViz,
+     tooltip="Table counting how many bars passed each sub-condition — tells you which filter is blocking trades.")
+showPnL      = input.bool(true, "Show last-10 trade P&L", group=grpViz)
+
+// ----------------------------- Indicators (inlined) -------------------------
+// --- Donchian: single-arg overloads use high/low, matching the indicator ---
+upper = ta.highest(dcLen)
+lower = ta.lowest(dcLen)
+basis = math.avg(upper, lower)
+
+// --- LWTI ---
+variant(t, src, len) =>
+    sig = 0.0
+    if t == "SMA"
+        sig := ta.sma(src, len)
+    else if t == "EMA"
+        sig := ta.ema(src, len)
+    else if t == "WMA"
+        sig := ta.wma(src, len)
+    else if t == "RMA"
+        sig := ta.rma(src, len)
+    sig
+
+lwtiMa  = ta.sma(close - nz(close[lwtiPer]), lwtiPer)
+lwtiAtr = ta.atr(lwtiPer)
+lwtiOut = lwtiMa / lwtiAtr * 50 + 50
+lwtiOut := lwtiSmooth ? variant(lwtiType, lwtiOut, lwtiSmthPer) : lwtiOut
+lwtiGreen = lwtiOut > 50
+lwtiRed   = lwtiOut < 50
+
+// --- Volume MA ---
+// If the filter is off (or the feed has no volume) this must not block signals.
+volMA    = ta.sma(volume, volMaLen)
+volAbove = not useVolFilter or (not na(volume) and not na(volMA) and volume > volMA)
+
+// ----------------------------- Signal logic ---------------------------------
+// DC line must be flat across the `flatBars` bars BEFORE the signal candle,
+// i.e. upper[1]==upper[2]==...==upper[flatBars] (and likewise for lower).
+dcUpFlat = true
+dcDnFlat = true
+for i = 1 to flatBars - 1
+    dcUpFlat := dcUpFlat and (upper[i] == upper[i + 1])
+    dcDnFlat := dcDnFlat and (lower[i] == lower[i + 1])
+// Optional: when the flat requirement is off, any body break of the DC line qualifies.
+dcUpFlat := not useDCflat or dcUpFlat
+dcDnFlat := not useDCflat or dcDnFlat
+
+// LWTI direction gate (optional): Buy needs LWTI bullish, Sell needs LWTI bearish.
+lwtiDirBuyOK  = not useLwtiDir or lwtiGreen
+lwtiDirSellOK = not useLwtiDir or lwtiRed
+
+// Break must be by candle BODY, not wick. For a green candle the body top is
+// `close`; for a red candle the body bottom is `close`. We compare the body
+// edge (max/min of open,close) to the flat DC line — wicks are ignored.
+bodyHigh = math.max(open, close)
+bodyLow  = math.min(open, close)
+greenBreak = close > open and (breakInclusive ? bodyHigh >= upper[1] : bodyHigh > upper[1])   // green body breaks above flat upper
+redBreak   = close < open and (breakInclusive ? bodyLow  <= lower[1] : bodyLow  < lower[1])    // red body breaks below flat lower
+
+candleOK = not useCandleFilter or (high - low) < maxCandle
+
+// --- Optional filters ---
+// EMA trend gate
+emaVal    = ta.ema(close, emaLen)
+emaBuyOK  = not useEMA or close > emaVal
+emaSellOK = not useEMA or close < emaVal
+
+// ADX / DMI trend-strength gate. adxStrong requires a trending market; the
+// optional +DI/-DI check requires the dominant directional index to agree with
+// the trade direction (Buy => +DI > -DI, Sell => -DI > +DI).
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)
+adxStrong = not useADX or (adxVal >= adxThresh and (not useADXmax or adxVal <= adxMax))
+adxBuyOK  = adxStrong and (not useADXdi or diPlus  > diMinus)
+adxSellOK = adxStrong and (not useADXdi or diMinus > diPlus)
+
+// LWTI slope V1: two parts, both required.
+//   1) Colour NOW — LWTI must be green (>50) on the ENTRY bar for a buy, red
+//      (<50) on the entry bar for a sell. Earlier bars in the window may be the
+//      opposite colour, so a fresh flip into the trade's direction qualifies
+//      (e.g. red,red,green -> a buy is allowed on the flip bar).
+//   2) Not a one-way move against the trade — rejected ONLY when LWTI fell on
+//      EVERY step (buy) or rose on EVERY step (sell). Oscillation is fine: a dip
+//      that recovers must not block a buy.
+// Together these admit every LWTI shape whose entry bar is the right colour,
+// except a straight one-way move against the trade.
+lwtiAllStepsDown = true
+lwtiAllStepsUp   = true
+for i = 0 to lwtiSlopeLen - 1
+    lwtiAllStepsDown := lwtiAllStepsDown and (lwtiOut[i] < lwtiOut[i + 1])
+    lwtiAllStepsUp   := lwtiAllStepsUp   and (lwtiOut[i] > lwtiOut[i + 1])
+lwtiNoDown = lwtiGreen and not lwtiAllStepsDown
+lwtiNoUp   = lwtiRed   and not lwtiAllStepsUp
+lwtiUpOK  = not useLwtiSlope or lwtiNoDown
+lwtiDnOK  = not useLwtiSlope or lwtiNoUp
+
+// LWTI slope V2 (strict one-way trend): the tightest LWTI gate — it admits ONLY
+// a clean monotonic move in the trade's direction.
+//   Buy  => LWTI green (>50) on the ENTRY bar AND rose on EVERY step.
+//   Sell => LWTI red   (<50) on the ENTRY bar AND fell on EVERY step.
+// As with V1, only the ENTRY bar's colour is checked, so a fresh flip qualifies
+// provided the climb is monotonic (e.g. red,red,green rising every step admits a
+// buy). Every other shape — up-then-down, down-then-up, one-way against — is
+// rejected. That is the difference from V1: V1 merely rejects a one-way move
+// AGAINST the trade, whereas V2 demands a one-way move WITH it. Because a
+// monotonic move with the trade can never also be a monotonic move against it,
+// V2 still implies V1 whenever both use the same lookback — so enabling both is
+// equivalent to V2 alone. Uses its own lookback (lwtiSlopeLenV2).
+lwtiAllUpV2   = true
+lwtiAllDownV2 = true
+for i = 0 to lwtiSlopeLenV2 - 1
+    lwtiAllUpV2   := lwtiAllUpV2   and (lwtiOut[i] > lwtiOut[i + 1])
+    lwtiAllDownV2 := lwtiAllDownV2 and (lwtiOut[i] < lwtiOut[i + 1])
+lwtiUpV2OK = not useLwtiSlopeV2 or (lwtiGreen and lwtiAllUpV2)
+lwtiDnV2OK = not useLwtiSlopeV2 or (lwtiRed   and lwtiAllDownV2)
+
+// LWTI flip-window: track the persistent LWTI regime (green>50 / red<50). A flip
+// is a regime change (red->green or green->red). After a flip, entries are allowed
+// only for the next `flipWindow` candles (flip candle = candle 1). Beyond that we
+// wait for the next flip. Direction-agnostic gate: the LWTI direction requirement
+// (lwtiGreen for buys / lwtiRed for sells) is enforced separately, so a buy can
+// only use a red->green flip window and a sell only a green->red one.
+var int lwtiRegime = 0                       // 1 = green, -1 = red, 0 = undetermined
+prevRegime = lwtiRegime
+lwtiRegime := lwtiGreen ? 1 : lwtiRed ? -1 : lwtiRegime
+lwtiFlip   = (prevRegime == -1 and lwtiRegime == 1) or (prevRegime == 1 and lwtiRegime == -1)
+barsSinceFlip = ta.barssince(lwtiFlip)       // 0 on the flip bar, na before the first flip
+flipOK = not useFlipWindow or (not na(barsSinceFlip) and barsSinceFlip < flipWindow)
+
+// Breakout candle strength: close is the strongest close of the last N bars
+brkBuyOK  = not useBrkFilter or close >= ta.highest(close, brkLen)
+brkSellOK = not useBrkFilter or close <= ta.lowest(close, brkLen)
+
+// Candle strength: decisive breakout candle by body dominance OR close position.
+// Green ok if body >= bodyThresh of range, OR close in the top (1-closeThresh) of range.
+// Red   ok if body >= bodyThresh of range, OR close in the bottom (1-closeThresh) of range.
+rng      = high - low
+bodyFrac = rng > 0 ? math.abs(close - open) / rng : 0.0
+closePos = rng > 0 ? (close - low) / rng : 0.0        // 0 = at low, 1 = at high
+greenStrong = bodyFrac >= bodyThresh or closePos >= closeThresh
+redStrong   = bodyFrac >= bodyThresh or closePos <= (1.0 - closeThresh)
+csBuyOK   = not useCandleStr or greenStrong
+csSellOK  = not useCandleStr or redStrong
+
+// Sessions: bar must be inside an enabled session that permits the direction
+inSyd = sydOn and not na(time(timeframe.period, sydTime))
+inTok = tokOn and not na(time(timeframe.period, tokTime))
+inLon = lonOn and not na(time(timeframe.period, lonTime))
+inNy  = nyOn  and not na(time(timeframe.period, nyTime))
+buySessOK  = not useSession or ((inSyd and sydBuy)  or (inTok and tokBuy)  or (inLon and lonBuy)  or (inNy and nyBuy))
+sellSessOK = not useSession or ((inSyd and sydSell) or (inTok and tokSell) or (inLon and lonSell) or (inNy and nySell))
+
+buySignal  = dcUpFlat and greenBreak and lwtiDirBuyOK  and volAbove and candleOK and emaBuyOK  and adxBuyOK  and lwtiUpOK and lwtiUpV2OK and flipOK and brkBuyOK  and csBuyOK  and buySessOK
+sellSignal = dcDnFlat and redBreak   and lwtiDirSellOK and volAbove and candleOK and emaSellOK and adxSellOK and lwtiDnOK and lwtiDnV2OK and flipOK and brkSellOK and csSellOK and sellSessOK
+
+// Diagnostic: a fully-valid signal that was NOT taken because a position was
+// already open (the single-position entry gate). Trading is unaffected.
+blockedBuy  = buySignal  and strategy.position_size != 0
+blockedSell = sellSignal and strategy.position_size != 0
+
+// --- ExecRelay close messages (strings only, never touches signals) ---
+// Rebuilt every bar (Pine re-evaluates non-`var` locals on every bar) so the
+// bar-time tag stays fresh on whichever exit order eventually fills — mirrors
+// EMA915_Pullback_Webhook.pine's approach.
+longCloseMsg  = whSendCloseAlerts ? whLicenseId + ",CLOSELONG,"  + whSym + ",comment=" + whCommentSafe + "x-" + whBarTag + whSecretPart : ""
+shortCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSESHORT," + whSym + ",comment=" + whCommentSafe + "x-" + whBarTag + whSecretPart : ""
+
+// ----------------------------- Trade state ----------------------------------
+var float eEntry = na
+var float eStop  = na
+var float eTP    = na
+var float eRisk  = na
+var bool  beDone = false
+var int   eDir   = 0
+
+// ENTRY — only when flat (single position at a time: pyramiding=0 + this gate).
+// A new trade is opened only while there is NO open position.
+if strategy.position_size == 0 and (buySignal or sellSignal)
+    dir   = buySignal ? 1 : -1
+    entry = close
+    stop  = buySignal ? low : high               // wick of the breakout candle
+    risk  = math.abs(entry - stop)
+    tp    = buySignal ? entry + rr * risk : entry - rr * risk
+    // Fixed lot sizing: every trade uses `lotSize` contracts (default 1).
+    qty   = lotSize
+    eEntry := entry
+    eStop  := stop
+    eTP    := tp
+    eRisk  := risk
+    eDir   := dir
+    beDone := false
+    if buySignal
+        // ExecRelay: BUY with absolute SL/TP prices, so the broker holds the
+        // exact same stop and target as the strategy.
+        longEntryMsg = whLicenseId + ",BUY," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(stop) + ",tp=" + f_px(tp) + ",comment=" + whCommentSafe + "-" + whBarTag + whSecretPart
+        strategy.entry("Long", strategy.long, qty=qty, alert_message=longEntryMsg)
+    else
+        // ExecRelay: SELL with absolute SL/TP prices.
+        shortEntryMsg = whLicenseId + ",SELL," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(stop) + ",tp=" + f_px(tp) + ",comment=" + whCommentSafe + "-" + whBarTag + whSecretPart
+        strategy.entry("Short", strategy.short, qty=qty, alert_message=shortEntryMsg)
+
+// MANAGE — move SL to breakeven once price travels beTrigger x risk in favor
+if strategy.position_size != 0 and useBE and not beDone
+    reached = eDir == 1 ? (high >= eEntry + beTrigger * eRisk) : (low <= eEntry - beTrigger * eRisk)
+    if reached
+        eStop  := eEntry                          // breakeven
+        beDone := true
+
+// Emit / refresh protective orders every bar while in a position.
+// Re-calling strategy.exit updates the resting stop/limit (this applies breakeven).
+if strategy.position_size > 0
+    strategy.exit("L-exit", from_entry="Long", stop=eStop, limit=eTP, alert_message=longCloseMsg)
+else if strategy.position_size < 0
+    strategy.exit("S-exit", from_entry="Short", stop=eStop, limit=eTP, alert_message=shortCloseMsg)
+
+// ----------------------------- Exit detection -------------------------------
+// Fire when the strategy records a newly closed trade (robust, independent of
+// position_size fill timing). Direction of the just-closed trade: size > 0 was
+// a long ("Exit Buy"), size < 0 was a short ("Exit Sell").
+tradeClosed = ta.change(strategy.closedtrades) > 0
+lastSize    = strategy.closedtrades > 0 ? strategy.closedtrades.size(strategy.closedtrades - 1) : 0.0
+exitBuy     = tradeClosed and lastSize > 0
+exitSell    = tradeClosed and lastSize < 0
+
+// ----------------------------- Visuals --------------------------------------
+// --- Donchian channel (price pane) ---
+pU = plot(upper, "DC Upper", color=#2962FF, linewidth=2)
+pL = plot(lower, "DC Lower", color=#2962FF, linewidth=2)
+plot(basis, "DC Basis", color=#FF6D00)
+fill(pU, pL, color=showDCfill ? color.rgb(33, 150, 243, 92) : na, title="DC Background")
+
+// --- EMA trend filter line (only drawn when the filter is on) ---
+plot(useEMA ? emaVal : na, "EMA", color=color.new(color.yellow, 0), linewidth=2)
+
+// --- LWTI regime shown as a background tint (green = bullish, red = bearish) ---
+bgcolor(showLWTIbg ? (lwtiGreen ? color.new(#2DD204, 90) : lwtiRed ? color.new(#D2042D, 90) : na) : na,
+     title="LWTI Regime")
+
+// --- Volume: dot beneath bars trading above the volume MA ---
+plotshape(showVolMark and volume > volMA, title="Vol > MA", style=shape.circle,
+     location=location.bottom, color=color.new(color.teal, 0), size=size.auto)
+
+// --- LWTI flip marker: start of a new flip window (color = new regime) ---
+plotshape(showFlipMark and lwtiFlip, title="LWTI Flip", style=shape.diamond,
+     location=location.abovebar, size=size.tiny,
+     color=lwtiRegime == 1 ? color.new(#2DD204, 0) : color.new(#D2042D, 0))
+
+// --- Entry signals ---
+plotshape(showSignals and buySignal,  title="Buy",  style=shape.triangleup,
+     location=location.belowbar, color=color.new(#2DD204, 0), text="BUY",  size=size.tiny)
+plotshape(showSignals and sellSignal, title="Sell", style=shape.triangledown,
+     location=location.abovebar, color=color.new(#D2042D, 0), text="SELL", size=size.tiny)
+
+plotshape(showSignals and exitBuy,  title="Exit Buy",  style=shape.xcross,
+     location=location.abovebar, color=color.new(color.orange, 0), textcolor=color.orange, text="Exit Buy",  size=size.tiny)
+plotshape(showSignals and exitSell, title="Exit Sell", style=shape.xcross,
+     location=location.belowbar, color=color.new(color.orange, 0), textcolor=color.orange, text="Exit Sell", size=size.tiny)
+
+// --- Breakouts skipped because a position was already open (diagnostic) ---
+plotshape(showBlocked and blockedBuy,  title="Blocked Buy",  style=shape.circle,
+     location=location.belowbar, color=color.new(color.orange, 0), textcolor=color.orange, text="skip", size=size.tiny)
+plotshape(showBlocked and blockedSell, title="Blocked Sell", style=shape.circle,
+     location=location.abovebar, color=color.new(color.orange, 0), textcolor=color.orange, text="skip", size=size.tiny)
+
+// --- Diagnostic (Data Window only): the EXACT internal LWTI values V1 evaluates.
+// These come from the strategy's OWN LWTI oscillator (centred on 50, unsmoothed
+// unless "Smooth LWTI?" is on) — NOT the separate "LWTI [Loxx]" pane indicator,
+// which is a different series on a different scale. Hover any bar and read these
+// in the Data Window to see precisely why V1 passed or blocked.
+plot(lwtiOut,               "V1: LWTI now",      color=color.lime, display=display.data_window)
+plot(lwtiOut[lwtiSlopeLen], "V1: LWTI N ago",    color=color.teal, display=display.data_window)
+plot(lwtiNoDown ? 1 : 0,    "V1: buy slope OK",  color=color.gray, display=display.data_window)
+plot(lwtiNoUp   ? 1 : 0,    "V1: sell slope OK", color=color.gray, display=display.data_window)
+
+// ----------------------------- Alerts ---------------------------------------
+// Informational only (condition "Any alert() function call") -- separate from
+// and unrelated to the ExecRelay webhook above, which uses "Order fills events".
+if enableAlerts and buySignal and barstate.isconfirmed
+    alert("DC-LWTI-VOL|BUY|" + syminfo.ticker + "|" + timeframe.period + "|" + str.tostring(close), alert.freq_once_per_bar_close)
+if enableAlerts and sellSignal and barstate.isconfirmed
+    alert("DC-LWTI-VOL|SELL|" + syminfo.ticker + "|" + timeframe.period + "|" + str.tostring(close), alert.freq_once_per_bar_close)
+if enableAlerts and exitBuy and barstate.isconfirmed
+    alert("DC-LWTI-VOL|EXIT BUY|" + syminfo.ticker + "|" + timeframe.period + "|" + str.tostring(close), alert.freq_once_per_bar_close)
+if enableAlerts and exitSell and barstate.isconfirmed
+    alert("DC-LWTI-VOL|EXIT SELL|" + syminfo.ticker + "|" + timeframe.period + "|" + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ----------------------------- Debug counters -------------------------------
+// Counts how many CONFIRMED bars passed each sub-condition. If a row shows 0,
+// that filter is what's blocking trades. (e.g. "Volume>MA = 0" => no volume data.)
+var int cFlatUp   = 0
+var int cFlatDn   = 0
+var int cBreakUp  = 0
+var int cBreakDn  = 0
+var int cLwtiG    = 0
+var int cLwtiR    = 0
+var int cVol      = 0
+var int cCandle   = 0
+var int cEmaB     = 0
+var int cEmaS     = 0
+var int cAdxB     = 0
+var int cAdxS     = 0
+var int cSlpB     = 0
+var int cSlpS     = 0
+var int cSlp2B    = 0
+var int cSlp2S    = 0
+var int cFlip     = 0
+var int cBrkB     = 0
+var int cBrkS     = 0
+var int cCsB      = 0
+var int cCsS      = 0
+var int cSesB     = 0
+var int cSesS     = 0
+var int cBuy      = 0
+var int cSell     = 0
+var int cBlkB     = 0
+var int cBlkS     = 0
+if barstate.isconfirmed
+    cFlatUp  += dcUpFlat   ? 1 : 0
+    cFlatDn  += dcDnFlat   ? 1 : 0
+    cBreakUp += greenBreak ? 1 : 0
+    cBreakDn += redBreak   ? 1 : 0
+    cLwtiG   += lwtiDirBuyOK  ? 1 : 0
+    cLwtiR   += lwtiDirSellOK ? 1 : 0
+    cVol     += volAbove   ? 1 : 0
+    cCandle  += candleOK   ? 1 : 0
+    cEmaB    += emaBuyOK   ? 1 : 0
+    cEmaS    += emaSellOK  ? 1 : 0
+    cAdxB    += adxBuyOK   ? 1 : 0
+    cAdxS    += adxSellOK  ? 1 : 0
+    cSlpB    += lwtiUpOK   ? 1 : 0
+    cSlpS    += lwtiDnOK   ? 1 : 0
+    cSlp2B   += lwtiUpV2OK ? 1 : 0
+    cSlp2S   += lwtiDnV2OK ? 1 : 0
+    cFlip    += flipOK     ? 1 : 0
+    cBrkB    += brkBuyOK   ? 1 : 0
+    cBrkS    += brkSellOK  ? 1 : 0
+    cCsB     += csBuyOK    ? 1 : 0
+    cCsS     += csSellOK   ? 1 : 0
+    cSesB    += buySessOK  ? 1 : 0
+    cSesS    += sellSessOK ? 1 : 0
+    cBuy     += buySignal  ? 1 : 0
+    cSell    += sellSignal ? 1 : 0
+    cBlkB    += blockedBuy  ? 1 : 0
+    cBlkS    += blockedSell ? 1 : 0
+
+if showDebug and barstate.islast
+    var table dbg = table.new(position.top_right, 3, 25, border_width=1)
+    table.cell(dbg, 0, 0,  "Condition", bgcolor=color.gray, text_color=color.white)
+    table.cell(dbg, 1, 0,  "Buy",       bgcolor=color.gray, text_color=color.white)
+    table.cell(dbg, 2, 0,  "Sell",      bgcolor=color.gray, text_color=color.white)
+    table.cell(dbg, 0, 1,  "DC flat")
+    table.cell(dbg, 1, 1,  str.tostring(cFlatUp))
+    table.cell(dbg, 2, 1,  str.tostring(cFlatDn))
+    table.cell(dbg, 0, 2,  "Break")
+    table.cell(dbg, 1, 2,  str.tostring(cBreakUp))
+    table.cell(dbg, 2, 2,  str.tostring(cBreakDn))
+    table.cell(dbg, 0, 3,  "LWTI dir")
+    table.cell(dbg, 1, 3,  str.tostring(cLwtiG))
+    table.cell(dbg, 2, 3,  str.tostring(cLwtiR))
+    table.cell(dbg, 0, 4,  "Volume>MA")
+    table.cell(dbg, 1, 4,  str.tostring(cVol),  text_color = cVol == 0 ? color.red : color.black)
+    table.cell(dbg, 2, 4,  str.tostring(cVol),  text_color = cVol == 0 ? color.red : color.black)
+    table.cell(dbg, 0, 5,  "Candle OK")
+    table.cell(dbg, 1, 5,  str.tostring(cCandle))
+    table.cell(dbg, 2, 5,  str.tostring(cCandle))
+    table.cell(dbg, 0, 6,  "EMA")
+    table.cell(dbg, 1, 6,  str.tostring(cEmaB))
+    table.cell(dbg, 2, 6,  str.tostring(cEmaS))
+    table.cell(dbg, 0, 7,  "LWTI slope V1")
+    table.cell(dbg, 1, 7,  str.tostring(cSlpB))
+    table.cell(dbg, 2, 7,  str.tostring(cSlpS))
+    table.cell(dbg, 0, 8,  "LWTI slope V2")
+    table.cell(dbg, 1, 8,  str.tostring(cSlp2B))
+    table.cell(dbg, 2, 8,  str.tostring(cSlp2S))
+    table.cell(dbg, 0, 9,  "Flip window")
+    table.cell(dbg, 1, 9,  str.tostring(cFlip))
+    table.cell(dbg, 2, 9,  str.tostring(cFlip))
+    table.cell(dbg, 0, 10, "Breakout N")
+    table.cell(dbg, 1, 10, str.tostring(cBrkB))
+    table.cell(dbg, 2, 10, str.tostring(cBrkS))
+    table.cell(dbg, 0, 11, "Cndl Str")
+    table.cell(dbg, 1, 11, str.tostring(cCsB))
+    table.cell(dbg, 2, 11, str.tostring(cCsS))
+    table.cell(dbg, 0, 12, "Session")
+    table.cell(dbg, 1, 12, str.tostring(cSesB))
+    table.cell(dbg, 2, 12, str.tostring(cSesS))
+    table.cell(dbg, 0, 13, "SIGNAL", bgcolor=color.new(color.blue, 70))
+    table.cell(dbg, 1, 13, str.tostring(cBuy),  bgcolor=color.new(color.green, 70))
+    table.cell(dbg, 2, 13, str.tostring(cSell), bgcolor=color.new(color.red, 70))
+    table.cell(dbg, 0, 14, "LWTI now")
+    table.cell(dbg, 1, 14, str.tostring(lwtiOut, "#.##"),
+         text_color = lwtiGreen ? color.green : color.red)
+    table.cell(dbg, 2, 14, lwtiGreen ? "Bull" : "Bear",
+         text_color = lwtiGreen ? color.green : color.red)
+    table.cell(dbg, 0, 15, "Bars since flip")
+    table.cell(dbg, 1, 15, na(barsSinceFlip) ? "na" : str.tostring(barsSinceFlip),
+         text_color = flipOK ? color.green : color.red)
+    table.cell(dbg, 2, 15, na(barsSinceFlip) ? "-" : (flipOK ? "in" : "out"),
+         text_color = flipOK ? color.green : color.red)
+    table.cell(dbg, 0, 16, "Volume")
+    table.cell(dbg, 1, 16, na(volume) ? "na" : str.tostring(volume, "#.#"),
+         text_color = volume > volMA ? color.green : color.black)
+    table.cell(dbg, 2, 16, volume > volMA ? ">MA" : "<MA")
+    table.cell(dbg, 0, 17, "Vol MA")
+    table.cell(dbg, 1, 17, na(volMA) ? "na" : str.tostring(volMA, "#.#"))
+    table.cell(dbg, 2, 17, "")
+    table.cell(dbg, 0, 18, "DC Upper")
+    table.cell(dbg, 1, 18, str.tostring(upper, format.mintick))
+    table.cell(dbg, 2, 18, "")
+    table.cell(dbg, 0, 19, "DC Lower")
+    table.cell(dbg, 1, 19, str.tostring(lower, format.mintick))
+    table.cell(dbg, 2, 19, "")
+    table.cell(dbg, 0, 20, "Trades")
+    table.cell(dbg, 1, 20, str.tostring(strategy.closedtrades + strategy.opentrades))
+    table.cell(dbg, 2, 20, "")
+    table.cell(dbg, 0, 21, "Bars")
+    table.cell(dbg, 1, 21, str.tostring(bar_index + 1))
+    table.cell(dbg, 2, 21, "")
+    table.cell(dbg, 0, 22, "ADX pass")
+    table.cell(dbg, 1, 22, str.tostring(cAdxB))
+    table.cell(dbg, 2, 22, str.tostring(cAdxS))
+    table.cell(dbg, 0, 23, "ADX now")
+    table.cell(dbg, 1, 23, na(adxVal) ? "na" : str.tostring(adxVal, "#.#"),
+         text_color = adxStrong ? color.green : color.red)
+    table.cell(dbg, 2, 23, na(diPlus) or na(diMinus) ? "-" : (diPlus > diMinus ? "+DI" : "-DI"),
+         text_color = diPlus > diMinus ? color.green : color.red)
+    table.cell(dbg, 0, 24, "Skipped (pos)", text_color = color.orange)
+    table.cell(dbg, 1, 24, str.tostring(cBlkB), text_color = color.orange)
+    table.cell(dbg, 2, 24, str.tostring(cBlkS), text_color = color.orange)
+
+// ----------------------------- Last-10 trade P&L ----------------------------
+// Shows the most recent (up to) 10 CLOSED trades in chronological order with
+// per-trade profit and a running cumulative. Profit is in account currency.
+if showPnL and barstate.islast
+    var table pnl = table.new(position.bottom_right, 4, 12, border_width=1)
+    table.cell(pnl, 0, 0, "#",     bgcolor=color.gray, text_color=color.white)
+    table.cell(pnl, 1, 0, "Dir",   bgcolor=color.gray, text_color=color.white)
+    table.cell(pnl, 2, 0, "P&L",   bgcolor=color.gray, text_color=color.white)
+    table.cell(pnl, 3, 0, "Cum",   bgcolor=color.gray, text_color=color.white)
+    n     = strategy.closedtrades
+    shown = math.min(n, 10)
+    cum   = 0.0
+    for i = 0 to 9
+        r = i + 1
+        if i < shown
+            idx = n - shown + i                                   // oldest of the last 10 first
+            pl  = strategy.closedtrades.profit(idx)
+            dir = strategy.closedtrades.size(idx) > 0 ? "Buy" : "Sell"
+            cum := cum + pl
+            plCol = pl >= 0 ? color.green : color.red
+            table.cell(pnl, 0, r, str.tostring(idx + 1))
+            table.cell(pnl, 1, r, dir)
+            table.cell(pnl, 2, r, str.tostring(pl, "#.##"),  text_color=plCol)
+            table.cell(pnl, 3, r, str.tostring(cum, "#.##"))
+        else
+            table.cell(pnl, 0, r, "")
+            table.cell(pnl, 1, r, "")
+            table.cell(pnl, 2, r, "")
+            table.cell(pnl, 3, r, "")
+    netCol = cum >= 0 ? color.new(color.green, 60) : color.new(color.red, 60)
+    table.cell(pnl, 0, 11, "Net", bgcolor=netCol, text_color=color.white)
+    table.cell(pnl, 1, 11, "",    bgcolor=netCol)
+    table.cell(pnl, 2, 11, str.tostring(cum, "#.##"), bgcolor=netCol, text_color=color.white)
+    table.cell(pnl, 3, 11, "",    bgcolor=netCol)

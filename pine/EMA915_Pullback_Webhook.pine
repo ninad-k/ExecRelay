@@ -118,7 +118,13 @@ whFixedLots = input.bool(true, "Force Exact Lots | Bypass Stack $-Risk Sizing", 
 // Short tag that becomes the broker order comment.
 // The bar time is appended automatically so ExecRelay's duplicate-signal
 // filter (which hashes the whole alert body) never drops a repeat alert.
-whComment = input.string("x915", "Order Comment Tag", group = groupWebhook)
+// ExecRelay's own ingress parser hard-caps the whole comment field at 20
+// characters (packages/parser-go: MaxComment=20) -- a longer comment is not
+// truncated, it's REJECTED outright (400 parse_error), silently dropping
+// every single signal. The close-comment suffix "x-<13-digit bar time>" is
+// the tightest budget at 15 chars, so keep this tag to 5 characters or
+// fewer; whCommentSafe below truncates automatically as a hard backstop.
+whComment = input.string("X915E", "Order Comment Tag | max 5 chars, longer is silently rejected by ingress", group = groupWebhook)
 
 // Also send CLOSELONG / CLOSESHORT when the strategy's TP/SL exit fills.
 // The broker already holds the SL/TP sent with the entry, so this is a
@@ -130,6 +136,10 @@ whSym = whSymbol == "" ? syminfo.ticker : whSymbol
 whSecretPart = whSecret != "" ? ",secret=" + whSecret : ""
 whRiskPart = whFixedLots ? ",risk=0" : ""
 whLotsStr = str.tostring(whLots, "#.####")
+// Hard backstop for the 20-char ingress comment limit -- see whComment's
+// tooltip. Silently truncates rather than letting a too-long tag reject
+// every signal; still worth fixing the input if this ever actually trims it.
+whCommentSafe = str.length(whComment) > 5 ? str.substring(whComment, 0, 5) : whComment
 
 f_px(_p) =>
     str.tostring(_p, format.mintick)
@@ -295,8 +305,8 @@ if debugSellCandidate
 // --------------------------------------------------
 // Close messages are rebuilt every bar so the bar-time tag stays fresh
 // on the exit order that eventually fills.
-longCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSELONG," + whSym + ",comment=" + whComment + "x-" + whBarTag + whSecretPart : ""
-shortCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSESHORT," + whSym + ",comment=" + whComment + "x-" + whBarTag + whSecretPart : ""
+longCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSELONG," + whSym + ",comment=" + whCommentSafe + "x-" + whBarTag + whSecretPart : ""
+shortCloseMsg = whSendCloseAlerts ? whLicenseId + ",CLOSESHORT," + whSym + ",comment=" + whCommentSafe + "x-" + whBarTag + whSecretPart : ""
 
 // --------------------------------------------------
 // 14. TRADE MANAGEMENT
@@ -315,7 +325,7 @@ if longSignal
 
     // ExecRelay: BUY with absolute SL/TP prices, so the broker holds the
     // exact same stop and target as the strategy.
-    longEntryMsg = whLicenseId + ",BUY," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(longStop) + ",tp=" + f_px(longTarget) + ",comment=" + whComment + "-" + whBarTag + whSecretPart
+    longEntryMsg = whLicenseId + ",BUY," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(longStop) + ",tp=" + f_px(longTarget) + ",comment=" + whCommentSafe + "-" + whBarTag + whSecretPart
 
     if qtyInput > 0.0
         strategy.entry("Long", strategy.long, qty = qtyInput, comment = "Buy", alert_message = longEntryMsg)
@@ -339,7 +349,7 @@ if shortSignal
     longTarget := na
 
     // ExecRelay: SELL with absolute SL/TP prices.
-    shortEntryMsg = whLicenseId + ",SELL," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(shortStop) + ",tp=" + f_px(shortTarget) + ",comment=" + whComment + "-" + whBarTag + whSecretPart
+    shortEntryMsg = whLicenseId + ",SELL," + whSym + ",vol_lots=" + whLotsStr + whRiskPart + ",sl=" + f_px(shortStop) + ",tp=" + f_px(shortTarget) + ",comment=" + whCommentSafe + "-" + whBarTag + whSecretPart
 
     if qtyInput > 0.0
         strategy.entry("Short", strategy.short, qty = qtyInput, comment = "Sell", alert_message = shortEntryMsg)
