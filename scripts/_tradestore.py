@@ -856,6 +856,65 @@ def set_dry_run(enabled: bool) -> None:
                 pass
 
 
+_SYMBOL_MAP_KEY = "symbol_map"
+_SYMBOL_MAP_TS_KEY = "symbol_map_updated_ts"
+
+
+def get_symbol_map() -> dict[str, str]:
+    """Operator-managed symbol alias map: UPPERCASED alias -> broker symbol
+    (e.g. {"GOLD": "XAUUSD_", "XAUUSD": "XAUUSD_"}). Many aliases may point at
+    one broker symbol. Managed from the dashboard's "Symbol mapping" panel;
+    ea_shim re-reads it on every signal, so changes need no restart.
+
+    Fail-safe: any store problem or junk value returns {} -- ea_shim then
+    falls back to its built-in suffix guessing, same as before the map
+    existed."""
+    rows = query("SELECT value FROM meta WHERE key=?", (_SYMBOL_MAP_KEY,))
+    if not rows:
+        return {}
+    try:
+        raw = json.loads(str(rows[0].get("value") or "{}"))
+        return {
+            str(k).strip().upper(): str(v).strip()
+            for k, v in raw.items()
+            if str(k).strip() and str(v).strip()
+        }
+    except (ValueError, AttributeError):
+        return {}
+
+
+def set_symbol_map(mapping: dict[str, str]) -> None:
+    """Persist the full alias map (the dashboard sends the complete new state,
+    not a delta). Same no-throw posture as set_dry_run."""
+    conn = None
+    try:
+        conn = get_conn()
+        if conn is None:
+            return
+        clean = {
+            str(k).strip().upper(): str(v).strip()
+            for k, v in mapping.items()
+            if str(k).strip() and str(v).strip()
+        }
+        conn.executemany(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                (_SYMBOL_MAP_KEY, json.dumps(clean, sort_keys=True)),
+                (_SYMBOL_MAP_TS_KEY, _utcnow_iso()),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"set_symbol_map failed: {exc!r}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Backfill (CLI only) -- imports existing JSONL txn logs + MT5 closed-deal
 # history. Safe to re-run: every write above is an upsert.

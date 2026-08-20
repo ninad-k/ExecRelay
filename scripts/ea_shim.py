@@ -39,6 +39,7 @@ import websockets
 from _txnlog import get_txn_logger, log_txn
 from _tradestore import (
     channel_flags,
+    get_symbol_map,
     meta_set,
     record_closed_trade,
     record_equity,
@@ -506,6 +507,17 @@ def position_monitor():
 
 def send_market(action_type, symbol, volume, comment, sl=0.0, tp=0.0):
     tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        # No live market data for this symbol -- broker never resolved it
+        # (no alias mapping, no suffix-fallback match, or genuinely delisted).
+        # Must fail cleanly here: `tick.ask`/`tick.bid` below would otherwise
+        # raise AttributeError, which the caller has no per-signal handler
+        # for -- it propagates all the way out of the bridge session loop
+        # and kills the connection, silently dropping this signal's fill
+        # report (execute() never gets to report "rejected" back to the
+        # bridge, so the signal never shows up anywhere, not even as a
+        # rejection) instead of a normal, visible rejected order.
+        return None, f"no market data for {symbol} (symbol not found or not subscribed)"
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -570,6 +582,12 @@ def close_positions(symbol, pos_type):
             else mt5.ORDER_TYPE_BUY
         )
         tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            # Same class of failure as send_market()'s tick guard: no live
+            # market data must fail this one position cleanly rather than
+            # crash the whole close_positions() call (and the caller's
+            # session) with an AttributeError on tick.bid/tick.ask.
+            return closed, f"no market data for {symbol} (symbol not found or not subscribed)"
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -584,6 +602,11 @@ def close_positions(symbol, pos_type):
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
         res = mt5.order_send(req)
+        if res is not None and res.retcode == mt5.TRADE_RETCODE_INVALID_FILL:
+            # Mirrors send_market()'s fallback: this broker doesn't accept IOC
+            # for this symbol -- retry once with FOK before giving up.
+            req["type_filling"] = mt5.ORDER_FILLING_FOK
+            res = mt5.order_send(req)
         if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
             return (
                 closed,
@@ -645,6 +668,13 @@ def execute(trace_id, command, symbol, params):
     status is "filled" for executed orders, "placed" for resting pendings,
     and volume is the FINAL sized lot actually sent to the broker (after
     $-risk sizing overrides the requested vol_lots/volume)."""
+    # Operator alias map first (dashboard "Symbol mapping" panel): GOLD ->
+    # XAUUSD_ style renames the suffix fallback below can never guess. Read
+    # per signal so dashboard edits apply without a restart.
+    alias = get_symbol_map().get(symbol.strip().upper())
+    if alias and alias != symbol:
+        log(f"symbol {symbol} mapped to {alias} (dashboard symbol map)")
+        symbol = alias
     # Broker symbol-name fallback: many brokers suffix their instruments
     # (XAUUSD_ here). If the exact name is unknown, try common variants
     # rather than failing the order on a naming mismatch.
@@ -693,10 +723,19 @@ def execute(trace_id, command, symbol, params):
 
     if cmd == "buy":
         res, err = send_market(mt5.ORDER_TYPE_BUY, symbol, volume, comment, sl, tp)
-        return "filled", (str(res.order) if res else ""), err, volume
+        # Status reflects whether the broker actually confirmed the order --
+        # send_market() returns res=None on EVERY failure path (order_send
+        # returning None, a bad retcode after the FOK retry, or now also a
+        # missing tick), so `res` alone is a reliable filled/rejected signal.
+        # This used to hardcode "filled" regardless of `res`, relying on the
+        # caller's `"rejected" if err else ok_status` to patch it up before
+        # logging -- correct in practice, but fragile: this return value
+        # should be right on its own, not only right because of how one
+        # particular caller happens to use it.
+        return ("filled" if res else "rejected"), (str(res.order) if res else ""), err, volume
     if cmd == "sell":
         res, err = send_market(mt5.ORDER_TYPE_SELL, symbol, volume, comment, sl, tp)
-        return "filled", (str(res.order) if res else ""), err, volume
+        return ("filled" if res else "rejected"), (str(res.order) if res else ""), err, volume
     if cmd in _PENDING_TYPES:
         entry = fnum(params, "entry", "entry_price")
         if entry <= 0:
