@@ -51,7 +51,17 @@ param(
     [ValidateSet("start", "stop", "status")]
     [string]$Command = "status",
     [switch]$Public,
-    [switch]$Tunnel  # deprecated alias for -Public (kept so old invocations keep working)
+    [switch]$Tunnel,  # deprecated alias for -Public (kept so old invocations keep working)
+    # Reuse .local-stack\bin\{ingress,bridge}.exe as-is instead of rebuilding.
+    # Used by the SYSTEM-context scheduled tasks (ExecRelay-Stack-Boot/
+    # -Watchdog, see docs/development/windows-local-stack.md "Reliability")
+    # so a periodic watchdog run never has to invoke `go build` under an
+    # account whose Go build cache/network context differs from the
+    # interactive admin session that normally builds these -- a cold/stuck
+    # SYSTEM-context build is exactly what caused the 2026-08-19 incident
+    # this flag exists to avoid repeating. Falls back to building anyway if
+    # the binary is simply missing (nothing to skip to).
+    [switch]$SkipBuild
 )
 if ($Tunnel) { $Public = $true }
 
@@ -73,8 +83,17 @@ $PublicPort = 80   # TradingView only posts webhooks to ports 80/443
 $RetentionDays = 7
 
 function Resolve-PythonExe {
+    # $env:LOCALAPPDATA is per-account -- it points at a different (usually
+    # empty) profile when this script runs as SYSTEM (e.g. from a Task
+    # Scheduler task set to "run whether user is logged on or not", the
+    # mechanism that lets the stack survive an RDP disconnect) rather than
+    # interactively as the admin user who actually has Python installed. The
+    # C:\Users\*\... glob finds it either way, so the same script works
+    # unchanged both interactively and as a SYSTEM-run scheduled task.
     $candidates = @(
         "$env:LOCALAPPDATA\Python\pythoncore-3.14-64\python.exe",
+        (Get-ChildItem "C:\Users\*\AppData\Local\Python\pythoncore-*\python.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName),
         (Get-Command python -ErrorAction SilentlyContinue).Source,
         (Get-Command py -ErrorAction SilentlyContinue).Source
     ) | Where-Object { $_ -and (Test-Path $_) }
@@ -98,6 +117,12 @@ function Import-DotEnv {
     }
 }
 
+function Format-CmdArg {
+    param([string]$Value)
+    if ($Value -match '[\s"]') { return '"' + ($Value -replace '"', '\"') + '"' }
+    return $Value
+}
+
 function Start-Tracked {
     param(
         [string]$Name,
@@ -110,19 +135,55 @@ function Start-Tracked {
     $stdout = Join-Path $Logs "$Name-$today.log"
     $stderr = Join-Path $Logs "$Name-$today.err.log"
     foreach ($k in $Env.Keys) { [Environment]::SetEnvironmentVariable($k, [string]$Env[$k], "Process") }
+
+    # Start-Process's own -RedirectStandardOutput/-Error TRUNCATE the target
+    # file on every launch -- Windows PowerShell 5.1 has no append mode for
+    # it -- so restarting the stack mid-day (e.g. to deploy a fix) silently
+    # wiped that day's log history each time. Routed through cmd.exe's `>>`
+    # instead: real OS-level append, and (unlike a pipe + PowerShell event
+    # reader) the file handle stays valid even after this launcher script's
+    # own process exits, which every service here depends on since they're
+    # meant to keep running detached long after `start` returns.
+    #
+    # cmd.exe stays alive as the real service's parent for its whole
+    # lifetime (`cmd /c` waits on the child), so $proc.Id here is cmd's PID,
+    # not the service's -- Invoke-Stop kills by PID with no tree-kill, so
+    # tracking cmd's PID would leave the actual service orphaned on `stop`.
+    # Poll for the real child PID instead and track that; once it's killed,
+    # cmd.exe exits on its own with nothing left behind.
+    $quotedInner = (@(Format-CmdArg $FilePath) + ($ArgumentList | ForEach-Object { Format-CmdArg $_ })) -join ' '
+    $cmdLine = "$quotedInner >> `"$stdout`" 2>> `"$stderr`""
     $spArgs = @{
-        FilePath                = $FilePath
+        FilePath                = "cmd.exe"
+        ArgumentList             = @("/c", $cmdLine)
         WorkingDirectory         = $WorkDir
         WindowStyle              = "Hidden"
         PassThru                 = $true
-        RedirectStandardOutput   = $stdout
-        RedirectStandardError    = $stderr
     }
-    if ($ArgumentList.Count -gt 0) { $spArgs["ArgumentList"] = $ArgumentList }
-    $proc = Start-Process @spArgs
-    $proc.Id | Out-File -FilePath (Join-Path $Pids "$Name.pid") -Encoding ascii
-    Write-Host "  $Name`: pid $($proc.Id) (log: $stdout)"
-    return $proc
+    $wrapper = Start-Process @spArgs
+
+    # cmd.exe (run WindowStyle Hidden) spawns TWO children under its PID:
+    # conhost.exe (console host, created for the hidden console) and the
+    # actual target executable -- Win32_Process doesn't guarantee which one
+    # WMI enumerates first, so filtering on ParentProcessId alone can (and
+    # did, in testing) grab conhost.exe by mistake. Match on the target's own
+    # leaf filename to get the real one.
+    $exeLeaf = Split-Path $FilePath -Leaf
+    $childId = $null
+    for ($i = 0; $i -lt 30 -and -not $childId; $i++) {
+        Start-Sleep -Milliseconds 100
+        $kids = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($wrapper.Id)" -ErrorAction SilentlyContinue
+        $match = $kids | Where-Object { $_.Name -eq $exeLeaf } | Select-Object -First 1
+        if ($match) { $childId = $match.ProcessId }
+    }
+    if (-not $childId) {
+        Write-Warning "$Name`: could not resolve the real child PID under cmd.exe (pid $($wrapper.Id)); tracking the wrapper instead -- 'stop' may leave $Name running"
+        $childId = $wrapper.Id
+    }
+
+    $childId | Out-File -FilePath (Join-Path $Pids "$Name.pid") -Encoding ascii
+    Write-Host "  $Name`: pid $childId (log: $stdout)"
+    return $childId
 }
 
 function Wait-Http {
@@ -234,89 +295,123 @@ function Invoke-Start {
         }
     } catch {}
 
-    New-Item -ItemType Directory -Force -Path $Bin, $Logs, $Pids | Out-Null
-    Write-Host "purging logs older than $RetentionDays days..."
-    Remove-OldLogs
-    Import-DotEnv (Join-Path $Root ".env")
-
-    if (-not $env:EXECRELAY_LICENSES) { $env:EXECRELAY_LICENSES = "60000000001:test-secret::test-instance:mt5" }
-    if (-not $env:BRIDGE_AUTH_TOKEN) { $env:BRIDGE_AUTH_TOKEN = "test-bridge-token" }
-    if (-not $env:ML_ENFORCE) { $env:ML_ENFORCE = "false" }
-    if (-not $env:ML_THRESHOLD) { $env:ML_THRESHOLD = "0.50" }
-
-    $goBin = Join-Path $Dir "go\bin"
-    $env:PATH = "$goBin;$env:PATH"
-    $python = Resolve-PythonExe
-    Write-Host "using python: $python"
-
-    Write-Host "building services..."
-    & (Join-Path $goBin "go.exe") build -o (Join-Path $Bin "ingress.exe") "./apps/ingress/cmd/ingress"
-    & (Join-Path $goBin "go.exe") build -o (Join-Path $Bin "bridge.exe") "./apps/bridge/cmd/bridge"
-
-    Write-Host "starting stack..."
-    $nats = Get-NatsExe
-    Start-Tracked -Name "nats" -FilePath $nats -ArgumentList @("-js", "-p", "$NatsPort") | Out-Null
-    Wait-Tcp -Name "nats" -Port $NatsPort
-
-    Start-Tracked -Name "ml-predictor" -FilePath $python -ArgumentList @("app.py") `
-        -WorkDir (Join-Path $Root "apps\ml-predictor") -Env @{
-        HTTP_PORT = $PredictorPort; DEBUG = "false"
-    } | Out-Null
-
-    Start-Tracked -Name "ingress" -FilePath (Join-Path $Bin "ingress.exe") -ArgumentList @() -Env @{
-        HTTP_ADDR = ":$IngressPort"
-        NATS_URL = "nats://127.0.0.1:$NatsPort"
-        WEBHOOK_RATE_LIMIT = "0"
-        WEBHOOK_TIMESTAMP_WINDOW_SECS = "0"
-        ML_PREDICTOR_URL = "http://127.0.0.1:$PredictorPort"
-    } | Out-Null
-
-    Start-Tracked -Name "bridge" -FilePath (Join-Path $Bin "bridge.exe") -ArgumentList @() -Env @{
-        HTTP_ADDR = ":$BridgePort"
-        NATS_URL = "nats://127.0.0.1:$NatsPort"
-    } | Out-Null
-
-    Write-Host "waiting for health..."
-    Wait-Http -Name "ml-predictor" -Url "http://127.0.0.1:$PredictorPort/healthz"
-    Wait-Http -Name "ingress" -Url "http://127.0.0.1:$IngressPort/health"
-    Wait-Http -Name "bridge" -Url "http://127.0.0.1:$BridgePort/health"
-
-    Start-Tracked -Name "ea-shim" -FilePath $python -ArgumentList @("scripts\ea_shim.py") | Out-Null
-
-    # Localhost-only (shows account balances; optional bearer-token auth via
-    # DASHBOARD_TOKEN in .env) -- keep it off the public interface even
-    # though ingress itself is exposed.
-    Start-Tracked -Name "trade-dashboard" -FilePath $python `
-        -ArgumentList @("scripts\trade_dashboard.py") -Env @{
-        DASHBOARD_ADDR = "127.0.0.1:$DashboardPort"
-    } | Out-Null
-    Wait-Http -Name "trade-dashboard" -Url "http://127.0.0.1:$DashboardPort/health"
-
-    if ($Public) {
-        $ip = Get-PublicIP
-        if (-not $ip) {
-            Write-Warning "could not determine this machine's public IP -- no public webhook URL available"
-        } else {
-            if (-not (Test-PublicPortForward -Port $PublicPort)) {
-                Write-Warning ("public port $PublicPort is not forwarded to ingress yet. One-time setup, run as Administrator:`n" +
-                    "  netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$PublicPort connectaddress=127.0.0.1 connectport=$IngressPort`n" +
-                    "  New-NetFirewallRule -DisplayName 'ExecRelay ingress $PublicPort' -Direction Inbound -Protocol TCP -LocalPort $PublicPort -Action Allow`n" +
-                    "and allow inbound TCP $PublicPort in the cloud firewall (AWS security group) for this instance.")
-            }
-            $url = "http://$ip"
-            Set-PublicLinkFile -Path $PublicLinkPath -Url $url
-            Write-Host "  public ingress URL: $url"
-            Write-Host "  webhook endpoints:  $url/webhook  and  $url/webhook/ml  (TradingView needs port 80/443)"
-            Write-Warning "reachable from the public internet while port $PublicPort stays open -- still requires a valid license/secret to place a trade, but treat the URL as sensitive."
+    # Second guard, independent of the health check above: two overlapping
+    # `start` calls (e.g. a manual run landing in the same window as the
+    # 5-minute watchdog task) can BOTH observe ingress as unhealthy and race
+    # past the check above before either finishes -- this is what let stuck
+    # SYSTEM-context runs pile up on 2026-08-19 instead of the second one
+    # backing off. A lock file closes that race regardless of what made the
+    # first run slow. A lock older than 5 minutes is treated as stale (a
+    # crashed run that never reached the `finally` below) rather than
+    # honored forever.
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    $lockFile = Join-Path $Dir "start.lock"
+    if (Test-Path $lockFile) {
+        $age = (Get-Date) - (Get-Item $lockFile).LastWriteTime
+        if ($age.TotalMinutes -lt 5) {
+            Write-Warning "another 'start' is already in progress (lock is $([int]$age.TotalSeconds)s old) -- refusing to start concurrently."
+            return
         }
+        Write-Warning "found a stale start.lock (>5 min old, so treated as a crashed prior run, not an active one) -- proceeding."
     }
+    New-Item -ItemType File -Force -Path $lockFile | Out-Null
+    try {
+        New-Item -ItemType Directory -Force -Path $Bin, $Logs, $Pids | Out-Null
+        Write-Host "purging logs older than $RetentionDays days..."
+        Remove-OldLogs
+        Import-DotEnv (Join-Path $Root ".env")
 
-    $dashboardUrl = "http://127.0.0.1:$DashboardPort"
-    if ($env:DASHBOARD_TOKEN) { $dashboardUrl += "?token=$($env:DASHBOARD_TOKEN)" }
-    Write-Host ""
-    Write-Host "  trade dashboard:  $dashboardUrl  (local only)"
-    Write-Host ""
-    Write-Host "stack is up. EA connects to 127.0.0.1:$BridgePort (instance: test-instance)."
+        if (-not $env:EXECRELAY_LICENSES) { $env:EXECRELAY_LICENSES = "60000000001:test-secret::test-instance:mt5" }
+        if (-not $env:BRIDGE_AUTH_TOKEN) { $env:BRIDGE_AUTH_TOKEN = "test-bridge-token" }
+        if (-not $env:ML_ENFORCE) { $env:ML_ENFORCE = "false" }
+        if (-not $env:ML_THRESHOLD) { $env:ML_THRESHOLD = "0.50" }
+
+        $goBin = Join-Path $Dir "go\bin"
+        $env:PATH = "$goBin;$env:PATH"
+        $python = Resolve-PythonExe
+        Write-Host "using python: $python"
+
+        $ingressExe = Join-Path $Bin "ingress.exe"
+        $bridgeExe = Join-Path $Bin "bridge.exe"
+        $haveBinaries = (Test-Path $ingressExe) -and (Test-Path $bridgeExe)
+        if ($SkipBuild -and $haveBinaries) {
+            Write-Host "skipping build, reusing existing $ingressExe / $bridgeExe"
+        } else {
+            if ($SkipBuild) {
+                Write-Warning "-SkipBuild set but a binary is missing -- building anyway (nothing to reuse yet)"
+            }
+            Write-Host "building services..."
+            & (Join-Path $goBin "go.exe") build -o $ingressExe "./apps/ingress/cmd/ingress"
+            & (Join-Path $goBin "go.exe") build -o $bridgeExe "./apps/bridge/cmd/bridge"
+        }
+
+        Write-Host "starting stack..."
+        $nats = Get-NatsExe
+        Start-Tracked -Name "nats" -FilePath $nats -ArgumentList @("-js", "-p", "$NatsPort") | Out-Null
+        Wait-Tcp -Name "nats" -Port $NatsPort
+
+        Start-Tracked -Name "ml-predictor" -FilePath $python -ArgumentList @("app.py") `
+            -WorkDir (Join-Path $Root "apps\ml-predictor") -Env @{
+            HTTP_PORT = $PredictorPort; DEBUG = "false"
+        } | Out-Null
+
+        Start-Tracked -Name "ingress" -FilePath $ingressExe -ArgumentList @() -Env @{
+            HTTP_ADDR = ":$IngressPort"
+            NATS_URL = "nats://127.0.0.1:$NatsPort"
+            WEBHOOK_RATE_LIMIT = "0"
+            WEBHOOK_TIMESTAMP_WINDOW_SECS = "0"
+            ML_PREDICTOR_URL = "http://127.0.0.1:$PredictorPort"
+        } | Out-Null
+
+        Start-Tracked -Name "bridge" -FilePath $bridgeExe -ArgumentList @() -Env @{
+            HTTP_ADDR = ":$BridgePort"
+            NATS_URL = "nats://127.0.0.1:$NatsPort"
+        } | Out-Null
+
+        Write-Host "waiting for health..."
+        Wait-Http -Name "ml-predictor" -Url "http://127.0.0.1:$PredictorPort/healthz"
+        Wait-Http -Name "ingress" -Url "http://127.0.0.1:$IngressPort/health"
+        Wait-Http -Name "bridge" -Url "http://127.0.0.1:$BridgePort/health"
+
+        Start-Tracked -Name "ea-shim" -FilePath $python -ArgumentList @("scripts\ea_shim.py") | Out-Null
+
+        # Localhost-only (shows account balances; optional bearer-token auth via
+        # DASHBOARD_TOKEN in .env) -- keep it off the public interface even
+        # though ingress itself is exposed.
+        Start-Tracked -Name "trade-dashboard" -FilePath $python `
+            -ArgumentList @("scripts\trade_dashboard.py") -Env @{
+            DASHBOARD_ADDR = "127.0.0.1:$DashboardPort"
+        } | Out-Null
+        Wait-Http -Name "trade-dashboard" -Url "http://127.0.0.1:$DashboardPort/health"
+
+        if ($Public) {
+            $ip = Get-PublicIP
+            if (-not $ip) {
+                Write-Warning "could not determine this machine's public IP -- no public webhook URL available"
+            } else {
+                if (-not (Test-PublicPortForward -Port $PublicPort)) {
+                    Write-Warning ("public port $PublicPort is not forwarded to ingress yet. One-time setup, run as Administrator:`n" +
+                        "  netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$PublicPort connectaddress=127.0.0.1 connectport=$IngressPort`n" +
+                        "  New-NetFirewallRule -DisplayName 'ExecRelay ingress $PublicPort' -Direction Inbound -Protocol TCP -LocalPort $PublicPort -Action Allow`n" +
+                        "and allow inbound TCP $PublicPort in the cloud firewall (AWS security group) for this instance.")
+                }
+                $url = "http://$ip"
+                Set-PublicLinkFile -Path $PublicLinkPath -Url $url
+                Write-Host "  public ingress URL: $url"
+                Write-Host "  webhook endpoints:  $url/webhook  and  $url/webhook/ml  (TradingView needs port 80/443)"
+                Write-Warning "reachable from the public internet while port $PublicPort stays open -- still requires a valid license/secret to place a trade, but treat the URL as sensitive."
+            }
+        }
+
+        $dashboardUrl = "http://127.0.0.1:$DashboardPort"
+        if ($env:DASHBOARD_TOKEN) { $dashboardUrl += "?token=$($env:DASHBOARD_TOKEN)" }
+        Write-Host ""
+        Write-Host "  trade dashboard:  $dashboardUrl  (local only)"
+        Write-Host ""
+        Write-Host "stack is up. EA connects to 127.0.0.1:$BridgePort (instance: test-instance)."
+    } finally {
+        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-Stop {
